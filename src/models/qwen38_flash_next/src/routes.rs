@@ -183,6 +183,8 @@ pub(crate) struct Q8Input<'a> {
 /// Everything the routes need besides the scratch they read and write.
 pub(crate) struct Ctx<'e> {
     pub stream: &'e Stream,
+    /// The side stream of the overlapped prefill passes.
+    pub side: &'e crate::executor::Side,
     pub model: &'e DeviceModel,
     pub blaslt: &'e mut BlasLt,
     pub stage: &'e mut Stage,

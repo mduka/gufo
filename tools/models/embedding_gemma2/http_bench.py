@@ -26,10 +26,12 @@ WORKLOADS = [
     (1, 1, 16),
     (1, 1, 128),
     (1, 1, 512),
+    (1, 1, 2100),
     (1, 8, 128),
     (1, 32, 128),
     (4, 1, 128),
     (16, 1, 128),
+    (16, 1, 16),
     (4, 8, 128),
     (16, 8, 128),
 ]
@@ -64,6 +66,7 @@ def run(base_url, model, api_key, concurrency, inputs, words, requests):
     return {
         "concurrency": concurrency, "inputs": inputs, "words": words,
         "requests": requests,
+        "request_ms": [round(r[0] * 1000, 3) for r in results],
         "tokens_per_request": results[0][1],
         "median_ms": round(statistics.median(times) * 1000, 2),
         "p95_ms": round(times[math.ceil(len(times) * 0.95) - 1] * 1000, 2),

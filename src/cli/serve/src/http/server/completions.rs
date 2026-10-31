@@ -9,13 +9,16 @@ pub(super) fn openai_completions(
 ) -> Result<HttpResponse> {
     compatibility_errors((|| {
         let body = try_response!(parse_body(request));
-        let (max_tokens, sampling) = try_response!(read_compatibility_options(
+        let (max_tokens, mut sampling) = try_response!(read_compatibility_options(
             &body,
             backend,
             "max_tokens",
-            &["stop", "stream", "stream_options", "ignore_eos"],
+            &["stop", "stream", "stream_options", "ignore_eos", "logprobs"],
             backend.reasoning_defaults().enabled,
         ));
+        if let Err(error) = parse_logprobs(&body, false, &mut sampling) {
+            return Ok(invalid_compatibility_request(&error.message));
+        }
         let stream = body.find("stream").is_some_and(|s| s.as_bool(false));
         let mut include_usage = false;
         if let Some(options) = body.find("stream_options") {
@@ -62,6 +65,7 @@ pub(super) fn openai_completions(
                 Err(message) => return Ok(invalid_compatibility_request(&message)),
             };
         let cache_prompt = try_response!(read_cache_prompt(&body));
+        let cache_persist = try_response!(read_cache_persist(&body));
         let Some(Value::String(prompt)) = body.find("prompt") else {
             return Ok(invalid_compatibility_request(
                 "'prompt' must be a single string",
@@ -88,10 +92,11 @@ pub(super) fn openai_completions(
             &stop_sequences,
             return_progress,
             cache_prompt,
+            cache_persist,
         )?;
         let id = random_id("cmpl-", 12);
         let created = unix_time();
-        let model = backend.model_id();
+        let model = requested_model(&body, backend);
         if stream {
             return Ok(streaming_completion(
                 generation,
@@ -100,13 +105,22 @@ pub(super) fn openai_completions(
                 model,
                 include_usage,
                 return_progress,
+                cache_persist,
+                sampling.logprobs,
             ));
         }
         let result = generation.wait(None)?;
         let choice = Value::object()
             .with("text", text_of(&result))
             .with("index", 0)
-            .with("logprobs", Value::Null)
+            .with(
+                "logprobs",
+                if sampling.logprobs.is_some() {
+                    completion_logprobs(&result.logprobs, 0)
+                } else {
+                    Value::Null
+                },
+            )
             .with(
                 "finish_reason",
                 if result.finish_reason == FinishReason::Length {
@@ -122,14 +136,17 @@ pub(super) fn openai_completions(
             .with("model", model)
             .with("choices", vec![choice])
             .with("usage", usage_json(&result))
-            .with("timings", generation_timings(&result));
+            .with("timings", generation_timings(&result))
+            .with("cache_persist", cache_persist);
         Ok(with_timing(ok(&response), &result))
     })())
 }
 
 /// Raw Completions over SSE: empty-text `prompt_progress` chunks when asked,
-/// one `text_completion` chunk per piece, a terminal chunk with the finish
-/// reason, optionally a usage chunk, then `[DONE]`.
+/// one `text_completion` chunk per piece (with its token's log
+/// probabilities when `logprobs` asks for them), a terminal chunk with the
+/// finish reason, optionally a usage chunk, then `[DONE]`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn streaming_completion(
     mut generation: Box<dyn GenerationRequest>,
     id: String,
@@ -137,10 +154,14 @@ pub(super) fn streaming_completion(
     model: String,
     include_usage: bool,
     return_progress: bool,
+    cache_persist: bool,
+    logprobs: Option<u32>,
 ) -> HttpResponse {
     let stream_log = Arc::new(Mutex::new(StreamLog::default()));
     let log = stream_log.clone();
     let body: crate::http::StreamingBody = Box::new(move |writer| {
+        let pending_logprobs = std::cell::RefCell::new(None::<Value>);
+        let mut text_offset = 0usize;
         let chunk = |text: &str, finish_reason: Option<&str>, usage: Option<Value>| {
             let base = Value::object()
                 .with("id", id.as_str())
@@ -157,7 +178,10 @@ pub(super) fn streaming_completion(
                         Value::object()
                             .with("text", text)
                             .with("index", 0)
-                            .with("logprobs", Value::Null)
+                            .with(
+                                "logprobs",
+                                pending_logprobs.borrow_mut().take().unwrap_or_default(),
+                            )
                             .with(
                                 "finish_reason",
                                 finish_reason.map_or(Value::Null, Value::from),
@@ -186,8 +210,18 @@ pub(super) fn streaming_completion(
         // Admitted or long queued: commit the headers.
         let mut on_start = || write(b"");
         let outcome = generation.wait_streaming(StreamCallbacks {
-            on_token: Some(&mut |piece: &[u8]| {
-                write(&sse(&chunk(&decoder.push(piece, false), None, None)))
+            on_token: Some(&mut |piece| {
+                if logprobs.is_some()
+                    && let Some(values) = piece.logprobs
+                {
+                    *pending_logprobs.borrow_mut() = Some(completion_logprobs(
+                        std::slice::from_ref(values),
+                        text_offset,
+                    ));
+                }
+                let text = decoder.push(piece, false);
+                text_offset += unicode_length(text.as_bytes());
+                write(&sse(&chunk(&text, None, None)))
             }),
             on_progress: if return_progress {
                 Some(&mut on_progress)
@@ -233,12 +267,18 @@ pub(super) fn streaming_completion(
         };
         // llama.cpp reports timings on the terminal chunk regardless of the
         // optional usage chunk.
+        // The finishing and usage chunks echo the applied `cache_persist`.
         let terminal = chunk(&decoder.push(&[], true), Some(finish), None)
-            .with("timings", generation_timings(&result));
+            .with("timings", generation_timings(&result))
+            .with("cache_persist", cache_persist);
         if !writer(&sse(&terminal)) {
             return Ok(());
         }
-        if include_usage && !writer(&sse(&chunk("", None, Some(usage_json(&result))))) {
+        if include_usage
+            && !writer(&sse(
+                &chunk("", None, Some(usage_json(&result))).with("cache_persist", cache_persist)
+            ))
+        {
             return Ok(());
         }
         writer(b"data: [DONE]\n\n");
@@ -266,7 +306,7 @@ pub(super) fn openai_responses(
             Ok(reasoning) => with_reasoning_defaults(reasoning, backend),
             Err(message) => return Ok(invalid_compatibility_request(&message)),
         };
-        let (max_tokens, sampling) = try_response!(read_compatibility_options(
+        let (max_tokens, mut sampling) = try_response!(read_compatibility_options(
             &body,
             backend,
             "max_output_tokens",
@@ -278,13 +318,20 @@ pub(super) fn openai_responses(
                 "tools",
                 "tool_choice",
                 "parallel_tool_calls",
-                // A standard Responses field (encrypted reasoning, for
-                // example): no server-side conversation is kept, so it is
-                // accepted and ignored.
                 "include",
+                "top_logprobs",
             ],
             reasoning.enabled,
         ));
+        if let Err(error) = parse_responses_logprobs(&body, &mut sampling) {
+            return Ok(err(
+                400,
+                "Bad Request",
+                &error.message,
+                "invalid_request_error",
+                &error.code,
+            ));
+        }
         let mut messages = Vec::new();
         if let Some(instructions) = body.find("instructions") {
             let Value::String(instructions) = instructions else {
@@ -351,6 +398,19 @@ pub(super) fn openai_responses(
                 ));
             }
         }
+        match body.find("cache_persist") {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(cache_persist)) => chat.cache_persist = *cache_persist,
+            Some(_) => {
+                return Ok(err(
+                    400,
+                    "Bad Request",
+                    "'cache_persist' must be a boolean",
+                    "invalid_request_error",
+                    "invalid_cache_persist",
+                ));
+            }
+        }
         match body.find("return_progress") {
             None | Some(Value::Null) => {}
             Some(Value::Bool(return_progress)) => chat.return_progress = *return_progress,
@@ -368,7 +428,14 @@ pub(super) fn openai_responses(
             .find("stream")
             .is_some_and(|stream| stream.as_bool(false));
         crate::openai_chat::create_openai_response(
-            request, backend, &chat, max_tokens, &sampling, stream, target,
+            request,
+            backend,
+            &chat,
+            max_tokens,
+            &sampling,
+            stream,
+            target,
+            &requested_model(&body, backend),
         )
     })())
 }
@@ -461,7 +528,13 @@ pub(super) fn anthropic_messages(
             .find("stream")
             .is_some_and(|stream| stream.as_bool(false));
         crate::openai_chat::create_anthropic_message(
-            request, backend, &chat, max_tokens, &sampling, stream,
+            request,
+            backend,
+            &chat,
+            max_tokens,
+            &sampling,
+            stream,
+            &requested_model(&body, backend),
         )
     })())
 }

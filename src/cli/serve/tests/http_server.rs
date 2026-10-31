@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use gufo_core::json;
 use gufo_core::sampling::SamplingConfig;
 use gufo_core::text::{
-    ChatRequest, ChatRole, DEVICE_LOST_MESSAGE, GenerationErrorCode, ReasoningEffort,
+    ChatRequest, ChatRole, DEVICE_LOST_MESSAGE, GenerationErrorCode, ImageDetail, ReasoningEffort,
     ReasoningOptions, SCHEDULER_FAILED_MESSAGE, ToolChoice,
 };
 use gufo_serve::backend::{
@@ -391,7 +391,8 @@ fn compatibility_requests() {
             && last.images[0].offset == 8
     );
     // Codex's view_image sends detail "high"; it is served as automatic
-    // detail, and an unknown value is still rejected.
+    // detail, and an unknown value is still rejected. Only "low" reaches the
+    // backend as a resolution bound.
     let calls = server.backend.calls.load(Ordering::SeqCst);
     expect_status(
         &server.post(
@@ -409,7 +410,36 @@ fn compatibility_requests() {
             {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"high"}]}]}"#,
     ));
     let chat = server.backend.last_call().chat;
-    assert_eq!(chat.messages.last().expect("message").images.len(), 1);
+    let images = &chat.messages.last().expect("message").images;
+    assert!(images.len() == 1 && images[0].detail == ImageDetail::Auto);
+    response_body(&server.post(
+        "/v1/responses",
+        r#"{"input":[{"role":"user","content":[
+            {"type":"input_text","text":"describe"},
+            {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"low"}]}]}"#,
+    ));
+    let chat = server.backend.last_call().chat;
+    assert_eq!(
+        chat.messages.last().expect("message").images[0].detail,
+        ImageDetail::Low
+    );
+    // Responses input_image.detail reaches the tool result's image part.
+    let response = server.post(
+        "/v1/responses",
+        r#"{"model":"test","tools":[{"type":"function","name":"f","parameters":{}}],
+           "input":[{"role":"user","content":"look"},
+             {"type":"function_call","call_id":"call_picture","name":"f","arguments":"{}"},
+             {"type":"function_call_output","call_id":"call_picture",
+              "output":[{"type":"input_image","detail":"low",
+                         "image_url":"data:image/png;base64,AQID"}]}]}"#,
+    );
+    expect_status(&response, 200);
+    let messages = server.backend.last_call().chat.messages;
+    let images = &messages.last().expect("tool result").images;
+    assert!(
+        images.len() == 1 && images[0].detail == ImageDetail::Low,
+        "{messages:?}"
+    );
 
     let response = response_body(&server.post(
         "/v1/responses",
@@ -999,7 +1029,8 @@ fn responses_client_compat_tolerances() {
             "{rejected}\n{response}"
         );
     }
-    // The 128-function cap counts flattened functions, in either order.
+    // #820: no fixed function count. Claude Code with MCP servers sends
+    // more than 128 tools; the request body size bounds the count.
     let nested = format!(
         r#"{{"type":"namespace","name":"crm","tools":[{}]}}"#,
         (0..128)
@@ -1008,17 +1039,47 @@ fn responses_client_compat_tolerances() {
             .join(",")
     );
     let outside = r#"{"type":"function","name":"outside"}"#;
-    expect_status(
-        &post(&format!(r#"{{"input":"hi","tools":[{nested}]}}"#)),
-        200,
-    );
-    assert_eq!(tool_names().len(), 128);
     for tools in [format!("{outside},{nested}"), format!("{nested},{outside}")] {
         expect_status(
             &post(&format!(r#"{{"input":"hi","tools":[{tools}]}}"#)),
-            400,
+            200,
+        );
+        assert_eq!(
+            tool_names().len(),
+            129,
+            "Both orderings accept a 129th function"
         );
     }
+    let duplicate = r#"{"type":"function","name":"f127"}"#;
+    expect_status(
+        &post(&format!(
+            r#"{{"input":"hi","tools":[{nested},{duplicate}]}}"#
+        )),
+        400,
+    );
+    // The Messages tools of Claude Code with MCP servers (#820).
+    let tools = (0..200)
+        .map(|i| {
+            format!(
+                r#"{{"name":"mcp__srv__t{i}","input_schema":{{"type":"object","properties":{{"q":{{"type":"string"}}}}}}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    expect_status(
+        &server.post(
+            "/v1/messages",
+            &format!(
+                r#"{{"max_tokens":16,"messages":[{{"role":"user","content":"hi"}}],"tools":[{tools}]}}"#
+            ),
+        ),
+        200,
+    );
+    let names = tool_names();
+    assert!(
+        names.len() == 200 && names.last().map(String::as_str) == Some("mcp__srv__t199"),
+        "Messages accepts 200 custom tools"
+    );
     // reasoning.summary is ignored while effort applies; text.verbosity is
     // ignored while text.format applies.
     expect_status(
@@ -1309,6 +1370,213 @@ fn response_sampling_defaults() {
         );
         assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
     }
+    body.set("cache_prompt", json::Value::Null);
+    let post = |body: &json::Value| server.post("/v1/responses", &body.dump().expect("dump"));
+    expect_status(&post(&body), 200);
+    assert!(server.backend.last_call().chat.cache_persist);
+    for persist in [false, true] {
+        body.set("cache_persist", persist);
+        expect_status(&post(&body), 200);
+        assert_eq!(server.backend.last_call().chat.cache_persist, persist);
+        assert!(server.backend.last_call().chat.cache_prompt);
+    }
+    body.set("cache_persist", false);
+    expect_status(&post(&body), 200);
+    body.set("cache_persist", json::Value::Null);
+    expect_status(&post(&body), 200);
+    assert!(server.backend.last_call().chat.cache_persist);
+    for invalid in ["0", "\"false\""] {
+        body.set("cache_persist", json::parse_str(invalid).expect("json"));
+        let calls = server.backend.calls.load(Ordering::SeqCst);
+        let rejected = post(&body);
+        expect_status(&rejected, 400);
+        assert!(
+            rejected.contains("'cache_persist' must be a boolean"),
+            "{rejected}"
+        );
+        assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
+    }
+}
+
+#[test]
+fn served_model_names() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    let listed = || -> Vec<String> {
+        let models = server.send("GET /v1/models HTTP/1.1\r\n\r\n", false);
+        expect_status(&models, 200);
+        let listing = json::parse_str(body_of(&models)).expect("json");
+        listing
+            .find("data")
+            .expect("data")
+            .items()
+            .iter()
+            .map(|model| {
+                assert_eq!(model.member_size("context_length", 0), 65536);
+                model.member_str("id", "").to_owned()
+            })
+            .collect()
+    };
+    // Path, the request fields besides `model`, and whether the response
+    // names the model.
+    let endpoints = [
+        (
+            "/v1/chat/completions",
+            r#""messages":[{"role":"user","content":"hi"}]"#,
+            true,
+        ),
+        ("/v1/completions", r#""prompt":"hi""#, true),
+        ("/v1/responses", r#""input":"hi""#, true),
+        (
+            "/v1/messages",
+            r#""messages":[{"role":"user","content":"hi"}]"#,
+            true,
+        ),
+        (
+            "/v1/messages/count_tokens",
+            r#""messages":[{"role":"user","content":"hi"}]"#,
+            false,
+        ),
+        ("/completion", r#""prompt":"hi""#, false),
+        (
+            "/apply-template",
+            r#""messages":[{"role":"user","content":"hi"}]"#,
+            false,
+        ),
+    ];
+    *server.backend.chat_token_count.lock().expect("count") = Some(1);
+    *server.backend.rendered_prompt.lock().expect("prompt") = Some("p".into());
+    let post = |path: &str, fields: &str, model: &str| {
+        server.post(path, &format!(r#"{{"model":"{model}",{fields}}}"#))
+    };
+    let model_of = |response: &str| {
+        json::parse_str(body_of(response))
+            .expect("json")
+            .member_str("model", "")
+            .to_owned()
+    };
+    // One name serves as before: it alone is listed and accepted.
+    assert_eq!(listed(), ["test"]);
+    for (path, fields, echoes) in endpoints {
+        let response = post(path, fields, "test");
+        expect_status(&response, 200);
+        assert!(!echoes || model_of(&response) == "test", "{path}");
+        let unknown = post(path, fields, "additional");
+        expect_status(&unknown, 404);
+        assert!(unknown.contains("model_not_found"), "{path}");
+    }
+
+    let names: Vec<String> = ["test", "additional", "books"].map(String::from).into();
+    *server.backend.names.lock().expect("names") = names.clone();
+    assert_eq!(listed(), names);
+    for (path, fields, echoes) in endpoints {
+        for model in &names {
+            let response = post(path, fields, model);
+            expect_status(&response, 200);
+            assert!(!echoes || model_of(&response) == *model, "{path} {model}");
+        }
+        let unknown = post(path, fields, "other");
+        expect_status(&unknown, 404);
+        assert!(unknown.contains("model_not_found"), "{path}");
+    }
+    // Streamed events carry the additional name the request selected.
+    let streamed = server.post(
+        "/v1/responses",
+        r#"{"model":"books","input":"hi","stream":true}"#,
+    );
+    expect_status(&streamed, 200);
+    assert!(
+        streamed.contains("text/event-stream")
+            && streamed.contains(r#""model":"books""#)
+            && !streamed.contains(r#""model":"test""#)
+    );
+    // Without a model field the primary name answers.
+    assert_eq!(
+        model_of(&server.post("/v1/responses", r#"{"input":"hi"}"#)),
+        "test"
+    );
+}
+
+/// llama-server's `/apply-template` (`TestApplyTemplate`).
+#[test]
+fn apply_template() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    let chat = r#"{"messages":[{"role":"system","content":"sys"},
+        {"role":"user","content":"ping"}],
+        "tools":[{"type":"function","function":{"name":"t","parameters":
+          {"type":"object","properties":{"a":{"type":"string"}}}}}]}"#;
+    let calls = server.backend.calls.load(Ordering::SeqCst);
+
+    // A backend that cannot render its template as text says so.
+    expect_status(&server.post("/apply-template", chat), 501);
+
+    // The prompt is the backend's render of the parsed Chat request; no
+    // model field is needed, as outside llama-server router mode.
+    *server.backend.rendered_prompt.lock().expect("prompt") = Some("<rendered>".into());
+    *server.backend.reasoning.lock().expect("reasoning") = ReasoningOptions {
+        enabled: Some(true),
+        effort: Some(ReasoningEffort::Medium),
+        ..ReasoningOptions::default()
+    };
+    let response = server.post("/apply-template", chat);
+    expect_status(&response, 200);
+    let body = json::parse_str(body_of(&response)).expect("json");
+    assert_eq!(body.member_str("prompt", ""), "<rendered>");
+    assert!(body.find("model").is_none());
+    let rendered = server
+        .backend
+        .rendered_chat
+        .lock()
+        .expect("rendered")
+        .clone();
+    assert!(rendered.messages.len() == 2 && rendered.tools.len() == 1);
+    // A request that sets no reasoning renders at the server's defaults,
+    // which is what makes them observable; a request's own effort wins.
+    assert!(
+        rendered.reasoning.enabled == Some(true)
+            && rendered.reasoning.effort == Some(ReasoningEffort::Medium)
+    );
+    expect_status(
+        &server.post(
+            "/apply-template",
+            r#"{"reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        200,
+    );
+    assert_eq!(
+        server
+            .backend
+            .rendered_chat
+            .lock()
+            .expect("rendered")
+            .reasoning
+            .effort,
+        Some(ReasoningEffort::Low)
+    );
+
+    expect_status(&server.post("/apply-template", r#"{"messages":[]}"#), 400);
+    // A forwarded streaming Chat body renders like any other.
+    expect_status(
+        &server.post(
+            "/apply-template",
+            r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        200,
+    );
+    expect_status(
+        &server.post(
+            "/apply-template",
+            r#"{"model":"other","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        404,
+    );
+    // A template error is the request's, as in Chat.
+    *server.backend.render_error.lock().expect("error") =
+        Some("No user query found in messages.".into());
+    let invalid = server.post("/apply-template", chat);
+    expect_status(&invalid, 400);
+    assert!(invalid.contains("No user query found"), "{invalid}");
+    // Rendering never generates.
+    assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
 }
 
 #[test]
@@ -1704,6 +1972,31 @@ fn loading_responder() {
     ));
     // A request head split across segments is answered after it completes.
     expect_loading(&send_parts(port, &["GET /hea", "lth HTTP/1.1\r\n", "\r\n"]));
+    // A body the responder leaves unread, whole or arriving after the head,
+    // must not reset the connection before the client reads the answer.
+    expect_loading(&send_parts(
+        port,
+        &[&format!(
+            "POST /v1/completions HTTP/1.1\r\nContent-Length: 65536\r\n\r\n{}",
+            "x".repeat(65536)
+        )],
+    ));
+    expect_loading(&send_parts(
+        port,
+        &[
+            "POST /v1/completions HTTP/1.1\r\nContent-Length: 4096\r\n\r\n",
+            &"x".repeat(4096),
+        ],
+    ));
+    // A body larger than the socket buffers is still being sent when the
+    // answer is written; closing then breaks the client's send.
+    expect_loading(&send_parts(
+        port,
+        &[&format!(
+            "POST /v1/completions HTTP/1.1\r\nContent-Length: 8388608\r\n\r\n{}",
+            "x".repeat(8_388_608)
+        )],
+    ));
     // The port is held: the server cannot bind it until stop.
     let early = HttpServer::new(
         "127.0.0.1",
@@ -3279,6 +3572,7 @@ fn direct_response(server: &RunningServer, chat: &ChatRequest, stream: bool) -> 
         &SamplingConfig::default(),
         stream,
         ResponsesReasoningTarget::default(),
+        "",
     )
     .expect("response");
     let mut body = response.body.clone();
@@ -3615,6 +3909,136 @@ fn text_only_backend_refuses_images_before_reading() {
         );
     }
     assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
+}
+
+/// The applied `cache_persist` is echoed at the top level of every final
+/// response object, and of the finishing and usage stream chunks, never of
+/// a content delta (`TestCachePersistEcho`).
+#[test]
+fn cache_persist_echo() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    // The JSON of each `data:` line except [DONE], in order.
+    let events = |response: &str| -> Vec<json::Value> {
+        body_of(response)
+            .split("data: ")
+            .skip(1)
+            .filter_map(|event| event.split('\n').next())
+            .filter(|data| *data != "[DONE]")
+            .map(|data| json::parse_str(data).expect("event"))
+            .collect()
+    };
+    let echoed = |value: &json::Value| match value.find("cache_persist") {
+        Some(json::Value::Bool(persist)) => Some(*persist),
+        _ => None,
+    };
+    let chat = r#""model":"test","messages":[{"role":"user","content":"hello"}]"#;
+    for persist in [None, Some(false), Some(true)] {
+        let expected = persist.unwrap_or(true);
+        let field = persist.map_or_else(String::new, |p| format!(r#","cache_persist":{p}"#));
+        let plain = server.post("/v1/chat/completions", &format!("{{{chat}{field}}}"));
+        expect_status(&plain, 200);
+        assert_eq!(
+            echoed(&json::parse_str(body_of(&plain)).expect("json")),
+            Some(expected)
+        );
+
+        let streamed = events(&server.post(
+            "/v1/chat/completions",
+            &format!(
+                r#"{{{chat}{field},"stream":true,"stream_options":{{"include_usage":true}}}}"#
+            ),
+        ));
+        assert!(streamed.len() >= 3);
+        for event in &streamed[..streamed.len() - 2] {
+            assert_eq!(echoed(event), None);
+        }
+        assert_eq!(echoed(&streamed[streamed.len() - 2]), Some(expected));
+        assert_eq!(echoed(streamed.last().expect("usage")), Some(expected));
+        assert!(streamed.last().expect("usage").find("usage").is_some());
+
+        let response = server.post("/v1/responses", &format!(r#"{{"input":"hello"{field}}}"#));
+        expect_status(&response, 200);
+        assert_eq!(
+            echoed(&json::parse_str(body_of(&response)).expect("json")),
+            Some(expected)
+        );
+        let lifecycle = events(&server.post(
+            "/v1/responses",
+            &format!(r#"{{"input":"hello","stream":true{field}}}"#),
+        ));
+        let last = lifecycle.last().expect("events");
+        assert_eq!(last.member_str("type", ""), "response.completed");
+        assert_eq!(
+            echoed(last.find("response").expect("response")),
+            Some(expected)
+        );
+        assert_eq!(
+            echoed(lifecycle[0].find("response").expect("response")),
+            None
+        );
+
+        for path in ["/v1/completions", "/completion"] {
+            let completion = server.post(path, &format!(r#"{{"prompt":"hello"{field}}}"#));
+            expect_status(&completion, 200);
+            assert_eq!(
+                echoed(&json::parse_str(body_of(&completion)).expect("json")),
+                Some(expected),
+                "{path}"
+            );
+        }
+        let chunks = events(&server.post(
+            "/v1/completions",
+            &format!(
+                r#"{{"prompt":"hello","stream":true,"stream_options":{{"include_usage":true}}{field}}}"#
+            ),
+        ));
+        assert!(chunks.len() >= 3);
+        for chunk in &chunks[..chunks.len() - 2] {
+            assert_eq!(echoed(chunk), None);
+        }
+        assert_eq!(echoed(&chunks[chunks.len() - 2]), Some(expected));
+        assert_eq!(echoed(chunks.last().expect("usage")), Some(expected));
+    }
+}
+
+/// The raw completion routes pass `cache_persist` to the backend; null keeps
+/// the default (`TestRawCompletionCachePersist`).
+#[test]
+fn raw_completion_cache_persist() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    for path in ["/v1/completions", "/completion"] {
+        let persisted = || server.backend.last_cache_persist.load(Ordering::SeqCst);
+        expect_status(
+            &server.post(path, r#"{"prompt":"hello","cache_persist":false}"#),
+            200,
+        );
+        assert!(!persisted());
+        assert!(server.backend.last_cache_prompt.load(Ordering::SeqCst));
+        expect_status(&server.post(path, r#"{"prompt":"hello"}"#), 200);
+        assert!(persisted());
+        expect_status(
+            &server.post(path, r#"{"prompt":"hello","cache_persist":false}"#),
+            200,
+        );
+        expect_status(
+            &server.post(path, r#"{"prompt":"hello","cache_persist":null}"#),
+            200,
+        );
+        assert!(persisted());
+        let before = server.backend.calls.load(Ordering::SeqCst);
+        for value in [r#""false""#, "0"] {
+            let rejected = server.post(
+                path,
+                &format!(r#"{{"prompt":"hello","cache_persist":{value}}}"#),
+            );
+            expect_status(&rejected, 400);
+            assert!(
+                rejected.contains("'cache_persist' must be a boolean"),
+                "{rejected}"
+            );
+        }
+        assert_eq!(server.backend.calls.load(Ordering::SeqCst), before);
+    }
 }
 
 /// The raw completion routes read `cache_prompt` like Chat Completions and
@@ -4368,4 +4792,120 @@ fn reasoning_budgets() {
         .lock()
         .expect("reasoning")
         .budget_tokens = None;
+}
+
+/// Responses `include: ["message.output_text.logprobs"]` and `top_logprobs`
+/// reach the backend and the output; invalid controls fail before
+/// generation, other includes leave log probabilities off
+/// (`TestResponsesLogprobsOptions`).
+#[test]
+fn responses_logprobs_options() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    for stream in [false, true] {
+        for count in ["null", "0", "3", "20"] {
+            let response = server.post(
+                "/v1/responses",
+                &format!(
+                    r#"{{"input":"hello","include":["message.output_text.logprobs"],"top_logprobs":{count},"stream":{stream}}}"#
+                ),
+            );
+            expect_status(&response, 200);
+            let requested = count.parse::<u32>().unwrap_or(0);
+            assert_eq!(
+                server.backend.last_call().sampling.logprobs,
+                Some(requested)
+            );
+            assert!(response.contains(r#""token":"ok""#), "{response}");
+            assert!(response.contains(r#""logprob":-3"#), "{response}");
+            assert!(response.contains(r#""bytes":[111,107]"#), "{response}");
+        }
+    }
+    for options in [
+        r#""top_logprobs":-1"#,
+        r#""top_logprobs":21"#,
+        r#""top_logprobs":1.5"#,
+        r#""top_logprobs":true"#,
+        r#""top_logprobs":"3""#,
+        r#""include":[1]"#,
+        r#""include":"message.output_text.logprobs""#,
+        r#""logprobs":true"#,
+    ] {
+        let before = server.backend.calls.load(Ordering::SeqCst);
+        expect_status(
+            &server.post(
+                "/v1/responses",
+                &format!(r#"{{"input":"hello",{options}}}"#),
+            ),
+            400,
+        );
+        assert_eq!(
+            server.backend.calls.load(Ordering::SeqCst),
+            before,
+            "{options}"
+        );
+    }
+    for options in [
+        r#""include":null"#,
+        r#""include":[]"#,
+        r#""top_logprobs":3"#,
+        r#""include":["reasoning.encrypted_content"] "#,
+    ] {
+        expect_status(
+            &server.post(
+                "/v1/responses",
+                &format!(r#"{{"input":"hello",{options}}}"#),
+            ),
+            200,
+        );
+        assert!(
+            server.backend.last_call().sampling.logprobs.is_none(),
+            "{options}"
+        );
+    }
+}
+
+/// Legacy Completions `logprobs`, buffered and streamed, and its validation
+/// (`TestRawCompletionLogprobs`).
+#[test]
+fn raw_completion_logprobs() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    for stream in [false, true] {
+        for count in [0, 1, 20] {
+            let response = server.post(
+                "/v1/completions",
+                &format!(r#"{{"prompt":"hello","logprobs":{count},"stream":{stream}}}"#),
+            );
+            expect_status(&response, 200);
+            assert!(response.contains(r#""tokens":["ok"]"#), "{response}");
+            assert!(response.contains(r#""token_logprobs":[-3]"#), "{response}");
+            assert!(response.contains(r#""text_offset":[0]"#), "{response}");
+            assert!(
+                response.contains(if count > 0 {
+                    r#""top_logprobs":[{"ok":-3,"alternative":-0.5}]"#
+                } else {
+                    r#""top_logprobs":[{"ok":-3}]"#
+                }),
+                "{response}"
+            );
+        }
+    }
+    for value in ["true", "false", "-1", "21", "1.5", r#""1""#] {
+        let before = server.backend.calls.load(Ordering::SeqCst);
+        expect_status(
+            &server.post(
+                "/v1/completions",
+                &format!(r#"{{"prompt":"hello","logprobs":{value}}}"#),
+            ),
+            400,
+        );
+        assert_eq!(
+            server.backend.calls.load(Ordering::SeqCst),
+            before,
+            "{value}"
+        );
+    }
+    expect_status(
+        &server.post("/v1/completions", r#"{"prompt":"hello","logprobs":null}"#),
+        200,
+    );
 }

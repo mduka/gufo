@@ -1,5 +1,6 @@
-//! OpenAI-compatible `POST /v1/embeddings` over EmbeddingGemma 2
-//! (`src/cli/serve/embeddings_api.cpp`): request validation, Matryoshka
+//! OpenAI-compatible `POST /v1/embeddings` and llama.cpp's `POST /embeddings`
+//! over EmbeddingGemma 2 (`src/cli/serve/embeddings_api.cpp`): request
+//! validation of text, image and audio inputs, named prompts, Matryoshka
 //! truncation, float and base64 encodings.
 
 use std::sync::Arc;
@@ -8,13 +9,21 @@ use gufo_core::json::{self, Value};
 use gufo_core::text::Result;
 
 use crate::embedding_service::{
-    EmbeddingBatch, EmbeddingService, EmbeddingStatus, MAX_INPUT_TOKENS,
+    EmbeddingBatch, EmbeddingInput, EmbeddingPart, EmbeddingPartType, EmbeddingRequestOptions,
+    EmbeddingService, EmbeddingStatus, MAX_AUDIO, MAX_IMAGES, MAX_INPUT_TOKENS,
 };
 use crate::http::{HttpRequest, HttpResponse};
 
 pub const EMBEDDINGS_API_SCHEMA: &str = "gufo.embeddings-api.v1";
 
 const EMBEDDINGS_PATH: &str = "/v1/embeddings";
+// llama.cpp's non-OpenAI routes. Both share one handler there.
+const NATIVE_EMBEDDINGS_PATH: &str = "/embeddings";
+const LEGACY_EMBEDDING_PATH: &str = "/embedding";
+// llama.cpp's default multimodal marker in a `prompt_string`. Its server can
+// randomize the marker and report it in /props; clients that cannot read
+// /props, as here, fall back to this one.
+const MEDIA_MARKER: &str = "<__media__>";
 const MAXIMUM_INPUTS: usize = 2048;
 const DIMENSIONS: [usize; 4] = [128, 256, 512, 768];
 
@@ -165,11 +174,245 @@ fn truncate_and_normalize(full: &[f32], dimensions: usize) -> Option<Vec<f32>> {
     )
 }
 
-fn is_known_field(name: &str) -> bool {
+/// Whether a base64 `multimodal_data` file looks like audio, as llama.cpp's
+/// mtmd helper decides (`is_audio_file`): WAV, MP3 (an ID3 tag or an MPEG
+/// sync word) or FLAC. Ogg, which the audio decoder also reads, is sniffed
+/// too. Anything else, including undecodable base64, goes to the image
+/// reader.
+fn looks_like_audio(base64: &str) -> bool {
+    const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let base64 = base64.as_bytes();
+    if base64.len() < 16 {
+        return false;
+    }
+    let mut head = [0u8; 12];
+    for i in (0..16).step_by(4) {
+        let mut bits = 0u32;
+        for &digit in &base64[i..i + 4] {
+            let Some(value) = DIGITS.iter().position(|&d| d == digit) else {
+                return false;
+            };
+            bits = (bits << 6) | value as u32;
+        }
+        head[i / 4 * 3] = (bits >> 16) as u8;
+        head[i / 4 * 3 + 1] = (bits >> 8) as u8;
+        head[i / 4 * 3 + 2] = bits as u8;
+    }
+    let starts = |offset: usize, magic: &[u8]| head[offset..].starts_with(magic);
+    (starts(0, b"RIFF") && starts(8, b"WAVE"))
+        || starts(0, b"ID3")
+        || (head[0] == 0xFF && head[1] & 0xE0 == 0xE0)
+        || starts(0, b"fLaC")
+        || starts(0, b"OggS")
+}
+
+fn is_known_field(name: &str, native: bool) -> bool {
     matches!(
         name,
-        "input" | "model" | "encoding_format" | "dimensions" | "user"
-    )
+        "input" | "model" | "encoding_format" | "dimensions" | "user" | "truncate" | "prompt_name"
+    ) || (native && matches!(name, "content" | "embd_normalize"))
+}
+
+/// Counts of the media parts parsed so far in one request.
+#[derive(Default)]
+struct MediaCounts {
+    images: usize,
+    audio: usize,
+}
+
+/// A boxed refusal: the error of a parser that returns early.
+fn refuse(message: &str, code: &str) -> Box<HttpResponse> {
+    Box::new(bad_request(message, code))
+}
+
+/// `parse_item`: one `input` item as an embedding input, or the response
+/// that refuses it.
+fn parse_item(
+    item: &Value,
+    native: bool,
+    counts: &mut MediaCounts,
+) -> std::result::Result<EmbeddingInput, Box<HttpResponse>> {
+    let mut parsed = EmbeddingInput::default();
+    let invalid = |message: &str| refuse(message, "invalid_parameter_type");
+    let too_many_images = || {
+        refuse(
+            "embedding requests accept at most 32 images",
+            "too_many_images",
+        )
+    };
+    let too_many_audio = || {
+        refuse(
+            "embedding requests accept at most 32 audio clips",
+            "too_many_audio",
+        )
+    };
+    if let Value::String(text) = item {
+        if text.is_empty() {
+            return Err(refuse(
+                "'input' must not contain empty strings",
+                "empty_input",
+            ));
+        }
+        parsed.content.push(EmbeddingPart::text(text.clone()));
+    } else if native && item.is_object() && item.contains("prompt_string") {
+        // llama.cpp's multimodal prompt: each marker in the string stands for
+        // the next base64 file in `multimodal_data`.
+        let prompt = item.find("prompt_string").expect("checked member");
+        let data = item.find("multimodal_data");
+        if !prompt.is_string()
+            || item.len() != if data.is_some() { 2 } else { 1 }
+            || data.is_some_and(|d| !d.is_array())
+        {
+            return Err(invalid(
+                "prompt objects take a 'prompt_string' string and an optional 'multimodal_data' array",
+            ));
+        }
+        let text = prompt.str();
+        let files = data.map_or(0, Value::len);
+        let markers = text.matches(MEDIA_MARKER).count();
+        if markers != files {
+            return Err(refuse(
+                &format!(
+                    "'prompt_string' has {markers} media markers ({MEDIA_MARKER}) but 'multimodal_data' has {files} items"
+                ),
+                "invalid_multimodal_data",
+            ));
+        }
+        let mut begin = 0;
+        for i in 0..=files {
+            let end = if i == files {
+                text.len()
+            } else {
+                begin + text[begin..].find(MEDIA_MARKER).expect("counted marker")
+            };
+            if end > begin {
+                parsed.content.push(EmbeddingPart::text(&text[begin..end]));
+            }
+            if i == files {
+                break;
+            }
+            let file = &data.expect("files present").items()[i];
+            if !file.is_string() || file.str().is_empty() {
+                return Err(invalid("'multimodal_data' items must be base64 strings"));
+            }
+            if looks_like_audio(file.str()) {
+                counts.audio += 1;
+                if counts.audio > MAX_AUDIO {
+                    return Err(too_many_audio());
+                }
+                // The audio reader takes raw base64; the decoder checks the
+                // bytes.
+                parsed.content.push(EmbeddingPart {
+                    kind: EmbeddingPartType::Audio,
+                    value: file.str().to_owned(),
+                });
+            } else {
+                counts.images += 1;
+                if counts.images > MAX_IMAGES {
+                    return Err(too_many_images());
+                }
+                // The image reader identifies PNG, JPEG and WebP by their
+                // bytes.
+                parsed.content.push(EmbeddingPart {
+                    kind: EmbeddingPartType::Image,
+                    value: format!("data:image/jpeg;base64,{}", file.str()),
+                });
+            }
+            begin = end + MEDIA_MARKER.len();
+        }
+        if parsed.content.is_empty() {
+            return Err(refuse("'prompt_string' must not be empty", "empty_input"));
+        }
+    } else if item.is_object() {
+        let content = item.find("content");
+        let Some(content) = content.filter(|c| item.len() == 1 && c.is_array()) else {
+            return Err(invalid("typed input requires a 'content' array"));
+        };
+        if content.items().is_empty() {
+            return Err(refuse("'content' must not be empty", "empty_input"));
+        }
+        for part in content.items() {
+            if !part.is_object() {
+                return Err(invalid("content parts must be objects"));
+            }
+            let kind = part.member_str("type", "");
+            match kind.as_str() {
+                "text" => {
+                    let text = part.find("text");
+                    let Some(text) = text.filter(|t| part.len() == 2 && t.is_string()) else {
+                        return Err(invalid("text parts require a 'text' string"));
+                    };
+                    parsed.content.push(EmbeddingPart::text(text.str()));
+                }
+                "image_url" => {
+                    let image = part.find("image_url");
+                    let url = image.filter(|i| i.is_object()).and_then(|i| i.find("url"));
+                    let valid = part.len() == 2
+                        && image.is_some_and(|i| i.len() == 1)
+                        && url.is_some_and(|u| u.is_string() && !u.str().is_empty());
+                    if !valid {
+                        return Err(invalid("image parts require 'image_url': {'url': '...'}"));
+                    }
+                    counts.images += 1;
+                    if counts.images > MAX_IMAGES {
+                        return Err(too_many_images());
+                    }
+                    parsed.content.push(EmbeddingPart {
+                        kind: EmbeddingPartType::Image,
+                        value: url.expect("checked url").str().to_owned(),
+                    });
+                }
+                "input_audio" => {
+                    let audio = part.find("input_audio");
+                    let Some(audio) = audio.filter(|a| part.len() == 2 && a.is_object()) else {
+                        return Err(invalid("audio parts require an 'input_audio' object"));
+                    };
+                    if audio.members().iter().any(|(key, value)| {
+                        !matches!(key.as_str(), "data" | "url" | "format") || !value.is_string()
+                    }) {
+                        return Err(invalid(
+                            "input_audio accepts string data, url and format fields",
+                        ));
+                    }
+                    // Match llama.cpp: data takes precedence; format is
+                    // ignored and the actual container is detected from its
+                    // bytes.
+                    let source = audio.find("data").or_else(|| audio.find("url"));
+                    let Some(source) = source.filter(|s| !s.str().is_empty()) else {
+                        return Err(invalid("input_audio requires nonempty data or url"));
+                    };
+                    counts.audio += 1;
+                    if counts.audio > MAX_AUDIO {
+                        return Err(too_many_audio());
+                    }
+                    parsed.content.push(EmbeddingPart {
+                        kind: EmbeddingPartType::Audio,
+                        value: source.str().to_owned(),
+                    });
+                }
+                _ => {
+                    return Err(refuse(
+                        &format!("unsupported embedding content type: {kind}"),
+                        "unsupported_input",
+                    ));
+                }
+            }
+        }
+        if parsed.content.iter().all(|part| part.value.is_empty()) {
+            return Err(refuse(
+                "'content' must contain text or an image",
+                "empty_input",
+            ));
+        }
+    } else if matches!(item, Value::Number(_) | Value::Array(_)) {
+        return Err(refuse(
+            "token-array input is not supported; send strings",
+            "unsupported_input",
+        ));
+    } else {
+        return Err(invalid("'input' items must be strings or content objects"));
+    }
+    Ok(parsed)
 }
 
 /// The member's value, or `None` when it is absent or null.
@@ -177,7 +420,9 @@ fn optional<'a>(root: &'a Value, name: &str) -> Option<&'a Value> {
     root.find(name).filter(|value| !value.is_null())
 }
 
-fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
+/// `native` selects llama.cpp's `POST /embeddings` request and response
+/// form.
+fn embed(request: &HttpRequest, service: &EmbeddingService, native: bool) -> HttpResponse {
     let root = match json::parse(&request.body) {
         Ok(root) => root,
         Err(e) => return bad_request(e.message(), "parse_error"),
@@ -188,7 +433,7 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
     if let Some((name, _)) = root
         .members()
         .iter()
-        .find(|(name, _)| !is_known_field(name))
+        .find(|(name, _)| !is_known_field(name, native))
     {
         return bad_request(
             &format!("unsupported embeddings parameter: {name}"),
@@ -209,51 +454,47 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
         }
     }
 
-    let Some(input) = optional(&root, "input") else {
-        return bad_request("'input' is required", "missing_input");
+    // As in llama.cpp, `input` takes precedence over the legacy `content`.
+    let input =
+        optional(&root, "input").or_else(|| native.then(|| optional(&root, "content")).flatten());
+    let Some(input) = input else {
+        return bad_request(
+            if native {
+                "'input' or 'content' is required"
+            } else {
+                "'input' is required"
+            },
+            "missing_input",
+        );
     };
-    let mut texts: Vec<String> = Vec::new();
-    match input {
-        Value::String(text) => texts.push(text.clone()),
-        Value::Array(items) => {
-            if items.is_empty() {
-                return bad_request("'input' must not be an empty array", "empty_input");
-            }
-            if items.len() > MAXIMUM_INPUTS {
-                return bad_request(
-                    &format!("'input' accepts at most {MAXIMUM_INPUTS} items"),
-                    "too_many_inputs",
-                );
-            }
-            for item in items {
-                match item {
-                    Value::Number(_) | Value::Array(_) => {
-                        return bad_request(
-                            "token-array input is not supported; send strings",
-                            "unsupported_input",
-                        );
-                    }
-                    Value::String(text) => texts.push(text.clone()),
-                    _ => {
-                        return bad_request(
-                            "'input' items must be strings",
-                            "invalid_parameter_type",
-                        );
-                    }
-                }
-            }
+    let mut inputs: Vec<EmbeddingInput> = Vec::new();
+    let mut counts = MediaCounts::default();
+    // llama.cpp also takes one bare prompt or content object.
+    if input.is_string() || (native && input.is_object()) {
+        match parse_item(input, native, &mut counts) {
+            Ok(parsed) => inputs.push(parsed),
+            Err(response) => return *response,
         }
-        _ => {
+    } else if let Value::Array(items) = input {
+        if items.is_empty() {
+            return bad_request("'input' must not be an empty array", "empty_input");
+        }
+        if items.len() > MAXIMUM_INPUTS {
             return bad_request(
-                "'input' must be a string or an array of strings",
-                "invalid_parameter_type",
+                &format!("'input' accepts at most {MAXIMUM_INPUTS} items"),
+                "too_many_inputs",
             );
         }
-    }
-    if let Some(index) = texts.iter().position(String::is_empty) {
+        for item in items {
+            match parse_item(item, native, &mut counts) {
+                Ok(parsed) => inputs.push(parsed),
+                Err(response) => return *response,
+            }
+        }
+    } else {
         return bad_request(
-            &format!("'input' must not contain empty strings (index {index})"),
-            "empty_input",
+            "'input' must be a string or an array of strings or content objects",
+            "invalid_parameter_type",
         );
     }
 
@@ -265,7 +506,18 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
                 "invalid_encoding_format",
             );
         }
-        base64 = format.str() == "base64";
+        // As in llama.cpp, the native form validates it but returns floats.
+        base64 = !native && format.str() == "base64";
+    }
+    // llama.cpp's per-request normalization. EmbeddingGemma 2 vectors are
+    // always L2-normalized, so only its default, 2 (Euclidean), is accepted.
+    if let Some(normalize) = optional(&root, "embd_normalize")
+        && (!normalize.is_number() || normalize.as_double(0.0) != 2.0)
+    {
+        return bad_request(
+            "'embd_normalize' supports only 2 (Euclidean)",
+            "unsupported_embd_normalize",
+        );
     }
 
     // 0 means the model's full width.
@@ -283,10 +535,56 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
         return bad_request("'user' must be a string", "invalid_parameter_type");
     }
 
+    let mut prompt_name = service.default_prompt_name().to_owned();
+    let mut requested_prompt = false;
+    if let Some(value) = optional(&root, "prompt_name") {
+        if !value.is_string() {
+            return bad_request("'prompt_name' must be a string", "invalid_parameter_type");
+        }
+        prompt_name = value.str().to_owned();
+        requested_prompt = true;
+    }
+    if !prompt_name.is_empty() {
+        let Some(prefix) = service.prompt(&prompt_name) else {
+            return bad_request(
+                &format!("unknown prompt_name '{prompt_name}'"),
+                "invalid_prompt_name",
+            );
+        };
+        // A leading text part: the service joins adjacent text before
+        // tokenizing, so this equals a client-side prefix. A requested
+        // prompt applies to every input, as in sentence-transformers. The
+        // model card passes images and audio without a prefix, so the server
+        // default skips inputs without text.
+        for input in &mut inputs {
+            let has_text = input
+                .content
+                .iter()
+                .any(|part| part.kind == EmbeddingPartType::Text && !part.value.is_empty());
+            if requested_prompt || has_text {
+                input.content.insert(0, EmbeddingPart::text(prefix));
+            }
+        }
+    }
+
+    let mut options = EmbeddingRequestOptions::default();
+    if let Some(truncate) = optional(&root, "truncate") {
+        if !truncate.is_bool() {
+            return bad_request("'truncate' must be a boolean", "invalid_parameter_type");
+        }
+        options.truncate = truncate.as_bool(false);
+    }
+
     let cancelled = || request.is_cancelled.as_ref().is_some_and(|check| check());
     let mut batch = EmbeddingBatch::default();
     let mut message = String::new();
-    match service.embed(&texts, &cancelled, &mut batch, &mut message) {
+    match service.embed_inputs(
+        &inputs,
+        request.is_cancelled.clone(),
+        &mut batch,
+        &mut message,
+        &options,
+    ) {
         EmbeddingStatus::Ok => {}
         EmbeddingStatus::Cancelled => {
             return error(499, "embedding request cancelled", "cancelled");
@@ -298,6 +596,19 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
                     batch.failed_index
                 ),
                 "context_length_exceeded",
+            );
+        }
+        EmbeddingStatus::InvalidAudioInput => {
+            return bad_request(&message, "invalid_audio_input");
+        }
+        EmbeddingStatus::InvalidInput => {
+            return bad_request(
+                if message.is_empty() {
+                    "invalid embedding input"
+                } else {
+                    &message
+                },
+                "invalid_image_input",
             );
         }
         EmbeddingStatus::Failed => {
@@ -319,7 +630,7 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
         return error(499, "embedding request cancelled", "cancelled");
     }
 
-    if batch.embeddings.len() != texts.len() || batch.token_counts.len() != texts.len() {
+    if batch.embeddings.len() != inputs.len() || batch.token_counts.len() != inputs.len() {
         return error(
             500,
             "embedding runtime returned an inconsistent batch",
@@ -328,7 +639,13 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
     }
     let prompt_tokens: usize = batch.token_counts.iter().sum();
 
-    let mut body = String::from(r#"{"object":"list","data":["#);
+    // llama.cpp's native form is a bare array whose items nest the pooled
+    // vector in a one-element list, without model or usage.
+    let mut body = String::from(if native {
+        "["
+    } else {
+        r#"{"object":"list","data":["#
+    });
     for (index, full) in batch.embeddings.iter().enumerate() {
         if full.is_empty() {
             return error(
@@ -362,6 +679,12 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
         if index != 0 {
             body.push(',');
         }
+        if native {
+            body.push_str(&format!(r#"{{"index":{index},"embedding":["#));
+            append_floats(&mut body, values);
+            body.push_str("]}");
+            continue;
+        }
         body.push_str(&format!(
             r#"{{"object":"embedding","index":{index},"embedding":"#
         ));
@@ -374,40 +697,49 @@ fn embed(request: &HttpRequest, service: &EmbeddingService) -> HttpResponse {
         }
         body.push('}');
     }
-    let model = Value::from(service.model_id()).dump().unwrap_or_default();
-    body.push_str(&format!(
-        r#"],"model":{model},"usage":{{"prompt_tokens":{prompt_tokens},"total_tokens":{prompt_tokens}}}}}"#
-    ));
+    if native {
+        body.push(']');
+    } else {
+        let model = Value::from(service.model_id()).dump().unwrap_or_default();
+        body.push_str(&format!(
+            r#"],"model":{model},"usage":{{"prompt_tokens":{prompt_tokens},"total_tokens":{prompt_tokens}}}}}"#
+        ));
+    }
 
     let mut response = HttpResponse::new(200, "OK", body)
         .with_header("Content-Type", "application/json")
         .with_header("X-Gufo-Schema", EMBEDDINGS_API_SCHEMA)
         .with_header("X-Gufo-Embedding-Backend", service.backend_name());
     response.log_details = format!(
-        "model={} inputs={} prompt_tokens={prompt_tokens} dimensions={} encoding_format={}",
+        "model={} inputs={} prompt_tokens={prompt_tokens} dimensions={} encoding_format={}{}",
         service.model_id(),
-        texts.len(),
+        inputs.len(),
         if dimensions != 0 {
             dimensions
         } else {
             batch.embeddings[0].len()
         },
-        if base64 { "base64" } else { "float" }
+        if base64 { "base64" } else { "float" },
+        if native { " shape=llama.cpp" } else { "" }
     );
     response
 }
 
 pub fn is_embeddings_api_path(path: &str) -> bool {
-    path == EMBEDDINGS_PATH
+    matches!(
+        path,
+        EMBEDDINGS_PATH | NATIVE_EMBEDDINGS_PATH | LEGACY_EMBEDDING_PATH
+    )
 }
 
-/// `POST /v1/embeddings`; other methods answer 405.
+/// `POST /v1/embeddings`, and llama.cpp's `POST /embeddings` and
+/// `POST /embedding`; other methods answer 405.
 pub fn handle_embeddings_api_request(
     request: &HttpRequest,
     service: &Arc<EmbeddingService>,
 ) -> Result<HttpResponse> {
-    if request.path == EMBEDDINGS_PATH && request.method == "POST" {
-        return Ok(embed(request, service));
+    if is_embeddings_api_path(&request.path) && request.method == "POST" {
+        return Ok(embed(request, service, request.path != EMBEDDINGS_PATH));
     }
     Ok(error(
         405,

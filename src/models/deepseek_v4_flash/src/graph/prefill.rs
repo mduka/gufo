@@ -57,8 +57,21 @@ fn row_view(
     row: u32,
     row_floats: u64,
 ) -> Result<gufo_deepseek_v4_flash_kernels::TensorView<'_>> {
-    t.view(u64::from(row) * row_floats * F32, row_floats * F32)
-        .ok_or(Error { op: "row view" })
+    span_view(t, row, 1, row_floats)
+}
+
+/// Rows `row0 .. row0 + rows` of `row_floats` floats.
+fn span_view(
+    t: &impl Input,
+    row0: u32,
+    rows: u32,
+    row_floats: u64,
+) -> Result<gufo_deepseek_v4_flash_kernels::TensorView<'_>> {
+    t.view(
+        u64::from(row0) * row_floats * F32,
+        u64::from(rows) * row_floats * F32,
+    )
+    .ok_or(Error { op: "row view" })
 }
 
 /// The weights the batched FFN half runs on: a target layer, or a DSpark
@@ -602,8 +615,17 @@ impl Graph {
                         *count = (pos0 + t_ as u32 + 1) / r;
                     }
                 } else {
-                    for t_ in 0..n_tokens {
-                        let pos = pos0 + t_;
+                    let mut t_ = 0;
+                    while t_ < n_tokens {
+                        // A store span never crosses a pool/shift boundary.
+                        // Verification retains every intermediate state for
+                        // rejected-prefix rollback.
+                        let rows = if self.spec_capture_prefixes {
+                            1
+                        } else {
+                            (n_tokens - t_).min(r - (pos0 + t_) % r)
+                        };
+                        let pos = pos0 + t_ + rows - 1;
                         let emit = (pos + 1).is_multiple_of(r);
                         if emit
                             && self.layers[il as usize].n_comp >= self.layers[il as usize].comp_cap
@@ -615,14 +637,27 @@ impl Graph {
                                 op: "compressed capacity",
                             });
                         }
-                        let kv_row = row_view(&s.comp_kv, t_, u64::from(comp_width))?;
-                        let sc_row = row_view(&s.comp_sc, t_, u64::from(comp_width))?;
+                        let kv_rows = span_view(&s.comp_kv, t_, rows, u64::from(comp_width))?;
+                        let sc_rows = span_view(&s.comp_sc, t_, rows, u64::from(comp_width))?;
                         let cache = &mut self.layers[il as usize];
                         let comp_row = cache.n_comp;
+                        if rows > 1 {
+                            b.compressor_store_batch(
+                                &kv_rows,
+                                &sc_rows,
+                                cached_mut(&mut cache.attn_state_kv)?,
+                                cached_mut(&mut cache.attn_state_score)?,
+                                attn_c.ape,
+                                N_HEAD_DIM,
+                                r,
+                                pos0 + t_,
+                                rows,
+                            )?;
+                        }
                         // in place: the compressor state
                         b.compressor_update(
-                            &kv_row,
-                            &sc_row,
+                            &kv_rows,
+                            &sc_rows,
                             cached_mut(&mut cache.attn_state_kv)?,
                             cached_mut(&mut cache.attn_state_score)?,
                             cached_mut(&mut cache.attn_comp)?,
@@ -633,16 +668,21 @@ impl Graph {
                             comp_row,
                             rope,
                             RMS_EPS,
-                            false,
+                            rows > 1,
                         )?;
                         if emit {
                             self.layers[il as usize].quantize_comp_row(b, comp_row)?;
                             self.layers[il as usize].n_comp += 1;
                         }
-                        comp_counts[t_ as usize] = self.layers[il as usize].n_comp;
-                        if t_ + 1 < n_tokens && t_ < SPEC_PREFIX_SLOTS {
+                        for row in t_..t_ + rows {
+                            comp_counts[row as usize] =
+                                comp_row + u32::from(emit && row + 1 == t_ + rows);
+                        }
+                        if self.spec_capture_prefixes && t_ + 1 < n_tokens && t_ < SPEC_PREFIX_SLOTS
+                        {
                             self.capture_prefix_attn_state(t, il, t_)?;
                         }
+                        t_ += rows;
                     }
                 }
                 n_comp = self.layers[il as usize].n_comp;
@@ -824,8 +864,18 @@ impl Graph {
                             *count = (pos0 + t_ as u32 + 1) / r;
                         }
                     } else {
-                        for t_ in 0..n_tokens {
-                            let pos = pos0 + t_;
+                        let mut t_ = 0;
+                        while t_ < n_tokens {
+                            // A store span never crosses a pool/shift
+                            // boundary. Verification retains every
+                            // intermediate state for rejected-prefix
+                            // rollback.
+                            let rows = if self.spec_capture_prefixes {
+                                1
+                            } else {
+                                (n_tokens - t_).min(r - (pos0 + t_) % r)
+                            };
+                            let pos = pos0 + t_ + rows - 1;
                             let emit = (pos + 1).is_multiple_of(r);
                             let cache = &mut self.layers[il as usize];
                             if emit && cache.n_index_comp >= cache.comp_cap {
@@ -836,13 +886,26 @@ impl Graph {
                                     op: "indexer capacity",
                                 });
                             }
-                            let kv_row = row_view(&s.comp_kv, t_, u64::from(index_width))?;
-                            let sc_row = row_view(&s.comp_sc, t_, u64::from(index_width))?;
+                            let kv_rows = span_view(&s.comp_kv, t_, rows, u64::from(index_width))?;
+                            let sc_rows = span_view(&s.comp_sc, t_, rows, u64::from(index_width))?;
                             let index_row = cache.n_index_comp;
+                            if rows > 1 {
+                                b.compressor_store_batch(
+                                    &kv_rows,
+                                    &sc_rows,
+                                    cached_mut(&mut cache.index_state_kv)?,
+                                    cached_mut(&mut cache.index_state_score)?,
+                                    idx_c.ape,
+                                    N_INDEXER_HEAD_DIM,
+                                    r,
+                                    pos0 + t_,
+                                    rows,
+                                )?;
+                            }
                             // in place: the compressor state
                             b.compressor_update(
-                                &kv_row,
-                                &sc_row,
+                                &kv_rows,
+                                &sc_rows,
                                 cached_mut(&mut cache.index_state_kv)?,
                                 cached_mut(&mut cache.index_state_score)?,
                                 cached_mut(&mut cache.index_comp)?,
@@ -853,7 +916,7 @@ impl Graph {
                                 index_row,
                                 rope,
                                 RMS_EPS,
-                                false,
+                                rows > 1,
                             )?;
                             if emit {
                                 let mut row = cached_mut(&mut cache.index_comp)?
@@ -863,10 +926,17 @@ impl Graph {
                                 b.indexer_qat(&mut row, 1, N_INDEXER_HEAD_DIM)?;
                                 self.layers[il as usize].n_index_comp += 1;
                             }
-                            index_counts[t_ as usize] = self.layers[il as usize].n_index_comp;
-                            if t_ + 1 < n_tokens && t_ < SPEC_PREFIX_SLOTS {
+                            for row in t_..t_ + rows {
+                                index_counts[row as usize] =
+                                    index_row + u32::from(emit && row + 1 == t_ + rows);
+                            }
+                            if self.spec_capture_prefixes
+                                && t_ + 1 < n_tokens
+                                && t_ < SPEC_PREFIX_SLOTS
+                            {
                                 self.capture_prefix_index_state(t, il, t_)?;
                             }
+                            t_ += rows;
                         }
                     }
                 }

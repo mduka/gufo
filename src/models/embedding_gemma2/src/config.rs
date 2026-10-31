@@ -11,6 +11,14 @@ use gufo_core::json::{self, Value};
 /// kernels also round the scaled embedding to BF16 as that execution does;
 /// the CPU reference applies the same constant but keeps the product in f32.
 pub const EMBED_SCALE: f32 = 22.625;
+pub const IMAGE_TOKEN_ID: u32 = 258880;
+pub const AUDIO_TOKEN_ID: u32 = 258881;
+pub const AUDIO_TOKEN: &str = "<|audio|>";
+pub const BEGIN_AUDIO_TOKEN: &str = "<|audio>";
+pub const END_AUDIO_TOKEN: &str = "<audio|>";
+pub const IMAGE_TOKEN: &str = "<|image|>";
+pub const BEGIN_IMAGE_TOKEN: &str = "<|image>";
+pub const END_IMAGE_TOKEN: &str = "<image|>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerType {
@@ -56,8 +64,7 @@ impl Default for LayerGeometry {
     }
 }
 
-/// The text backbone. The released checkpoint also carries vision and audio
-/// towers; this implementation reads none of their tensors.
+/// The text backbone shared by text, image and audio inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextConfig {
     pub vocab_size: u32,
@@ -102,6 +109,8 @@ pub struct ModelConfig {
     pub text_model_type: String,
     pub hidden_activation: String,
     pub text: TextConfig,
+    pub supported_vision: bool,
+    pub supported_audio: bool,
 }
 
 /// A number member stored into `output`, truncated to 32 bits like C++.
@@ -223,7 +232,70 @@ impl ModelConfig {
         let text = root.find("text_config").filter(|t| t.is_object())?;
         config.text_model_type = text.member_str("model_type", "");
         config.hidden_activation = text.member_str("hidden_activation", "");
-        parse_text_config(text, &mut config.text).then_some(config)
+        if !parse_text_config(text, &mut config.text) {
+            return None;
+        }
+        // A boolean member that exists and is false (`!as_bool(true)`).
+        let disabled =
+            |object: &Value, name: &str| object.find(name).is_some_and(|v| !v.as_bool(true));
+        if let Some(vision) = root.find("vision_config").filter(|v| v.is_object()) {
+            let rope = vision.find("rope_parameters");
+            config.supported_vision = vision.member_str("model_type", "") == "gemma4_vision"
+                && vision.member_str("dtype", "") == "bfloat16"
+                && vision.member_str("hidden_activation", "") == "gelu_pytorch_tanh"
+                && vision.member_size("hidden_size", 0) == 768
+                && vision.member_size("intermediate_size", 0) == 3072
+                && vision.member_size("num_hidden_layers", 0) == 16
+                && vision.member_size("num_attention_heads", 0) == 12
+                && vision.member_size("num_key_value_heads", 0) == 12
+                && vision.member_size("head_dim", 0) == 64
+                && vision.member_size("patch_size", 0) == 16
+                && vision.member_size("pooling_kernel_size", 0) == 3
+                && vision.member_size("position_embedding_size", 0) == 10240
+                && disabled(vision, "standardize")
+                && disabled(vision, "use_clipped_linears")
+                && disabled(vision, "attention_bias")
+                && vision.member_double("rms_norm_eps", 0.0) == 1e-6
+                && rope.is_some_and(|rope| {
+                    rope.member_str("rope_type", "") == "axial"
+                        && rope.member_double("rope_theta", 0.0) == 100.0
+                })
+                && root.member_size("vision_soft_tokens_per_image", 0) == 280
+                && root.member_size("boi_token_id", 0) == 255999
+                && root.member_size("image_token_id", 0) == 258880
+                && root.member_size("eoi_token_id", 0) == 258882;
+        }
+        if let Some(audio) = root.find("audio_config").filter(|a| a.is_object()) {
+            let channels = audio.find("subsampling_conv_channels");
+            let clipped = audio.find("use_clipped_linears");
+            config.supported_audio = audio.member_str("model_type", "") == "gemma4_audio"
+                && audio.member_str("dtype", "") == "bfloat16"
+                && audio.member_str("hidden_act", "") == "silu"
+                && audio.member_size("hidden_size", 0) == 1024
+                && audio.member_size("num_hidden_layers", 0) == 12
+                && audio.member_size("num_attention_heads", 0) == 8
+                && audio.member_size("output_proj_dims", 0) == 1536
+                && audio.member_size("conv_kernel_size", 0) == 5
+                && audio.member_size("attention_chunk_size", 0) == 12
+                && audio.member_size("attention_context_left", 0) == 13
+                && audio.member_double("attention_context_right", -1.0) == 0.0
+                && audio.member_double("attention_invalid_logits_value", 0.0) == -1e9
+                && audio.member_double("attention_logit_cap", 0.0) == 50.0
+                && audio.member_double("gradient_clipping", 0.0) == 1e10
+                && audio.member_double("residual_weight", 0.0) == 0.5
+                && audio.member_double("rms_norm_eps", 0.0) == 1e-6
+                && clipped.is_some_and(|c| c.is_bool() && c.as_bool(false))
+                && channels.is_some_and(|c| {
+                    c.is_array()
+                        && c.len() == 2
+                        && c.items()[0].as_size(0) == 128
+                        && c.items()[1].as_size(0) == 32
+                })
+                && root.member_size("audio_token_id", 0) == 258881
+                && root.member_size("boa_token_id", 0) == 256000
+                && root.member_size("eoa_token_index", 0) == 258883;
+        }
+        Some(config)
     }
 
     /// `LoadModelConfigFromPath`: `<model_dir>/config.json`.

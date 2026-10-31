@@ -12,7 +12,7 @@ use gufo_core::text::{
     TextDecodeSelection, TextExecutionPlan, TextModelRunner, TextPrefillStep, TextRunnerDescriptor,
     TextRunnerResourceClaim, TextRunnerSnapshot, TextRunnerState, Token, ToolChoice,
 };
-use gufo_serve::backend::{self, FinishReason, TextGenerationBackend};
+use gufo_serve::backend::{self, FinishReason, TextGenerationBackend, TokenPiece};
 use gufo_serve::pool::TextRunnerPool;
 use gufo_serve::scheduled_backend::ScheduledBackend;
 use gufo_serve::scheduler::{TextPrefillPolicy, TextSchedulerPolicy};
@@ -180,6 +180,7 @@ impl TextModelRunner for EchoRunner {
             stop: false,
             token,
             piece: vec![token as u8],
+            logprobs: None,
         })
     }
 
@@ -219,9 +220,9 @@ fn settings_follow_the_cpp_setters() {
     let backend = backend();
     assert!(backend.ready());
     assert_eq!(backend.model_id(), "echo");
-    backend.set_model_id("");
+    backend.set_model_ids(Vec::new());
     assert_eq!(backend.model_id(), "echo");
-    backend.set_model_id("served");
+    backend.set_model_ids(vec!["served".into()]);
     assert_eq!(backend.model_id(), "served");
 
     let sampling = SamplingConfig::with_temperature(0.5);
@@ -274,7 +275,7 @@ fn settings_follow_the_cpp_setters() {
 fn completion_and_chat_run_through_the_scheduler() {
     let backend = backend();
     let mut pieces = Vec::new();
-    let mut on_token = |piece: &[u8]| {
+    let mut on_token = |piece: &TokenPiece<'_>| {
         pieces.extend_from_slice(piece);
         true
     };
@@ -287,6 +288,7 @@ fn completion_and_chat_run_through_the_scheduler() {
             Some(&mut on_token),
             "",
             &[],
+            true,
             true,
         )
         .expect("complete");
@@ -320,7 +322,17 @@ fn prompts_without_tokens_return_empty_results() {
     assert_eq!(result.prompt_tokens, 0);
     assert!(result.text.is_empty());
     let result = backend
-        .complete("", 4, &SamplingConfig::default(), None, None, "", &[], true)
+        .complete(
+            "",
+            4,
+            &SamplingConfig::default(),
+            None,
+            None,
+            "",
+            &[],
+            true,
+            true,
+        )
         .expect("complete");
     assert_eq!(result.prompt_tokens, 0);
 
@@ -355,6 +367,7 @@ fn cancellation_before_submission_skips_generation() {
             "c",
             &[],
             true,
+            true,
         )
         .expect("complete");
     assert!(result.cancelled);
@@ -376,7 +389,7 @@ fn started_chats_are_scheduled_requests() {
     )
     .expect("start");
     let mut pieces = Vec::new();
-    let mut on_token = |piece: &[u8]| {
+    let mut on_token = |piece: &TokenPiece<'_>| {
         pieces.push(piece.to_vec());
         true
     };

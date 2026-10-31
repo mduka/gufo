@@ -8,9 +8,10 @@ are in [the DS4 benchmark README](../../docs/models/deepseek-v4-flash/BENCHMARKS
 | Tool | Purpose |
 | --- | --- |
 | `tools/ds4/check.py fast` | CLI options, chat framing and its Hugging Face goldens, exact DSpark sampling, load failures, pinned dataset audit, and answer grading |
-| `tools/ds4/check.py kernels` | Q8/IQ2/F16 and attention oracles, complete official HC formulas, and the Rust launcher probes; no model required |
+| `tools/ds4/check.py kernels` | Q8/IQ2/F16, attention and MMQ quantization oracles, complete official HC formulas, the compressor spans, router scores and the device Markov chain, and the Rust launcher probes; no model required |
 | `tools/ds4/check.py reference --model "$MODEL" --upstream "$UPSTREAM" --output /tmp/ds4-reference` | Repeated AR scoring against 105 official continuations; independent full logits and 128 forced tokens at 0/4K/8K/12K/16K, with matched 2K/4K prefill calls |
 | `tools/ds4/check.py reference --prefill-only --model "$MODEL" --upstream "$UPSTREAM" --output /tmp/ds4-prefill` | Same matched prefill grid and exact repeat check; skip continuation scoring and decode replay |
+| `tools/ds4/check.py reference --prefill-only --narrow --model "$MODEL" --upstream "$UPSTREAM" --output /tmp/ds4-narrow` | Two historical quality regression points: 32-token prefill calls at 4K/12K, with the same independent logit limits and exact repeat check |
 | `tools/ds4/check.py model --model "$MODEL" --dspark-model "$DSPARK"` | C++ parity of prefill, decode, batches, snapshots and DSpark; the QUALITY checks (`tests/quality.rs`, `tests/serving.rs`, the EOS boundary, the sampled CLI chat), including changing concurrency, snapshots through 16K, mixed sampling, and prefix/disk reuse |
 | `tools/ds4/check.py all --model "$MODEL" --dspark-model "$DSPARK"` | The fast, kernel and model suites |
 | `GUFO_DS4_QUALITY=indexer-boundary cargo test --profile gpu-test -p gufo-deepseek-v4-flash --features gpu,models --test quality -- --ignored --nocapture` | Focused DSpark C1 / AR C2 full-logit replay across the first sparse-indexer boundary (also `target`, `dspark`, `dspark-replay`, `wide-prefill`); `GUFO_DEEPSEEK_V4_FLASH_MODEL` and `GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL` override the artifacts |

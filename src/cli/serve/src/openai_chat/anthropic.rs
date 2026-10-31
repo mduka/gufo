@@ -123,6 +123,7 @@ pub(crate) fn parse_anthropic_image(
     message.images.push(gufo_core::text::ImagePart {
         offset: message.content.len(),
         bytes: Arc::new(bytes),
+        detail: gufo_core::text::ImageDetail::Auto,
     });
     Ok(())
 }

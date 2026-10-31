@@ -60,6 +60,7 @@ impl<R: TextModelRunner> Worker<R> {
             return self.complete_success(work, FinishReason::StopSequence);
         }
         if step.stop {
+            self.publish_terminal_logprobs(work, step.terminal_logprobs.as_ref())?;
             return self.complete_success(work, FinishReason::Stop);
         }
         if work.result.tokens.len() >= work.token_limit {
@@ -77,6 +78,9 @@ impl<R: TextModelRunner> Worker<R> {
                     return Ok(false);
                 }
                 work.preview_token = Some(preview.token);
+            }
+            if let Some(preview) = preview.as_ref().filter(|p| p.stop) {
+                self.publish_terminal_logprobs(work, preview.logprobs.as_ref())?;
             }
             work.preview_stops = preview.is_some_and(|p| p.stop);
             work.result.decode_ms += elapsed_ms(preview_start);
@@ -366,7 +370,8 @@ impl<R: TextModelRunner> Worker<R> {
             let finished = if work.stop_filter.stopped() {
                 self.complete_success(work, FinishReason::StopSequence)
             } else if step.stop {
-                self.complete_success(work, FinishReason::Stop)
+                self.publish_terminal_logprobs(work, step.terminal_logprobs.as_ref())
+                    .and_then(|()| self.complete_success(work, FinishReason::Stop))
             } else if work.result.tokens.len() >= work.token_limit {
                 self.complete_success(work, FinishReason::Length)
             } else {

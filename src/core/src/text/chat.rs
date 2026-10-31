@@ -51,6 +51,16 @@ impl ChatRole {
     }
 }
 
+/// The OpenAI `image_url.detail` of an image part: `Low` fits the resized
+/// image within 512 pixels per side unless the model's minimum size is
+/// larger; the other values behave as `Auto`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ImageDetail {
+    #[default]
+    Auto,
+    Low,
+}
+
 /// An image inserted before byte `offset` of the message content. Equal
 /// offsets keep input order; image-only messages use offset zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +68,7 @@ pub struct ImagePart {
     pub offset: usize,
     /// The encoded PNG or JPEG bytes.
     pub bytes: Arc<Vec<u8>>,
+    pub detail: ImageDetail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +170,9 @@ pub struct ChatRequest {
     /// Bypasses prompt reuse for this request; its completed state may still
     /// be retained.
     pub cache_prompt: bool,
+    /// False keeps this request's checkpoints out of the disk cache; it may
+    /// still read existing disk checkpoints and use the RAM cache.
+    pub cache_persist: bool,
     /// Streams llama-server `prompt_progress` before the first token; never
     /// changes the prompt or its cache identity.
     pub return_progress: bool,
@@ -185,6 +199,7 @@ impl Default for ChatRequest {
             reasoning: ReasoningOptions::default(),
             add_vision_id: false,
             cache_prompt: true,
+            cache_persist: true,
             return_progress: false,
             stop_sequences: Vec::new(),
             response_format: None,

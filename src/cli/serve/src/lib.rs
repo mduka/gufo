@@ -25,6 +25,7 @@ pub mod http;
 pub mod image_api;
 pub mod image_url;
 pub mod logging;
+pub mod logprobs;
 pub mod metrics;
 pub mod multipart;
 pub mod openai_chat;

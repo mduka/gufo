@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::deferred;
@@ -133,6 +133,92 @@ impl MappedFile {
 
     pub(crate) fn file(&self) -> &File {
         &self.file
+    }
+
+    /// Drops this process's resident pages of the mapping once its contents
+    /// live elsewhere, uploaded and synchronized (`ReleaseMappedPages`). The
+    /// mapping stays valid: a later read refaults the page from the file.
+    /// Best effort; a mapping registered with HIP, which reads it as weight
+    /// memory, keeps its pages.
+    pub fn release_pages(&self) {
+        if self
+            .registration
+            .lock()
+            .is_ok_and(|registration| registration.strong_count() != 0)
+        {
+            return;
+        }
+        // SAFETY: the whole private read-only mapping, page-aligned by mmap;
+        // dropping its page-table entries leaves every byte readable.
+        unsafe {
+            let _ = libc::madvise(self.ptr.as_ptr().cast(), self.len, libc::MADV_DONTNEED);
+        }
+    }
+
+    /// Visits the whole mapping in `chunk_bytes` pieces (a multiple of the
+    /// page size) from up to `workers` threads (`VisitMappedChunks`). Each
+    /// chunk is populated from the page cache or disk before `visit(worker,
+    /// offset, chunk)` runs and its page-table entries are dropped
+    /// afterwards; the page cache keeps the file data. A `false` from
+    /// `visit` stops the remaining chunks.
+    pub fn visit_chunks(
+        &self,
+        chunk_bytes: usize,
+        workers: usize,
+        visit: impl Fn(usize, usize, &[u8]) -> bool + Sync,
+    ) -> io::Result<()> {
+        if chunk_bytes == 0 || !chunk_bytes.is_multiple_of(4096) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk size must be a positive multiple of the page size",
+            ));
+        }
+        let chunks = self.len.div_ceil(chunk_bytes);
+        let next = AtomicUsize::new(0);
+        let stopped = AtomicBool::new(false);
+        let failure = Mutex::new(None);
+        let visit_chunks = |worker: usize| {
+            while !stopped.load(Ordering::Relaxed) {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= chunks {
+                    break;
+                }
+                let offset = index * chunk_bytes;
+                let size = chunk_bytes.min(self.len - offset);
+                let address = self.ptr.as_ptr().wrapping_add(offset).cast::<c_void>();
+                // SAFETY: a page-aligned range inside the mapping.
+                if unsafe { libc::madvise(address, size, libc::MADV_POPULATE_READ) } != 0 {
+                    if let Ok(mut slot) = failure.lock() {
+                        slot.get_or_insert(io::Error::last_os_error());
+                    }
+                    stopped.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let keep_going = visit(worker, offset, &self.bytes()[offset..offset + size]);
+                // The visitor owns a copy of these bytes now. Keep the
+                // mapping valid for the reader without retaining its
+                // populated page-table entries.
+                // SAFETY: as above; the range stays readable.
+                unsafe {
+                    let _ = libc::madvise(address, size, libc::MADV_DONTNEED);
+                }
+                if !keep_going {
+                    stopped.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            for worker in 1..workers.clamp(1, chunks.max(1)) {
+                let visit_chunks = &visit_chunks;
+                scope.spawn(move || visit_chunks(worker));
+            }
+            visit_chunks(0);
+        });
+        match failure.into_inner().ok().flatten() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Faults `range` into memory with parallel readers, which exposes the
@@ -329,6 +415,101 @@ impl Drop for MappedFile {
         unsafe {
             let _ = libc::munmap(self.ptr.as_ptr().cast(), self.len);
         }
+    }
+}
+
+/// Host-only checks of the mapping (`tests/core/platform_prefault_test.cpp`).
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    /// This process's resident kilobytes of the mapping holding `address`
+    /// (`ResidentKiB`): `mincore` would report page-cache residency, which
+    /// `MADV_DONTNEED` deliberately preserves.
+    fn resident_kib(address: *const u8) -> usize {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+        let address = address as usize;
+        let mut inside = false;
+        for line in smaps.lines() {
+            let range = line
+                .split_whitespace()
+                .next()
+                .and_then(|r| r.split_once('-'));
+            if let Some((begin, end)) = range
+                && let (Ok(begin), Ok(end)) = (
+                    usize::from_str_radix(begin, 16),
+                    usize::from_str_radix(end, 16),
+                )
+            {
+                inside = (begin..end).contains(&address);
+            } else if inside && let Some(rss) = line.strip_prefix("Rss:") {
+                return rss
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .expect("Rss");
+            }
+        }
+        panic!("mapping missing from smaps");
+    }
+
+    /// Every byte arrives once, at its offset, from a worker below the
+    /// limit, and a `false` stops the remaining chunks
+    /// (`tests/core/platform_pages_test.cpp`).
+    #[test]
+    fn chunk_visits_cover_the_file_once() {
+        // An odd size leaves a short last chunk.
+        let len = (5 << 20) + 12345;
+        let bytes: Vec<u8> = (0..len).map(|i| ((i * 131) ^ (i >> 9)) as u8).collect();
+        let path = std::env::temp_dir().join(format!("gufo-visit-{}.bin", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write");
+        let file = MappedFile::open(&path).expect("map");
+        let (chunk, workers) = (1 << 20, 3);
+        let copy = Mutex::new(vec![0u8; len]);
+        let seen = Mutex::new(vec![0; len / chunk + 1]);
+        file.visit_chunks(chunk, workers, |worker, offset, data| {
+            assert!(worker < workers);
+            assert_eq!(offset % chunk, 0);
+            assert_eq!(data.len(), chunk.min(len - offset));
+            copy.lock().expect("copy")[offset..offset + data.len()].copy_from_slice(data);
+            seen.lock().expect("seen")[offset / chunk] += 1;
+            true
+        })
+        .expect("visit");
+        assert!(copy.into_inner().expect("copy") == bytes);
+        assert!(
+            seen.into_inner()
+                .expect("seen")
+                .iter()
+                .all(|&count| count == 1)
+        );
+        let visited = AtomicUsize::new(0);
+        file.visit_chunks(chunk, 1, |_, _, _| {
+            visited.fetch_add(1, Ordering::Relaxed);
+            false
+        })
+        .expect("visit");
+        assert_eq!(visited.into_inner(), 1, "a false return stops the visit");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn released_pages_leave_the_process_and_refault() {
+        let path = std::env::temp_dir().join(format!("gufo-release-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0..4 * 4096).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).expect("write");
+        let file = MappedFile::open(&path).expect("map");
+        file.prefault(0..bytes.len()).expect("prefault");
+        let base = file.bytes().as_ptr();
+        assert_eq!(resident_kib(base), bytes.len() / 1024);
+        file.release_pages();
+        assert_eq!(resident_kib(base), 0);
+        assert_eq!(file.bytes(), bytes.as_slice(), "the mapping stays readable");
+        assert_eq!(resident_kib(base), bytes.len() / 1024);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

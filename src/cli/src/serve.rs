@@ -28,7 +28,7 @@ use gufo_serve::image_api::{
     Image as ServeImage, ImageCodec, ImageMetrics, ImageResult, ImageRunner, ImageService,
 };
 use gufo_serve::logging;
-use gufo_serve::pool::{TextRunnerDiskCacheOptions, TextRunnerPool, TextRunnerRamCacheOptions};
+use gufo_serve::pool::{TextRunnerDiskCacheOptions, TextRunnerPool};
 use gufo_serve::scheduled_backend::ScheduledBackend;
 use gufo_serve::tts_model::{ModelVariant as TtsVariant, SynthesisResult as TtsResult, TtsRunner};
 use gufo_serve::tts_service::{TtsService, TtsServiceOptions};
@@ -196,7 +196,8 @@ pub fn run(args: &[String]) -> u8 {
         Modality::Embedding {
             model,
             served_model_name,
-        } => match embedding::load(&model, &served_model_name) {
+            default_prompt_name,
+        } => match embedding::load(&model, &served_model_name, &default_prompt_name) {
             Ok(service) => services.embeddings = Some(Arc::new(service)),
             Err(code) => return code,
         },
@@ -616,13 +617,11 @@ fn start_backend<R: TextModelRunner>(
         Arc::new(runner),
         session_count,
         disk_cache,
-        TextRunnerRamCacheOptions {
-            capacity_bytes: options.cache_ram_bytes,
-        },
+        options.cache_ram,
     )?;
     let backend =
         ScheduledBackend::new(Arc::new(pool), options.prefill, options.scheduler.clone())?;
-    backend.set_model_id(&options.served_model_name);
+    backend.set_model_ids(options.served_model_names.clone());
     // As `gufo --version` prints it.
     backend.set_served_artifact(
         &options.model,
@@ -782,6 +781,17 @@ fn start_flash_next(
             .then(|| options.vision_model.clone().into()),
         enable_yarn: options.enable_yarn,
     })?;
+    let expanded = runner.expanded_q8_0_tensors();
+    if expanded != 0 {
+        logging::warn(
+            "loader",
+            &format!(
+                "event=q8_0_expanded tensors={expanded} \
+                 reason=hc_inject_and_ssm_alpha_beta_are_q8_0 (the official GGUF keeps them \
+                 F32; expanded to F32 at load, re-quantize them as F32)"
+            ),
+        );
+    }
     if options.enable_yarn {
         let native = gufo_qwen38_flash_next::runner::native_context(Path::new(&options.model));
         if let Some(scaling) = gufo_qwen38_flash_next::rope_scaling::rope_scaling_for_context(
@@ -927,10 +937,16 @@ fn load_text(
             return Err(1);
         }
     };
+    let ids = backend.model_ids();
+    let served_names = if ids.len() > 1 {
+        format!(" served_names={}", ids.join(","))
+    } else {
+        String::new()
+    };
     load_log.complete(
         &format!(
             "model={} sessions={session_count} context_tokens={} speculative={} \
-             draft_limit={} disk_cache={}",
+             draft_limit={} disk_cache={}{served_names}",
             backend.model_id(),
             options.max_context,
             options.speculative.name(),

@@ -308,17 +308,32 @@ void DsparkCandidates(void* out, uint64_t* scratch, const float* logits,
       static_cast<const unsigned char*>(confidence), rank);
 }
 
-void DsparkMarkovArgmax(int32_t* out_index, uint64_t* scratch_key,
-                        const float* logits_row, const void* w1_row,
-                        const void* w2, uint32_t vocab, uint32_t markov_rank,
-                        hipStream_t stream) {
+void DsparkMarkovChain(int32_t* out_index, uint64_t* scratch_key,
+                       const float* logits_rows, const void* w1,
+                       const void* w2, uint32_t vocab, uint32_t markov_rank,
+                       uint32_t previous_token, uint32_t rows,
+                       hipStream_t stream) {
   auto* key = reinterpret_cast<unsigned long long*>(scratch_key);
-  (void)hipMemsetAsync(key, 0, sizeof(unsigned long long), stream);
+  const auto* w1b = static_cast<const unsigned char*>(w1);
+  const auto* w2b = static_cast<const unsigned char*>(w2);
+  const uint32_t rank_blocks = markov_rank / 32u;
+  const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
   const uint32_t blocks = (vocab + 255u) / 256u;
-  dspark_markov_argmax_kernel<<<blocks, 256, 0, stream>>>(
-      key, logits_row, static_cast<const unsigned char*>(w1_row),
-      static_cast<const unsigned char*>(w2), vocab, markov_rank / 32u);
-  dspark_markov_key_decode_kernel<<<1, 1, 0, stream>>>(out_index, key);
+  for (uint32_t row = 0; row < rows; ++row) {
+    (void)hipMemsetAsync(key, 0, sizeof(*key), stream);
+    const float* logits = logits_rows + (uint64_t)row * vocab;
+    // Preserve the sequential Markov dependency on the stream. Only the
+    // first previous token comes from the host; subsequent positions consume
+    // the preceding kernel's index directly.
+    if (row == 0u)
+      dspark_markov_argmax_kernel<false><<<blocks, 256, 0, stream>>>(
+          key, logits, w1b + (uint64_t)previous_token * row_bytes, w2b, vocab,
+          rank_blocks);
+    else
+      dspark_markov_argmax_kernel<true><<<blocks, 256, 0, stream>>>(
+          key, logits, w1b, w2b, vocab, rank_blocks, out_index + row - 1u);
+    dspark_markov_key_decode_kernel<<<1, 1, 0, stream>>>(out_index + row, key);
+  }
 }
 
 bool DsparkMarkovArgmaxBatch(int32_t* out_index, uint64_t* scratch_key,

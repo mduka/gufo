@@ -49,3 +49,19 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     }
     dot / (na * nb).sqrt()
 }
+
+/// The synthetic image of a fixture specification (`MakeImage`).
+pub fn make_image(specification: &gufo_core::json::Value) -> gufo_core::image::Image {
+    let width = specification.member_size("width", 0);
+    let height = specification.member_size("height", 0);
+    let seed = specification.member_size("seed", 0);
+    let mut pixels = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            for c in 0..3 {
+                pixels.push(((x * 17 + y * 31 + c * 67 + (x * y + seed * 13) % 251) % 256) as u8);
+            }
+        }
+    }
+    gufo_core::image::Image::new(width as u32, height as u32, pixels).unwrap()
+}

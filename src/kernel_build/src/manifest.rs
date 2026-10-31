@@ -188,6 +188,18 @@ pub enum Kind {
     /// The launcher's `hipStream_t`, for C++ signatures that do not take it
     /// last (defaulted parameters after it); otherwise it is appended.
     Stream,
+    /// Another stream the C++ launcher orders itself (`hipStream_t`, null
+    /// when absent): it records on the launch stream and makes this one wait
+    /// before queueing work on it. Passed as `Option<&gufo_hip::Stream>`,
+    /// never the launch stream, never while it records a graph. Always
+    /// optional. Trusted base: what the launcher writes on it is complete
+    /// only after an event the caller records there.
+    #[serde(rename = "side_stream")]
+    SideStream,
+    /// A `hipEvent_t` (null when absent) the C++ launcher records or waits
+    /// for, passed as `Option<&gufo_hip::Event>`; never while the launch
+    /// stream records a graph. Always optional.
+    Event,
     /// Rows the kernels read through a device header of `cpp_type` (a
     /// pointer to `{ const elem* rows; u32 count; i32 tag }`), passed as
     /// `gufo_hip::RowTable<elem, width>`; kernels read at most `count` rows.
@@ -797,6 +809,13 @@ impl Launcher {
                 Kind::Stream => {
                     if p.elem.is_some() || p.len.is_some() || p.optional || p.contract_only {
                         return Err(format!("{at}: a `stream` takes no other fields"));
+                    }
+                }
+                Kind::SideStream | Kind::Event => {
+                    if p.elem.is_some() || p.len.is_some() || p.optional || p.contract_only {
+                        return Err(format!(
+                            "{at}: a `side_stream` or `event` is always optional and takes no other fields"
+                        ));
                     }
                 }
                 Kind::Const => {

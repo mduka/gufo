@@ -165,6 +165,10 @@ pub struct SnapshotSupport<S, P> {
     pub restore: Option<SnapshotRestore<S, P>>,
     pub capacity_bytes: Option<SnapshotCapacity>,
     pub on_event: Option<SnapshotEventSink>,
+    /// False keeps nothing in RAM (`--cache-ram-bytes off` beside a disk
+    /// cache): every reservation is refused without an event, so a capture
+    /// goes to disk alone, and restores serve disk checkpoints.
+    pub retain: bool,
 }
 
 impl<S, P> Default for SnapshotSupport<S, P> {
@@ -173,6 +177,7 @@ impl<S, P> Default for SnapshotSupport<S, P> {
             restore: None,
             capacity_bytes: None,
             on_event: None,
+            retain: true,
         }
     }
 }
@@ -646,6 +651,9 @@ impl<S: ContinuationState, P: ContinuationSnapshot> Lease<S, P> {
             return Err(Error::logic(
                 "continuation cache lease already has a snapshot reservation",
             ));
+        }
+        if !shared.support.retain {
+            return Ok(false);
         }
         // Reclaiming a retained copy of the same prefix keeps its learned
         // branch point for this publication.

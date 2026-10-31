@@ -84,8 +84,18 @@ pub struct Allocation {
     home: Arc<StreamInner>,
     shared: bool,
     owned: AtomicBool,
+    /// A [`Fork`](crate::Fork)'s claim while it runs work on its side
+    /// stream: [`HANDED`] with the side's id while the memory is handed over
+    /// to the side, else the number of lendings for reading.
+    lending: AtomicU64,
     backing: Backing,
 }
+
+/// The [`Allocation::lending`] bit of memory handed over to a side stream.
+const HANDED: u64 = 1 << 63;
+
+/// The stream id of views that may be used on no stream.
+const NO_STREAM: u64 = u64::MAX;
 
 /// Where the memory behind an allocation comes from.
 enum Backing {
@@ -127,6 +137,61 @@ impl Allocation {
     /// immutable memory that every stream may read.
     pub fn home_stream(&self) -> Option<u64> {
         (!self.shared).then_some(self.home.id)
+    }
+
+    /// The stream views may read this memory on, `None` for every stream:
+    /// a fork's side while the memory is handed over to it, every stream
+    /// while a fork lends it for reading.
+    fn read_stream(&self) -> Option<u64> {
+        if self.shared {
+            return None;
+        }
+        match self.lending.load(Ordering::Acquire) {
+            0 => Some(self.home.id),
+            lending if lending & HANDED != 0 => Some(lending & !HANDED),
+            _ => None,
+        }
+    }
+
+    /// The stream views may write this memory on: a fork's side while the
+    /// memory is handed over to it, none while a fork lends it for reading.
+    fn write_stream(&self) -> u64 {
+        match self.lending.load(Ordering::Acquire) {
+            0 => self.home.id,
+            lending if lending & HANDED != 0 => lending & !HANDED,
+            _ => NO_STREAM,
+        }
+    }
+
+    /// Hands the memory over to stream `side` until [`Allocation::give_back`];
+    /// fails while it is lent already.
+    pub(crate) fn hand_over(&self, side: u64) -> bool {
+        self.lending
+            .compare_exchange(0, HANDED | side, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Lends the memory for reading until [`Allocation::give_back`]; fails
+    /// while it is handed over.
+    pub(crate) fn lend_reads(&self) -> bool {
+        self.lending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |lending| {
+                (lending & HANDED == 0).then_some(lending + 1)
+            })
+            .is_ok()
+    }
+
+    /// Ends a hand-over or one lending for reading.
+    pub(crate) fn give_back(&self) {
+        let _ = self
+            .lending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |lending| {
+                Some(if lending & HANDED != 0 {
+                    0
+                } else {
+                    lending.saturating_sub(1)
+                })
+            });
     }
 
     /// Whether the host addresses this memory too (managed or host memory).
@@ -227,6 +292,7 @@ impl Owner {
                 home: Arc::clone(home),
                 shared: true,
                 owned: AtomicBool::new(true),
+                lending: AtomicU64::new(0),
                 backing: Backing::Mapped(mapping),
             }),
         }
@@ -287,6 +353,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             home: Arc::clone(home),
             shared: false,
             owned: AtomicBool::new(true),
+            lending: AtomicU64::new(0),
             backing,
         };
         Ok(Self {
@@ -340,6 +407,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
                     home: Arc::clone(home),
                     shared: false,
                     owned: AtomicBool::new(true),
+                    lending: AtomicU64::new(0),
                     backing,
                 }),
             },
@@ -763,9 +831,11 @@ impl<'a, T> DeviceSlice<'a, T> {
         self.len == 0
     }
 
-    /// The home stream, or `None` for an immutable tensor.
+    /// The stream the view may be used on: the home stream, or a fork's
+    /// side ([`Fork`](crate::Fork)); `None` for an immutable tensor and
+    /// while a fork lends the memory for reading.
     pub fn home_stream(&self) -> Option<u64> {
-        self.allocation.home_stream()
+        self.allocation.read_stream()
     }
 
     pub fn allocation(&self) -> &'a Arc<Allocation> {
@@ -844,9 +914,11 @@ impl<'a, T> DeviceSliceMut<'a, T> {
         self.len == 0
     }
 
-    /// The home stream; mutable views always have one.
+    /// The stream the view may be written on: the home stream, a fork's
+    /// side, or no stream while a fork lends the memory for reading
+    /// ([`Fork`](crate::Fork)).
     pub fn home_stream(&self) -> u64 {
-        self.allocation.home.id
+        self.allocation.write_stream()
     }
 
     pub fn allocation(&self) -> &'a Arc<Allocation> {

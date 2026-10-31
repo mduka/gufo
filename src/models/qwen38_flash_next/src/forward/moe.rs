@@ -43,7 +43,70 @@ impl Pass<'_> {
             stream.download_async(self.s.expert_counts.view().values(), &mut self.host.counts)?;
         }
         // The shared expert does not depend on routing: queued after the
-        // count download, before the host prepares the routed dispatch.
+        // count download, before the host prepares the routed dispatch. A
+        // wide batch runs it on the side stream beside the routed experts,
+        // which leave compute idle while they stream expert weights. The
+        // shared expert writes its own scratch and may quantize `mixed` into
+        // `x_q8t`: the fork hands those to the side, so no main-stream work
+        // may use them before the epilogue joins it. Only the Q8_0 shared
+        // expert overlaps: its kernels take the stream, while the BF16, F16
+        // and F32 routes go through BLAS handles bound to the main stream. A
+        // capture keeps it on `stream`.
+        let overlap = self.ctx.route.expert_matrix_rows(n)
+            && !last_only
+            && [&m.shexp_gate, &m.shexp_up, &m.shexp_down]
+                .iter()
+                .all(|w| w.format() == GgmlType::Q8_0)
+            && !stream.is_recording();
+        let fork = if overlap {
+            let side = self.ctx.side;
+            let fork = stream
+                .fork(&side.stream, &side.start, &side.done)
+                .map_err(|e| format!("side stream fork: {e}"))?;
+            fork.lend(self.s.mixed.allocation())
+                .and_then(|()| {
+                    [
+                        self.s.shexp_up.allocation(),
+                        self.s.shexp_gate.allocation(),
+                        self.s.shexp_half.allocation(),
+                        self.s.shexp_out.allocation(),
+                        self.ctx.stage.x_q8t.allocation(),
+                    ]
+                    .into_iter()
+                    .try_for_each(|memory| fork.hand_over(memory))
+                })
+                .map_err(|e| format!("side stream fork: {e}"))?;
+            self.ctx.stream = &side.stream;
+            Some(fork)
+        } else {
+            None
+        };
+        let shared = self.shared_expert(m, n);
+        self.ctx.stream = stream;
+        let shared_q8 = shared?;
+        if last_only
+            && m.gate_exps.format() == GgmlType::Q8_0
+            && m.up_exps.format() == GgmlType::Q8_0
+            && m.down_exps.format() == GgmlType::Q8_0
+        {
+            // Catch-up keeps only the final row: its routed experts run with
+            // the tiled arithmetic of a whole prompt batch.
+            let (row, prefill) = (self.row, self.ctx.route.prefill);
+            self.row = row + n as usize - 1;
+            self.ctx.route.prefill = true;
+            let result = self.moe_experts(m, 1, None, None);
+            self.row = row;
+            self.ctx.route.prefill = prefill;
+            return result;
+        }
+        // The routed experts read the shared expert's Q8_1 rows of `mixed`.
+        self.moe_experts(m, n, shared_q8, fork)
+    }
+
+    /// The shared expert of `moe` on `ctx.stream`; returns the `x_q8` slot
+    /// that holds the Q8_1 rows of `mixed`, if it quantized them.
+    fn shared_expert(&mut self, m: &Moe, n: u32) -> Result<Option<usize>> {
+        let (r, w) = (self.row, self.w);
         self.ctx.route.shexp_half_ready = false;
         let shared_q8 = {
             let (shexp_gate, shexp_up) = (&mut self.s.shexp_gate, &mut self.s.shexp_up);
@@ -62,7 +125,7 @@ impl Pass<'_> {
             let rows = m.shexp_down.rows as usize;
             launched(
                 k::dense_f16_gemm(
-                    stream,
+                    self.ctx.stream,
                     m.shexp_down.view(),
                     at(&self.s.shexp_half, r * w.shared_ff).range(0..n as usize * w.shared_ff),
                     at_mut(&mut self.s.shexp_out, r * w.hidden).range(0..n as usize * rows),
@@ -80,23 +143,7 @@ impl Pass<'_> {
                 n,
             )?;
         }
-        if last_only
-            && m.gate_exps.format() == GgmlType::Q8_0
-            && m.up_exps.format() == GgmlType::Q8_0
-            && m.down_exps.format() == GgmlType::Q8_0
-        {
-            // Catch-up keeps only the final row: its routed experts run with
-            // the tiled arithmetic of a whole prompt batch.
-            let (row, prefill) = (self.row, self.ctx.route.prefill);
-            self.row = row + n as usize - 1;
-            self.ctx.route.prefill = true;
-            let result = self.moe_experts(m, 1, None);
-            self.row = row;
-            self.ctx.route.prefill = prefill;
-            return result;
-        }
-        // The routed experts read the shared expert's Q8_1 rows of `mixed`.
-        self.moe_experts(m, n, shared_q8)
+        Ok(shared_q8)
     }
 
     /// Reads the counts of a tiled batch back and builds the routed tile
@@ -165,7 +212,13 @@ impl Pass<'_> {
 
     /// The routed experts once router and shared expert are queued
     /// (`MoeExperts`); `x_q8` as for `Ctx::gated_experts`.
-    pub fn moe_experts(&mut self, m: &Moe, n: u32, x_q8: Option<usize>) -> Result<()> {
+    pub fn moe_experts(
+        &mut self,
+        m: &Moe,
+        n: u32,
+        x_q8: Option<usize>,
+        side: Option<Fork<'_>>,
+    ) -> Result<()> {
         let c = self.c().clone();
         let (r, w) = (self.row, self.w);
         let stream = self.ctx.stream;
@@ -359,6 +412,10 @@ impl Pass<'_> {
                 1,
                 n,
             )?;
+        }
+        // The epilogue reads the shared expert's output (`JoinSide`).
+        if let Some(fork) = side {
+            fork.join().map_err(|e| format!("side stream join: {e}"))?;
         }
         let gate = at(&self.s.router, r * w.router + c.num_experts as usize);
         let weights = at(&self.s.weights, r * w.used);

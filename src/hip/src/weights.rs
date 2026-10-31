@@ -41,7 +41,7 @@ use std::thread::ScopedJoinHandle;
 use crate::error::{HipError, check};
 use crate::mapped::MappedFile;
 use crate::memory::{DeviceBuffer, DeviceCopy, DeviceTensor, Owner, PinnedBuffer};
-use crate::stream::Stream;
+use crate::stream::{Stream, heap_fits_above_reserve};
 use crate::sys;
 
 /// Device offset alignment of tensors in the copy arenas.
@@ -62,6 +62,9 @@ const ARENAS_AHEAD: usize = 2;
 const CHUNK: usize = 16 << 20;
 const DIRECT_ALIGNMENT: usize = 4096;
 const UPLOADERS: usize = 16;
+/// Chunk and worker count of a device image (`CopyMappedRegion`).
+const IMAGE_CHUNK: usize = 64 << 20;
+const IMAGE_WORKERS: usize = 8;
 
 static NEXT_LOADER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -82,8 +85,19 @@ pub enum Placement {
     /// A registered anonymous copy of each file in transparent huge pages
     /// ([`MappedFile::host_copy`]); tensors keep their file offsets, which
     /// must be aligned to their element type. The C++ Qwen text engine reads
-    /// its weights this way.
+    /// its weights this way when the device heap has no room.
     HostCopy,
+    /// An image of each file in device memory, read through the page cache
+    /// in 64 MiB chunks by eight workers, each through its own pinned
+    /// staging buffer, that drop the mapping's pages as they go (the C++ Qwen
+    /// loader's `CopyMappedRegion`). Device memory is not on the kernel's
+    /// page LRU, so compaction never migrates it; a registered anonymous
+    /// copy is, and every migration stalls the kernels reading it. A file
+    /// whose image would leave the device heap less than its dispatch
+    /// reserve, or whose allocation fails, gets [`Placement::HostCopy`].
+    /// Tensors keep their file offsets, which must be aligned to their
+    /// element type.
+    DeviceImage,
 }
 
 /// Reads every page of `files` into the page cache and maps it.
@@ -166,6 +180,9 @@ impl LoadedWeights {
     }
 }
 
+/// A device-image worker's stream and pinned staging buffer, made on first use.
+type Staging = Mutex<Option<(Stream, PinnedBuffer<u8>)>>;
+
 impl<'s> WeightLoader<'s> {
     pub fn new(stream: &'s Stream, placement: Placement) -> Self {
         Self {
@@ -206,8 +223,10 @@ impl<'s> WeightLoader<'s> {
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or(HipError::refused("weight size overflows"))?;
-        if matches!(self.placement, Placement::Map | Placement::HostCopy)
-            && !offset.is_multiple_of(align_of::<T>())
+        if matches!(
+            self.placement,
+            Placement::Map | Placement::HostCopy | Placement::DeviceImage
+        ) && !offset.is_multiple_of(align_of::<T>())
         {
             return Err(HipError::refused(
                 "mapped weight is not aligned to its element type",
@@ -297,6 +316,7 @@ impl<'s> WeightLoader<'s> {
             Placement::CachedCopy => self.finish_cached()?,
             Placement::Map => self.finish_map()?,
             Placement::HostCopy => self.finish_host_copy()?,
+            Placement::DeviceImage => self.finish_device_image()?,
         };
         Ok(LoadedWeights {
             loader: self.id,
@@ -567,6 +587,99 @@ impl<'s> WeightLoader<'s> {
         Ok(tensors)
     }
 
+    fn finish_device_image(&self) -> Result<Vec<(Arc<Owner>, usize)>, HipError> {
+        let mut owners: Vec<(&Arc<MappedFile>, Arc<Owner>)> = Vec::new();
+        let mut tensors = Vec::with_capacity(self.queued.len());
+        // Single-range tensors without a tail only (`add_parts`).
+        for e in self.queued.iter().map(|q| &self.entries[q.first]) {
+            let owner = match owners.iter().find(|(file, _)| Arc::ptr_eq(file, &e.file)) {
+                Some((_, owner)) => Arc::clone(owner),
+                None => {
+                    let owner = match self.device_image(&e.file)? {
+                        Some(owner) => owner,
+                        None => {
+                            let copy = e.file.host_copy().map_err(|_| {
+                                HipError::refused("cannot copy the mapped weight file")
+                            })?;
+                            copy.register(self.stream)?
+                        }
+                    };
+                    owners.push((&e.file, Arc::clone(&owner)));
+                    owner
+                }
+            };
+            tensors.push((owner, e.file_offset));
+        }
+        Ok(tensors)
+    }
+
+    /// The device image of `file`, or `None` when the heap has no room for
+    /// it above the dispatch reserve or refuses the allocation.
+    fn device_image(&self, file: &MappedFile) -> Result<Option<Arc<Owner>>, HipError> {
+        let fits = crate::stream::device_memory()
+            .is_ok_and(|(free, _)| heap_fits_above_reserve(free as u64, file.len() as u64));
+        let Some(mut image) = fits
+            .then(|| self.stream.alloc_persistent::<u8>(file.len()).ok())
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let base = image.as_mut_slice().address();
+        let failure = Mutex::new(None);
+        let staging: Vec<Staging> = (0..IMAGE_WORKERS).map(|_| Mutex::new(None)).collect();
+        let fail = |error: HipError| {
+            if let Ok(mut slot) = failure.lock() {
+                slot.get_or_insert(error);
+            }
+            false
+        };
+        let visited = file.visit_chunks(IMAGE_CHUNK, IMAGE_WORKERS, |worker, offset, chunk| {
+            let Ok(mut slot) = staging[worker].lock() else {
+                return fail(HipError::refused("weight staging lock poisoned"));
+            };
+            if slot.is_none() {
+                match Stream::new().and_then(|s| Ok((s, PinnedBuffer::<u8>::zeroed(IMAGE_CHUNK)?)))
+                {
+                    Ok(pair) => *slot = Some(pair),
+                    Err(error) => return fail(error),
+                }
+            }
+            let Some((stream, buffer)) = slot.as_mut() else {
+                return false;
+            };
+            let host = match buffer.host_mut() {
+                Ok(host) => host,
+                Err(error) => return fail(error),
+            };
+            host[..chunk.len()].copy_from_slice(chunk);
+            // SAFETY: the destination lies inside the image (the chunk is
+            // inside the file the image mirrors), which outlives this call;
+            // the source is pinned staging memory unchanged until the copy
+            // completes below.
+            let status = unsafe {
+                sys::hipMemcpyAsync(
+                    (base + offset) as *mut std::ffi::c_void,
+                    host.as_ptr().cast(),
+                    chunk.len(),
+                    sys::HIP_MEMCPY_HOST_TO_DEVICE,
+                    stream.as_raw(),
+                )
+            };
+            match stream
+                .observe(check(status, "hipMemcpyAsync weight image"))
+                .and_then(|()| stream.synchronize())
+            {
+                Ok(()) => true,
+                Err(error) => fail(error),
+            }
+        });
+        if let Some(error) = failure.into_inner().ok().flatten() {
+            return Err(error);
+        }
+        visited.map_err(|_| HipError::refused("cannot read mapped Qwen weights"))?;
+        Ok(Some(Arc::clone(image.freeze(self.stream)?.owner())))
+    }
+
     fn finish_map(&self) -> Result<Vec<(Arc<Owner>, usize)>, HipError> {
         self.prefault_files()?;
         let mut owners: Vec<(Arc<MappedFile>, Arc<Owner>)> = Vec::new();
@@ -734,12 +847,13 @@ fn read_chunk(
         let begin = offset / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT;
         let skip = offset - begin;
         let length = (skip + size).next_multiple_of(DIRECT_ALIGNMENT);
-        match read_fully(direct, &mut staging[..length], begin, skip + size) {
-            Ok(()) => return Ok(skip..skip + size),
-            // Some filesystems accept O_DIRECT at open but reject the reads.
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) => {
-            }
-            Err(error) => return Err(error),
+        // A failed unbuffered read retries through the buffered descriptor,
+        // which reports its own error. Some filesystems accept unbuffered
+        // opens but reject aligned reads, and Windows refuses an unbuffered
+        // read with ERROR_NO_SYSTEM_RESOURCES when it cannot lock the pages
+        // in memory.
+        if read_fully(direct, &mut staging[..length], begin, skip + size).is_ok() {
+            return Ok(skip..skip + size);
         }
     }
     read_fully(file.file(), &mut staging[..size], offset, size)?;
@@ -773,6 +887,32 @@ fn read_fully(file: &File, buffer: &mut [u8], offset: usize, required: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed unbuffered read falls back to the buffered descriptor
+    /// instead of failing the load (upstream's `pread` fault in
+    /// `tests/core/hip_weight_upload_test.cpp`): here a write-only
+    /// descriptor stands in for the direct one, so its reads fail.
+    #[test]
+    fn failed_direct_reads_fall_back_to_buffered_reads() {
+        let path = std::env::temp_dir().join(format!("gufo-fallback-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0..3 * DIRECT_ALIGNMENT as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = MappedFile::open(&path).unwrap();
+        let failing = OpenOptions::new().write(true).open(&path).unwrap();
+        let (offset, size) = (DIRECT_ALIGNMENT + 5, DIRECT_ALIGNMENT);
+        let mut staging = vec![0u8; 3 * DIRECT_ALIGNMENT];
+        let range = read_chunk(&file, Some(&failing), offset, size, &mut staging).unwrap();
+        assert_eq!(
+            range,
+            0..size,
+            "the buffered read places the bytes at the start"
+        );
+        assert_eq!(staging[range], bytes[offset..offset + size]);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Small limits: several arenas plus a final one of the trailing
     /// entries; every tensor still reads back its file bytes.

@@ -3,10 +3,11 @@
 //! files. `--official OUT.json` scores the 105 official 0731 continuations
 //! (`tests/models/deepseek_v4_flash/fixtures/official-0731.json`) by forced
 //! decoding: per step the target, the greedy token and the target's log
-//! probability. `--reference-frontiers OUT-DIR [--prefill-only]` writes the
-//! full logits before (and after 128 forced tokens) of chat prompts of 16,
-//! 4K, 8K, 12K and 16K tokens prefilled in 2K and 4K calls, with their
-//! prompts, tokens and a manifest for the upstream run. The model is
+//! probability. `--reference-frontiers OUT-DIR [--prefill-only] [--narrow]`
+//! writes the full logits before (and after 128 forced tokens) of chat
+//! prompts of 16, 4K, 8K, 12K and 16K tokens prefilled in 2K and 4K calls
+//! (`--narrow`: 4K and 12K in 32-token calls), with their prompts, tokens and
+//! a manifest for the upstream run. The model is
 //! `GUFO_DEEPSEEK_V4_FLASH_MODEL`:
 //! cargo run --release -p gufo-deepseek-v4-flash --example reference -- --official OUT.json
 
@@ -322,7 +323,12 @@ fn lines(tokens: &[i32]) -> String {
 }
 
 /// `DumpReferenceFrontiers`.
-fn dump_frontiers(engine: &mut Engine, directory: &Path, prefill_only: bool) -> Result<()> {
+fn dump_frontiers(
+    engine: &mut Engine,
+    directory: &Path,
+    prefill_only: bool,
+    narrow: bool,
+) -> Result<()> {
     require(
         !directory.exists(),
         "frontier output directory already exists",
@@ -364,7 +370,14 @@ fn dump_frontiers(engine: &mut Engine, directory: &Path, prefill_only: bool) -> 
     let vocabulary = engine.vocab.len();
     let mut points = Vec::new();
     let mut manifest = String::new();
-    for depth in [0usize, 4096, 8192, 12288, 16384] {
+    // Narrow MMQ tiles were invisible to the original 2K/4K call grid. Keep
+    // the two known regression points available without a full model sweep.
+    let (depths, prefill_steps): (&[usize], &[usize]) = if narrow {
+        (&[4096, 12288], &[32])
+    } else {
+        (&[0, 4096, 8192, 12288, 16384], &[2048, 4096])
+    };
+    for &depth in depths {
         let prefix = if depth == 0 { 16 } else { depth };
         require(
             prefix > overhead,
@@ -390,7 +403,7 @@ fn dump_frontiers(engine: &mut Engine, directory: &Path, prefill_only: bool) -> 
             "frontier prompt",
         )?;
         let absolute = std::path::absolute(&prompt_path).map_err(|e| e.to_string())?;
-        for prefill_step in [2048usize, 4096] {
+        for &prefill_step in prefill_steps {
             let mut session = engine
                 .create_session(20480, false)
                 .map_err(|e| e.to_string())?;
@@ -466,7 +479,15 @@ fn dump_frontiers(engine: &mut Engine, directory: &Path, prefill_only: bool) -> 
     let report = Value::object()
         .with("vocab", vocabulary as f64)
         .with("dtype", "float32-le")
-        .with("prefill_policy", "explicit 2048/4096-token calls")
+        .with(
+            "prefill_policy",
+            if narrow {
+                "explicit 32-token calls"
+            } else {
+                "explicit 2048/4096-token calls"
+            },
+        )
+        .with("narrow", narrow)
         .with("context_capacity", 20480.0)
         .with(
             "prefix",
@@ -487,21 +508,24 @@ fn main() -> std::result::Result<(), String> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .ok_or("GUFO_DEEPSEEK_V4_FLASH_MODEL is not set")?;
-    let usage =
-        "usage: reference --official OUT.json | --reference-frontiers OUT-DIR [--prefill-only]";
-    let mut engine = Engine::open(&model, None)?;
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        ["--official", output] => score_official(&mut engine, Path::new(output)),
-        ["--reference-frontiers", directory] => {
-            dump_frontiers(&mut engine, Path::new(directory), false)
+    let usage = "usage: reference --official OUT.json | \
+                 --reference-frontiers OUT-DIR [--prefill-only] [--narrow]";
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (mut prefill_only, mut narrow) = (false, false);
+    if let ["--reference-frontiers", _, options @ ..] = args.as_slice() {
+        for &option in options {
+            match option {
+                "--prefill-only" if !prefill_only => prefill_only = true,
+                "--narrow" if !narrow => narrow = true,
+                _ => return Err(format!("unknown or repeated frontier option: {option}")),
+            }
         }
-        ["--reference-frontiers", directory, "--prefill-only"] => {
-            dump_frontiers(&mut engine, Path::new(directory), true)
+    }
+    let mut engine = Engine::open(&model, None)?;
+    match args.as_slice() {
+        ["--official", output] => score_official(&mut engine, Path::new(output)),
+        ["--reference-frontiers", directory, ..] => {
+            dump_frontiers(&mut engine, Path::new(directory), prefill_only, narrow)
         }
         _ => Err(usage.into()),
     }

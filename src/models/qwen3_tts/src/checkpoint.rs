@@ -218,6 +218,15 @@ impl Checkpoint {
         &self.files[index].file
     }
 
+    /// Drops the resident pages of every mapped file once the caller's
+    /// weights live in device memory (`ReleaseHostPages`). Tensors stay
+    /// readable: their pages refault.
+    pub fn release_host_pages(&self) {
+        for file in &self.files {
+            file.file.release_pages();
+        }
+    }
+
     /// The payload bytes of `tensor`.
     pub fn bytes(&self, tensor: &Tensor) -> &[u8] {
         &self.files[tensor.file].file.bytes()[tensor.offset..tensor.offset + tensor.bytes]

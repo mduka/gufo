@@ -106,10 +106,11 @@ void DsparkCandidates(void* out, uint64_t* scratch, const float* logits,
                       const void* w1, const void* w2, const void* confidence,
                       uint32_t vocab, uint32_t rank, uint32_t hidden_width,
                       uint32_t requests, hipStream_t stream);
-void DsparkMarkovArgmax(int32_t* out_index, uint64_t* scratch_key,
-                        const float* logits_row, const void* w1_row,
-                        const void* w2, uint32_t vocab, uint32_t markov_rank,
-                        hipStream_t stream);
+void DsparkMarkovChain(int32_t* out_index, uint64_t* scratch_key,
+                       const float* logits_rows, const void* w1,
+                       const void* w2, uint32_t vocab, uint32_t markov_rank,
+                       uint32_t previous_token, uint32_t rows,
+                       hipStream_t stream);
 bool DsparkMarkovArgmaxBatch(int32_t* out_index, uint64_t* scratch_key,
                              const float* logits_rows,
                              std::size_t logits_row_stride,

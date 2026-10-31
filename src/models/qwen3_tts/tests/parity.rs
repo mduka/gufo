@@ -8,7 +8,7 @@
 //! former C ABI (the C++ runner replaced [`run_rust`] in this file, run with
 //! the same cases). ROCm 10.1 changes the codec decoder's samples, not the
 //! codes; `record_fixture` wrote them from this engine, whose CustomVoice
-//! and VoiceDesign audio equals that of C++ v0.23.0 on ROCm 10.1 in the A/B
+//! and VoiceDesign audio equals that of C++ v0.27.0 on ROCm 10.1 in the A/B
 //! runs (docs/RUST.md):
 //! cargo test -p gufo-qwen3-tts --features gpu,models --test parity -- --ignored record_fixture
 

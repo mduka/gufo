@@ -603,29 +603,32 @@ probes = [
 ]
 
 [[launcher]]
-name = "dspark_markov_argmax"
-cpp = "DsparkMarkovArgmax"
+name = "dspark_markov_chain"
+cpp = "DsparkMarkovChain"
 returns = "void"
-doc = "The Markov-coupled argmax of one logit row, given the previous token's W1 row."
+doc = "The Markov-coupled argmax of `rows` logit rows `vocab` floats apart: the first after `previous_token`, each later one after the index the previous row selected, read on the device (rows past an out-of-range index decode the empty key)."
 params = [
-  { name = "out_index", kind = "out", elem = "i32", len = "1" },
+  { name = "out_index", kind = "out", elem = "i32", len = "rows" },
   { name = "scratch_key", kind = "out", elem = "u64", len = "1" },
-  { name = "logits_row", kind = "in", elem = "f32", len = "vocab" },
-  { name = "w1_row", kind = "in", elem = "bytes", len = "markov_rank / 32 * 34" },
+  { name = "logits_rows", kind = "in", elem = "f32", len = "rows * vocab" },
+  { name = "w1", kind = "in", elem = "bytes", len = "vocab * (markov_rank / 32) * 34" },
   { name = "w2", kind = "in", elem = "bytes", len = "vocab * (markov_rank / 32) * 34" },
   { name = "vocab", kind = "scalar", type = "u32" },
   { name = "markov_rank", kind = "scalar", type = "u32" },
+  { name = "previous_token", kind = "scalar", type = "u32" },
+  { name = "rows", kind = "scalar", type = "u32" },
 ]
-requires = ["vocab >= 1", "markov_rank >= 32", "markov_rank <= 256", "markov_rank % 32 == 0"]
+requires = ["vocab >= 1", "markov_rank >= 32", "markov_rank <= 256", "markov_rank % 32 == 0", "previous_token + 1 <= vocab", "rows >= 1", "rows <= 8"]
 probes = [
-  { vocab = 129280, markov_rank = 256 },
+  { vocab = 129280, markov_rank = 256, previous_token = 129279, rows = 8 },
+  { vocab = 129280, markov_rank = 256, previous_token = 0, rows = 1 },
 ]
 
 [[launcher]]
 name = "dspark_markov_argmax_batch"
 cpp = "DsparkMarkovArgmaxBatch"
 returns = "supported"
-doc = "dspark_markov_argmax of 2, 4, 6 or 8 rows `logits_row_stride` floats apart; unsupported for other row counts."
+doc = "The Markov-coupled argmax of 2, 4, 6 or 8 independent rows `logits_row_stride` floats apart, each after its own previous token; unsupported for other row counts."
 params = [
   { name = "out_index", kind = "out", elem = "i32", len = "n_rows" },
   { name = "scratch_key", kind = "out", elem = "u64", len = "n_rows" },
@@ -711,7 +714,7 @@ params = [
   { name = "pos0", kind = "scalar", type = "u32" },
   { name = "n_tokens", kind = "scalar", type = "u32" },
 ]
-requires = ["ratio >= 1", "ratio <= 128", "coff == 1 + (4 / ratio) * (ratio / 4)", "head_dim >= 1", "n_tokens >= 1", "n_tokens * coff * head_dim <= 4294967295"]
+requires = ["ratio >= 1", "ratio <= 128", "coff == 1 + (4 / ratio) * (ratio / 4)", "head_dim >= 1", "n_tokens >= 1", "n_tokens <= ratio - pos0 % ratio", "n_tokens * coff * head_dim <= 4294967295"]
 probes = [
   { coff = 2, head_dim = 512, ratio = 4, pos0 = 6, n_tokens = 1 },
   { coff = 1, head_dim = 512, ratio = 128, pos0 = 300, n_tokens = 1 },

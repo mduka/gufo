@@ -318,4 +318,91 @@ fn sessions_match_the_cpp_engine() {
     }
     let mut model = load(3);
     run_batch(&mut model, "cpp-batch-greedy50", 3, 16, 0.0, 0);
+    check_logprobs(&mut model);
+}
+
+/// Observed log probabilities change neither the selected tokens, the RNG
+/// nor the speculative acceptance, cover every accepted token, and match a
+/// teacher-forced autoregressive session's raw target logits
+/// (`CheckLogprobs`).
+fn check_logprobs(model: &mut Model) {
+    let prompt = model.tokenize("Continue this list: red blue green red blue green red blue green");
+    let history: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+    for mtp in [false, true] {
+        for temperature in [0.0f32, 0.7] {
+            let mode = if mtp {
+                SessionMode::Speculative
+            } else {
+                SessionMode::Autoregressive
+            };
+            let mut observed = model.create_session(mode, 256).unwrap();
+            let mut plain = model.create_session(mode, 256).unwrap();
+            let mut reference = model
+                .create_session(SessionMode::Autoregressive, 256)
+                .unwrap();
+            model.sync(&mut observed, &prompt).unwrap();
+            model.sync(&mut plain, &prompt).unwrap();
+            model.sync(&mut reference, &prompt).unwrap();
+            let mut config = SamplingConfig {
+                temperature,
+                top_k: 20,
+                seed: 73,
+                ..SamplingConfig::default()
+            };
+            let mut a = SamplerState::new(config.clone(), &history).unwrap();
+            config.logprobs = Some(5);
+            let mut b = SamplerState::new(config, &history).unwrap();
+            let mut generated = 0;
+            while generated < 32 {
+                let budget = (if mtp { 8 } else { 1 }).min(32 - generated);
+                let expected = model
+                    .decode_step(&mut plain, budget, &mut a, false)
+                    .unwrap();
+                let actual = model
+                    .decode_step(&mut observed, budget, &mut b, false)
+                    .unwrap();
+                assert!(
+                    expected.tokens == actual.tokens && a.rng_state() == b.rng_state(),
+                    "logprobs changed selected tokens or RNG"
+                );
+                assert_eq!(
+                    actual.logprobs.len(),
+                    actual.tokens.len(),
+                    "missing accepted-token probabilities"
+                );
+                for (i, &token) in actual.tokens.iter().enumerate() {
+                    let logits = reference.logits();
+                    let maximum = logits
+                        .iter()
+                        .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
+                    let sum: f64 = logits.iter().map(|&v| (f64::from(v) - maximum).exp()).sum();
+                    let check = |entry: &gufo_core::sampling::TokenLogprob| {
+                        let expected =
+                            (f64::from(logits[entry.token as usize]) - maximum) - sum.ln();
+                        assert!(
+                            (entry.logprob - expected).abs() < 1e-5,
+                            "reported probability disagrees with teacher-forced target logits"
+                        );
+                    };
+                    let values = &actual.logprobs[i];
+                    assert_eq!(
+                        values.selected.token, token as u32,
+                        "probability token order differs"
+                    );
+                    check(&values.selected);
+                    values.top.iter().for_each(check);
+                    model.evaluate(&mut reference, token).unwrap();
+                }
+                generated += actual.tokens.len();
+            }
+            let (x, y) = (observed.statistics(), plain.statistics());
+            assert!(
+                x.drafted == y.drafted && x.accepted == y.accepted,
+                "observation changed speculative acceptance"
+            );
+            if mtp {
+                assert!(x.drafted > 0, "logprob fixture must execute drafts");
+            }
+        }
+    }
 }

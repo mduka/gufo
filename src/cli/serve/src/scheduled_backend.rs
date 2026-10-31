@@ -30,6 +30,7 @@ use crate::scheduler::{
 #[derive(Clone)]
 struct Settings {
     model_id: String,
+    extra_model_ids: Vec<String>,
     model_path: String,
     build_info: String,
     sampling_defaults: SamplingDefaults,
@@ -251,7 +252,7 @@ impl<R: TextModelRunner> ScheduledBackend<R> {
     }
 
     /// Starts the scheduler over `pool`; the model ID is the runner's until
-    /// [`Self::set_model_id`].
+    /// [`Self::set_model_ids`].
     pub fn new(
         pool: Arc<TextRunnerPool<R>>,
         prefill_policy: TextPrefillPolicy,
@@ -272,6 +273,7 @@ impl<R: TextModelRunner> ScheduledBackend<R> {
             scheduler,
             settings: RwLock::new(Settings {
                 model_id,
+                extra_model_ids: Vec::new(),
                 model_path: String::new(),
                 build_info: String::new(),
                 sampling_defaults: SamplingDefaults::default(),
@@ -415,11 +417,17 @@ impl<R: TextModelRunner> ScheduledBackend<R> {
         change(&mut self.settings.write().unwrap_or_else(|e| e.into_inner()));
     }
 
-    /// Overrides the public model ID; empty keeps the current one.
-    pub fn set_model_id(&self, model_id: &str) {
-        if !model_id.is_empty() {
-            self.update(|settings| settings.model_id = model_id.to_owned());
+    /// Overrides the public model IDs; empty keeps the current one. The first
+    /// name is primary, the rest are additional served names.
+    pub fn set_model_ids(&self, mut model_ids: Vec<String>) {
+        if model_ids.is_empty() {
+            return;
         }
+        let extra = model_ids.split_off(1);
+        self.update(|settings| {
+            settings.model_id = model_ids.remove(0);
+            settings.extra_model_ids = extra;
+        });
     }
 
     /// The served model file and build, as `/props` reports them.
@@ -472,6 +480,7 @@ impl<R: TextModelRunner> ScheduledBackend<R> {
         client_id: &str,
         prompt_context: Option<Arc<R::PromptContext>>,
         cache_prompt: bool,
+        cache_persist: bool,
         cache_prefix_tokens: usize,
         stop_sequences: &[String],
     ) -> Result<GenerationResult> {
@@ -503,6 +512,7 @@ impl<R: TextModelRunner> ScheduledBackend<R> {
                 request_start,
                 prompt_context,
                 cache_prompt,
+                cache_persist,
                 cache_prefix_tokens,
                 stop_sequences: stop_sequences.to_vec(),
                 stop_at_eos: true,
@@ -516,6 +526,13 @@ impl<R: TextModelRunner> ScheduledBackend<R> {
 impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
     fn model_id(&self) -> String {
         self.settings().model_id
+    }
+
+    fn model_ids(&self) -> Vec<String> {
+        let settings = self.settings();
+        let mut ids = vec![settings.model_id];
+        ids.extend(settings.extra_model_ids);
+        ids
     }
 
     fn ready(&self) -> bool {
@@ -572,6 +589,7 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
         client_id: &str,
         stop_sequences: &[String],
         cache_prompt: bool,
+        cache_persist: bool,
     ) -> Result<GenerationResult> {
         let request_start = Instant::now();
         let tokens = self.scheduler.runner().tokenize(prompt)?;
@@ -585,6 +603,7 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
             client_id,
             None,
             cache_prompt,
+            cache_persist,
             0,
             stop_sequences,
         )
@@ -623,6 +642,7 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
             &request.client_id,
             prompt.context,
             request.cache_prompt,
+            request.cache_persist,
             prompt.cache_prefix_tokens,
             &request.stop_sequences,
         )?;
@@ -669,6 +689,7 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
                 request_start,
                 prompt_context: prompt.context,
                 cache_prompt: request.cache_prompt,
+                cache_persist: request.cache_persist,
                 cache_prefix_tokens: prompt.cache_prefix_tokens,
                 stop_sequences: request.stop_sequences.clone(),
                 stop_at_eos: true,
@@ -696,6 +717,7 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
         stop_sequences: &[String],
         return_progress: bool,
         cache_prompt: bool,
+        cache_persist: bool,
     ) -> Result<Option<Box<dyn GenerationRequest>>> {
         let request_start = Instant::now();
         let tokens = self.scheduler.runner().tokenize(prompt)?;
@@ -715,6 +737,7 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
                 request_start,
                 prompt_context: None,
                 cache_prompt,
+                cache_persist,
                 cache_prefix_tokens: 0,
                 stop_sequences: stop_sequences.to_vec(),
                 stop_at_eos: !ignore_eos,
@@ -744,6 +767,14 @@ impl<R: TextModelRunner> TextGenerationBackend for ScheduledBackend<R> {
         let constrained = self.constrain(request, &SamplingConfig::default())?;
         let request = constrained.as_ref().map_or(request, |c| &c.request);
         self.scheduler.runner().count_prompt_tokens(request)
+    }
+
+    fn render_chat_prompt(&self, request: &ChatRequest) -> Result<Option<String>> {
+        // The same preparation as count_chat_tokens(), so the text is what
+        // chat() would tokenize.
+        let constrained = self.constrain(request, &SamplingConfig::default())?;
+        let request = constrained.as_ref().map_or(request, |c| &c.request);
+        self.scheduler.runner().render_prompt(request)
     }
 }
 

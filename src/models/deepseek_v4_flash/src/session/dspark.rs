@@ -9,7 +9,7 @@ use gufo_deepseek_v4_flash_kernels::Result as GpuResult;
 
 use super::{Session, SessionError, argmax, error, interrupted};
 use crate::dspark_model::{MAX_BLOCK, RETRY_TOKENS};
-use crate::dspark_policy::cycle_cost;
+use crate::dspark_policy::{cycle_cost, serial_backoff};
 use crate::dspark_sampler::DsparkSampler;
 use crate::engine::Engine;
 use crate::graph::{
@@ -95,33 +95,29 @@ impl Session {
         self.graph.dspark_context_len() >= required_context
     }
 
-    /// `session_dspark_note_cycle`: one request alone keeps the four-probe,
-    /// 64-token acceptance backoff; concurrent requests use their recent
-    /// cost window instead.
+    /// `session_dspark_note_cycle`: one request alone judges the recent
+    /// cost per completed token, the guaranteed target anchor included
+    /// ([`serial_backoff`]); acceptance over drafted tokens alone
+    /// over-penalizes short blocks and kept a poor start across every retry.
+    /// A backoff or eight cycles open a new window. Concurrent cohorts keep
+    /// their separate calibration.
     fn note_cycle(&mut self, concurrent_batch: bool) {
         if concurrent_batch {
             return;
         }
-        const EARLY_CYCLES: u64 = 4;
-        const EARLY_REJECT_RATE: f64 = 0.25;
-        const WARMUP_CYCLES: u64 = 8;
-        const BREAK_EVEN_ACCEPTANCE: f64 = 0.48;
         let s = &mut self.dspark_state;
+        let steps = s.steps - s.policy_start_steps;
         let drafted = s.support_drafted - s.policy_start_drafted;
         let accepted = s.support_accepted - s.policy_start_accepted;
-        let steps = s.steps - s.policy_start_steps;
-        if drafted == 0 || steps < EARLY_CYCLES {
-            return;
+        let backoff = serial_backoff(steps, drafted, accepted);
+        if backoff {
+            s.skip_remaining = RETRY_TOKENS;
         }
-        let acceptance = accepted as f64 / drafted as f64;
-        if steps < WARMUP_CYCLES && acceptance >= EARLY_REJECT_RATE {
-            return;
+        if backoff || steps >= 8 {
+            s.policy_start_steps = s.steps;
+            s.policy_start_drafted = s.support_drafted;
+            s.policy_start_accepted = s.support_accepted;
         }
-        s.skip_remaining = if acceptance >= BREAK_EVEN_ACCEPTANCE {
-            0
-        } else {
-            RETRY_TOKENS
-        };
     }
 
     /// `session_dspark_cycle_cost`.
@@ -245,8 +241,16 @@ impl Session {
             return Ok(argmax(&self.logits[..vocabulary]));
         };
         let pending = std::mem::replace(&mut self.dspark_state.pending_anchor, -1);
+        let pending = if sampler.unmodified_argmax() {
+            -1
+        } else {
+            pending
+        };
         if pending >= 0 {
-            sampler.accept(pending).map_err(|_| error(SAMPLER_FAILED))?;
+            sampler
+                .observe(&self.logits[..vocabulary], pending)
+                .and_then(|()| sampler.accept(pending))
+                .map_err(|_| error(SAMPLER_FAILED))?;
             return Ok(pending);
         }
         sampler
@@ -325,7 +329,9 @@ impl Session {
             if drawn != draft || (stop_at_eos && engine.vocab.is_stop(drawn)) {
                 // EOS is a completed draw that must not enter the reusable
                 // checkpoint: the next anchor, not drawn again.
-                self.dspark_state.pending_anchor = drawn;
+                if !sampler.unmodified_argmax() {
+                    self.dspark_state.pending_anchor = drawn;
+                }
                 return Ok(accepted);
             }
             accepted += 1;
@@ -353,7 +359,7 @@ impl Session {
     ) -> Result<(), SessionError> {
         let vocabulary = engine.vocab.len();
         let drafted = drafts.len() as u32;
-        let sampled = sampler.is_some();
+        let sampled = sampler.as_ref().is_some_and(|s| !s.unmodified_argmax());
         let mut frontier_read = false;
         let accepted = self.accept_prefix(
             engine,

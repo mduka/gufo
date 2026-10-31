@@ -325,7 +325,7 @@ still lose reuse; this is not unlimited retention.
 The actual selected limits are reported at startup:
 
 ```text
-event=snapshot_cache_configured sessions=1 snapshot_entries=128 capacity_bytes=8589934592 automatic_bytes=8589934592 max_bytes=12884901888
+event=snapshot_cache_configured sessions=1 snapshot_entries=128 capacity_bytes=8589934592 automatic_bytes=8589934592 max_bytes=12884901888 ram_cache=on
 ```
 
 ## Invariants
@@ -394,6 +394,24 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes | smaller of an eighth of the available host RAM and the disk budget | `--cache-disk-staging-bytes` |
+
+`--cache-ram-bytes off` turns the RAM cache off. The server then keeps no
+checkpoint in RAM and computes no budget. Each session still reuses its own
+live state, and `--cache-disk` still works: every checkpoint goes to disk
+alone, and later requests restore from there. Off drops every RAM checkpoint,
+so there is no restore from RAM, no shared-prefix or branch checkpoint in RAM,
+and no retained history. The startup line reports `ram_cache=off
+capacity_bytes=0`.
+
+`--cache-ram-bytes off` turns the RAM cache off. The server then keeps no
+checkpoint in RAM, commits no cache backing, and computes no budget. Without
+`--cache-disk` it also grows no backing before prefill. Each session still reuses its own live state, `--cache-disk`
+still works, and the per-response `gufo.component_cache` block stays present
+with zero captures. Off drops every RAM checkpoint, so there is no restore from
+RAM, no shared-prefix or branch checkpoint, and no retained history. With
+`--cache-disk`, Qwen and Flash-Next still copy each disk capture through a
+bounded 512 MiB backing, so `backing_prepared` appears in that case only. The
+startup line reports `ram_cache=off capacity_bytes=0`.
 
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
 A positive value replaces the automatic budget and may exceed it: it trades the
@@ -556,11 +574,18 @@ versus not, which reuse identically and interoperate within one conversation.
 `/v1/completions` or `/completion` bypasses lookup for a single request. The
 result can still populate the cache. `null` keeps the default, `true`.
 
+`cache_persist: false` on the same endpoints keeps one request's checkpoints
+in RAM only: nothing it captures is written or staged for the disk tier, so
+they are lost on eviction or restart. It still reads disk checkpoints, and it
+does not stop a later request without the flag from persisting the same
+prefix. `null` keeps the default, `true`. Responses echo the applied value as
+a top-level `cache_persist`; see [the server guide](SERVER.md).
+
 ## Observing it
 
 | Log line | Meaning |
 | --- | --- |
-| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
+| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim; `ram_cache=on` or `ram_cache=off` at the end of the line |
 | `event=disk_cache_configured` | disk and staging capacity at startup |
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |

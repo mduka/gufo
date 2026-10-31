@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::json_constraint::{ConstraintVocabulary, ToolFormat};
-use crate::sampling::SamplingConfig;
+use crate::sampling::{SamplingConfig, TokenLogprobs};
 
 use super::chat::ChatRequest;
 use super::error::{Error, Result};
@@ -216,16 +216,19 @@ pub enum DeviceStatus {
     Lost,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextDecodeSelection {
     pub stop: bool,
     pub token: Token,
     /// The token's text bytes; a piece may end inside a UTF-8 sequence
     /// (byte fallback), which the transport repairs across pieces.
     pub piece: Vec<u8>,
+    /// The raw target log probabilities of a request that asks for them,
+    /// also of a stopping token.
+    pub logprobs: Option<TokenLogprobs>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextDecodeStep {
     pub selections: Vec<TextDecodeSelection>,
     /// Speculative verification rounds actually executed.
@@ -237,6 +240,8 @@ pub struct TextDecodeStep {
     pub lookup_tokens: usize,
     pub lookup_accepted_tokens: usize,
     pub stop: bool,
+    /// The log probabilities of the stop token that ended the step.
+    pub terminal_logprobs: Option<TokenLogprobs>,
     /// The execution actually used for this request, including model-owned
     /// subgroup dispatch; an advertised maximum is not evidence of batching.
     pub execution_plan: TextExecutionPlan,
@@ -364,6 +369,12 @@ pub trait TextModelRunner: Send + Sync + 'static {
         ReasoningTags::default()
     }
     fn render_and_tokenize(&self, request: &ChatRequest) -> Result<Option<Vec<Token>>>;
+
+    /// The text [`Self::render_and_tokenize`] tokenizes (`RenderPrompt`), or
+    /// `None` when the runner cannot render its template as text.
+    fn render_prompt(&self, _request: &ChatRequest) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     fn prepare_prompt(
         &self,
@@ -656,6 +667,7 @@ pub fn default_decode_step<R: TextModelRunner + ?Sized>(
     if selection.stop {
         return Ok(TextDecodeStep {
             stop: true,
+            terminal_logprobs: selection.logprobs,
             ..TextDecodeStep::default()
         });
     }

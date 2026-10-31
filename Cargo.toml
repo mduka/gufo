@@ -42,6 +42,16 @@ gufo-formats = { path = "src/formats" }
 gufo-hip = { path = "src/hip" }
 gufo-kernel-build = { path = "src/kernel_build" }
 gufo-serve = { path = "src/cli/serve" }
+# EmbeddingGemma 2 audio input (libsndfile in C++), pure Rust: WAV, FLAC,
+# Ogg Vorbis and MP3. Compressed codecs may decode differently from
+# libsndfile; 16-bit PCM WAV decodes to the same samples (docs/RUST.md).
+claxon = "0.4"
+hound = "3.5"
+lewton = "0.10"
+nanomp3 = "0.2"
+# Resampling of embedding audio to 16 kHz (libsoxr SOXR_HQ in C++); not
+# bit-identical to libsoxr (docs/RUST.md).
+rubato = "5"
 # Local time for server log lines (`localtime_r` in C++).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # WebP decoding of chat images (libwebp in C++), pure Rust.

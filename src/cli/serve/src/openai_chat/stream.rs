@@ -22,11 +22,13 @@ pub(super) fn choice_chunk(
     model: &str,
     delta: Value,
     finish: Option<&str>,
+    logprobs: Option<Value>,
 ) -> Value {
-    let choice = Value::object()
-        .with("index", 0)
-        .with("delta", delta)
-        .with("finish_reason", finish.map_or(Value::Null, Value::from));
+    let mut choice = Value::object().with("index", 0).with("delta", delta);
+    if let Some(logprobs) = logprobs {
+        choice.set("logprobs", logprobs);
+    }
+    choice.set("finish_reason", finish.map_or(Value::Null, Value::from));
     base_chunk(id, created, model).with("choices", vec![choice])
 }
 
@@ -39,8 +41,17 @@ pub(super) enum FilterState {
 
 /// Splits streamed text into reasoning and content deltas, holding back
 /// possible partial markers and hiding text once a tool marker appears.
-/// Emits a delta: the text and whether it is reasoning.
-pub(super) type EmitPiece<'a> = Box<dyn FnMut(&str, bool) -> bool + 'a>;
+/// Emits a delta: the text, whether it is reasoning, and where its content
+/// lies in the filtered output when known.
+pub(super) type EmitPiece<'a> = Box<dyn FnMut(&str, bool, &[TextSourceSpan]) -> bool + 'a>;
+
+/// The source range of `piece`, which begins at `offset`.
+fn at(offset: usize, piece: &str) -> [TextSourceSpan; 1] {
+    [TextSourceSpan {
+        begin: offset,
+        size: piece.len(),
+    }]
+}
 
 pub(super) struct StreamingTextFilter<'a> {
     pub(super) emit: EmitPiece<'a>,
@@ -80,7 +91,7 @@ impl<'a> StreamingTextFilter<'a> {
     /// `syntax` delimits tool markup ([`tool_syntax`]).
     pub(super) fn structured(
         initial: InitialOutputState,
-        emit: impl FnMut(&str, bool) -> bool + 'a,
+        emit: impl FnMut(&str, bool, &[TextSourceSpan]) -> bool + 'a,
         structured: bool,
         tool_only: bool,
         syntax: ToolSyntax,
@@ -130,7 +141,9 @@ impl<'a> StreamingTextFilter<'a> {
                     self.tools,
                     false,
                 );
-                if !prose.is_empty() && !(self.emit)(prose, false) {
+                if !prose.is_empty()
+                    && !(self.emit)(prose, false, &at(offset_in(&self.raw, prose), prose))
+                {
                     return false;
                 }
                 self.emitted_content_bytes += prose.len();
@@ -150,7 +163,9 @@ impl<'a> StreamingTextFilter<'a> {
                     self.tools,
                     false,
                 );
-                if !text.is_empty() && !(self.emit)(text, false) {
+                if !text.is_empty()
+                    && !(self.emit)(text, false, &at(offset_in(&self.raw, text), text))
+                {
                     return false;
                 }
                 self.emitted_content_bytes += text.len();
@@ -173,8 +188,9 @@ impl<'a> StreamingTextFilter<'a> {
                 return true;
             }
         }
+        let offset = self.pending_offset();
         let text = std::mem::take(&mut self.pending);
-        text.is_empty() || (self.emit)(&text, false)
+        text.is_empty() || (self.emit)(&text, false, &at(offset, &text))
     }
 
     pub(super) fn push(&mut self, bytes: &[u8], last: bool) -> bool {
@@ -242,7 +258,7 @@ impl<'a> StreamingTextFilter<'a> {
             if let Some(marker) = marker
                 && end.is_none_or(|e| marker < e)
             {
-                if marker > 0 && !(self.emit)(&self.pending[..marker], true) {
+                if marker > 0 && !(self.emit)(&self.pending[..marker], true, &[]) {
                     return false;
                 }
                 self.emitted_reasoning_bytes += marker;
@@ -253,7 +269,7 @@ impl<'a> StreamingTextFilter<'a> {
             }
             match end {
                 Some(end) => {
-                    if end > 0 && !(self.emit)(&self.pending[..end], true) {
+                    if end > 0 && !(self.emit)(&self.pending[..end], true, &[]) {
                         return false;
                     }
                     self.emitted_reasoning_bytes += end;
@@ -282,7 +298,7 @@ impl<'a> StreamingTextFilter<'a> {
                         }
                     }
                     let ready = self.pending.len() - held;
-                    if ready > 0 && !(self.emit)(&self.pending[..ready], true) {
+                    if ready > 0 && !(self.emit)(&self.pending[..ready], true, &[]) {
                         return false;
                     }
                     self.emitted_reasoning_bytes += ready;
@@ -317,7 +333,9 @@ impl<'a> StreamingTextFilter<'a> {
                     self.tools,
                     false,
                 );
-                if !prose.is_empty() && !(self.emit)(prose, false) {
+                if !prose.is_empty()
+                    && !(self.emit)(prose, false, &at(offset_in(&self.raw, prose), prose))
+                {
                     return false;
                 }
                 self.hidden = self.pending[found - offset..].to_owned();
@@ -326,8 +344,11 @@ impl<'a> StreamingTextFilter<'a> {
                 return true;
             }
             let ready = self.pending.len() - self.held_content(offset);
-            if ready > 0 && !(self.emit)(&self.pending[..ready], false) {
-                return false;
+            if ready > 0 {
+                let text = &self.pending[..ready];
+                if !(self.emit)(text, false, &at(offset, text)) {
+                    return false;
+                }
             }
             self.pending.drain(..ready);
         }
@@ -354,26 +375,33 @@ impl<'a> StreamingTextFilter<'a> {
         marker.max(framing).min(self.pending.len())
     }
 
-    /// `content` is the parsed answer; `tool_only` streams its prose between
-    /// or after complete calls without their markup.
-    /// `reasoning` is the parsed reasoning: a quoted example taken for a
-    /// call inside the reasoning returns there.
+    /// `content` is the parsed answer, its pieces at `content_spans` in the
+    /// output when tracked; `tool_only` streams its prose between or after
+    /// complete calls without their markup. `reasoning` is the parsed
+    /// reasoning: a quoted example taken for a call inside the reasoning
+    /// returns there.
     pub(super) fn finish(
         &mut self,
         hide_tool_markup: bool,
         content: &str,
         reasoning: &str,
+        content_spans: &[TextSourceSpan],
     ) -> bool {
+        let emit_content = |emit: &mut EmitPiece<'a>, offset: usize| {
+            let mut spans = Vec::new();
+            append_text_spans(&mut spans, content_spans, offset, content.len() - offset);
+            emit(&content[offset..], false, &spans)
+        };
         if self.tool_mode && self.state == FilterState::Thinking {
             let tail = reasoning
                 .get(self.emitted_reasoning_bytes.min(reasoning.len())..)
                 .unwrap_or("");
-            return (tail.is_empty() || (self.emit)(tail, true))
-                && (content.is_empty() || (self.emit)(content, false));
+            return (tail.is_empty() || (self.emit)(tail, true, &[]))
+                && (content.is_empty() || emit_content(&mut self.emit, 0));
         }
         if self.tool_only && self.tool_mode && hide_tool_markup {
-            let tail = content.get(self.emitted_content_bytes..).unwrap_or("");
-            return tail.is_empty() || (self.emit)(tail, false);
+            let offset = self.emitted_content_bytes.min(content.len());
+            return offset == content.len() || emit_content(&mut self.emit, offset);
         }
         if self.raw_content && !self.structured_started && hide_tool_markup {
             self.pending.clear();
@@ -398,7 +426,7 @@ impl<'a> StreamingTextFilter<'a> {
                         false,
                     )
                 };
-                let emitted = (self.emit)(text, reasoning);
+                let emitted = (self.emit)(text, reasoning, &at(offset, text));
                 self.pending.clear();
                 return emitted;
             }
@@ -406,7 +434,8 @@ impl<'a> StreamingTextFilter<'a> {
         }
         if !hide_tool_markup && !self.hidden.is_empty() {
             let hidden = self.hidden.clone();
-            return (self.emit)(&hidden, false);
+            let offset = self.raw.len() - hidden.len();
+            return (self.emit)(&hidden, false, &at(offset, &hidden));
         }
         true
     }
@@ -535,7 +564,6 @@ pub(crate) fn stream_failure(failure: &Error) -> (String, &'static str) {
 
 pub(super) fn non_streaming_response(
     request: &ParsedChatRequest,
-    backend: &Arc<dyn TextGenerationBackend>,
     mut generation: Box<dyn GenerationRequest>,
     initial: InitialOutputState,
 ) -> Result<HttpResponse> {
@@ -548,6 +576,7 @@ pub(super) fn non_streaming_response(
         &text,
         initial,
         result.finish_reason == FinishReason::Stop,
+        false,
         false,
     )?;
     let mut message = Value::object().with("role", "assistant");
@@ -562,21 +591,24 @@ pub(super) fn non_streaming_response(
     if !generated.tool_calls.is_empty() {
         message.set("tool_calls", tool_calls_json(&generated.tool_calls));
     }
-    let choice = Value::object()
-        .with("index", 0)
-        .with("message", message)
-        .with(
-            "finish_reason",
-            finish_reason(&result, !generated.tool_calls.is_empty()),
-        );
+    let mut choice = Value::object().with("index", 0);
+    if let Some(count) = request.sampling.logprobs {
+        choice.set("logprobs", chat_logprobs(&result.logprobs, count));
+    }
+    choice.set("message", message);
+    choice.set(
+        "finish_reason",
+        finish_reason(&result, !generated.tool_calls.is_empty()),
+    );
     let response = Value::object()
         .with("id", random_id("chatcmpl-", 20))
         .with("object", "chat.completion")
         .with("created", unix_time())
-        .with("model", backend.model_id())
+        .with("model", request.model.as_str())
         .with("choices", vec![choice])
         .with("usage", usage(&result))
-        .with("timings", generation_timings(&result));
+        .with("timings", generation_timings(&result))
+        .with("cache_persist", request.chat.cache_persist);
     record_server_metrics(&result);
     let mut output = HttpResponse::new(200, "OK", dump(&response))
         .with_header("Server-Timing", server_timing(&result));
@@ -586,13 +618,12 @@ pub(super) fn non_streaming_response(
 
 pub(super) fn streaming_response(
     request: ParsedChatRequest,
-    backend: &Arc<dyn TextGenerationBackend>,
     mut generation: Box<dyn GenerationRequest>,
     initial: InitialOutputState,
 ) -> HttpResponse {
     let id = random_id("chatcmpl-", 20);
     let created = unix_time();
-    let model = backend.model_id();
+    let model = request.model.clone();
     let syntax = tool_syntax(&request.chat, generation.tool_format());
     let stream_log = Arc::new(Mutex::new(StreamLog::default()));
     let log = stream_log.clone();
@@ -609,7 +640,7 @@ pub(super) fn streaming_response(
             if !started.replace(true) {
                 let role_delta = Value::object().with("role", "assistant");
                 connected.set(write(&sse(&choice_chunk(
-                    &id, created, &model, role_delta, None,
+                    &id, created, &model, role_delta, None, None,
                 ))));
             }
             connected.get()
@@ -618,9 +649,18 @@ pub(super) fn streaming_response(
             generation.cancel();
             return Ok(());
         }
+        // The log probabilities of the current token go with its first
+        // delta, or with an empty one when its text is held back.
+        let pending_logprobs = std::cell::RefCell::new(None::<Value>);
+        let write_choice = |delta: Value| {
+            let logprobs = pending_logprobs.borrow_mut().take();
+            write(&sse(&choice_chunk(
+                &id, created, &model, delta, None, logprobs,
+            )))
+        };
         let mut filter = StreamingTextFilter::structured(
             initial,
-            |text: &str, reasoning: bool| {
+            |text: &str, reasoning: bool, _: &[TextSourceSpan]| {
                 if text.is_empty() {
                     return true;
                 }
@@ -629,7 +669,7 @@ pub(super) fn streaming_response(
                 } else {
                     Value::object().with("content", text)
                 };
-                let sent = write(&sse(&choice_chunk(&id, created, &model, delta, None)));
+                let sent = write_choice(delta);
                 connected.set(sent);
                 sent
             },
@@ -654,12 +694,12 @@ pub(super) fn streaming_response(
             function.set("arguments", call.arguments);
             item.set("function", function);
             let delta = Value::object().with("tool_calls", vec![item]);
-            let sent = write(&sse(&choice_chunk(&id, created, &model, delta, None)));
+            let sent = write_choice(delta);
             connected.set(sent);
             sent
         };
         let mut on_progress = |progress: &PromptProgress| {
-            let chunk = choice_chunk(&id, created, &model, Value::object(), None)
+            let chunk = choice_chunk(&id, created, &model, Value::object(), None, None)
                 .with("prompt_progress", prompt_progress_json(progress));
             let sent = begin() && write(&sse(&chunk));
             connected.set(sent);
@@ -668,14 +708,19 @@ pub(super) fn streaming_response(
         let mut on_start = || begin();
         let outcome = (|| -> Result<()> {
             let result = generation.wait_streaming(StreamCallbacks {
-                on_token: Some(&mut |piece: &[u8]| {
+                on_token: Some(&mut |piece| {
+                    if let (Some(values), Some(count)) = (piece.logprobs, request.sampling.logprobs)
+                    {
+                        *pending_logprobs.borrow_mut() =
+                            Some(chat_logprobs(std::slice::from_ref(values), count));
+                    }
                     if !begin() || !filter.push(piece, false) {
                         return false;
                     }
                     // Native calls stream their arguments as they parse.
-                    !filter.tool_mode
-                        || syntax.markers.len() > 2
-                        || tools.update(
+                    if filter.tool_mode
+                        && syntax.markers.len() <= 2
+                        && !tools.update(
                             &parse_request_generation(
                                 chat,
                                 syntax,
@@ -683,11 +728,19 @@ pub(super) fn streaming_response(
                                 initial,
                                 false,
                                 true,
+                                false,
                             )
                             .map(|generated| generated.tool_calls)
                             .unwrap_or_default(),
                             &mut emit_tool,
                         )
+                    {
+                        return false;
+                    }
+                    if pending_logprobs.borrow().is_some() {
+                        connected.set(write_choice(Value::object()));
+                    }
+                    connected.get()
                 }),
                 on_progress: if chat.return_progress {
                     Some(&mut on_progress)
@@ -714,6 +767,7 @@ pub(super) fn streaming_response(
                 initial,
                 !interrupted,
                 false,
+                false,
             )?;
             if !tools.finish(&generated.tool_calls, interrupted, &mut emit_tool)? {
                 return Ok(());
@@ -722,6 +776,7 @@ pub(super) fn streaming_response(
                 generated.hide_tool_markup,
                 &generated.text,
                 &generated.reasoning_content,
+                &[],
             ) {
                 return Ok(());
             }
@@ -734,8 +789,10 @@ pub(super) fn streaming_response(
                 &model,
                 Value::object(),
                 Some(finish_reason(&result, !generated.tool_calls.is_empty())),
+                None,
             )
-            .with("timings", generation_timings(&result));
+            .with("timings", generation_timings(&result))
+            .with("cache_persist", request.chat.cache_persist);
             if !write(&sse(&terminal)) {
                 return Ok(());
             }
@@ -743,7 +800,8 @@ pub(super) fn streaming_response(
                 let usage_chunk = base_chunk(&id, created, &model)
                     .with("choices", Value::array())
                     .with("usage", usage(&result))
-                    .with("timings", generation_timings(&result));
+                    .with("timings", generation_timings(&result))
+                    .with("cache_persist", request.chat.cache_persist);
                 if !write(&sse(&usage_chunk)) {
                     return Ok(());
                 }

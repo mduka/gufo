@@ -109,6 +109,7 @@ fn restoring(capacity: usize, events: Option<&Events>) -> SnapshotSupport<FakeSt
             },
         )),
         capacity_bytes: Some(Box::new(move || capacity)),
+        retain: true,
         on_event: events.map(|events| {
             let events = events.clone();
             Box::new(move |event: &SnapshotEvent| events.lock().expect("lock").push(*event))

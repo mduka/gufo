@@ -61,10 +61,14 @@ impl RequestShared {
     }
 
     /// False when the per-request or server-wide output bound is reached.
-    pub(super) fn publish_piece(&self, piece: Vec<u8>) -> bool {
+    pub(super) fn publish_piece(&self, text: Vec<u8>, logprobs: Option<&DecodedLogprobs>) -> bool {
         if !self.publish_token_pieces {
             return true;
         }
+        let piece = OutputPiece {
+            text,
+            logprobs: logprobs.cloned(),
+        };
         let bytes = queued_piece_cost(&piece);
         let refused = {
             let mut output = self.output();
@@ -238,7 +242,10 @@ impl SchedulerRequest {
             }
             // A token without text still gets its event.
             if let (Some(piece), true, Some(callback)) = (&piece, deliver, on_token.as_mut())
-                && !callback(piece)
+                && !callback(&TokenPiece::with_logprobs(
+                    &piece.text,
+                    piece.logprobs.as_ref(),
+                ))
             {
                 consumer_cancelled = true;
                 deliver = false;

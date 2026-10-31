@@ -32,6 +32,7 @@ pub fn register_sampling_options<'a>(
     model_defaults: bool,
 ) {
     let SamplingConfig {
+        logprobs: _,
         temperature,
         top_k,
         top_p,
@@ -187,6 +188,7 @@ mod tests {
         assert_eq!(
             config,
             SamplingConfig {
+                logprobs: None,
                 temperature: 0.7,
                 top_k: 40,
                 top_p: 0.9,

@@ -1,24 +1,28 @@
-//! The GPU text encoder (`hip/encoder_runtime.cpp`). One instance owns the
-//! weights and the scratch buffers and runs one device batch at a time.
-//! [`EncoderRuntime::embed`] is thread-safe: concurrent calls take turns in
-//! arrival order, one device batch per turn, so a long request does not hold
-//! the device until it finishes.
+//! The GPU text, image and audio encoder (`hip/encoder_runtime.cpp`). One
+//! instance owns the weights and the scratch buffers and runs one device
+//! batch at a time. [`EncoderRuntime::embed`] is thread-safe: text calls that
+//! wait for the device share batches in arrival order, as
+//! [`BatchScheduler`] describes, so a long call does not hold the device
+//! until it finishes.
 //!
 //! Activations stay f32 between operations. Each GEMM consumes BF16
 //! activations and the checkpoint's BF16 weights and produces f32.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
 
 use gufo_embedding_gemma2_kernels as k;
 use gufo_hip::{
     Bf16, DeviceBuffer, DeviceCopy, DeviceIndices, Launch, LaunchError, PinnedBuffer, Stream,
 };
 
-use crate::config::{EMBED_SCALE, LayerType, ModelConfig};
+use crate::audio::AudioRuntime;
+use crate::batch_scheduler::{BatchScheduler, CancelCheck, EncoderSequence, Outcome};
+use crate::config::{AUDIO_TOKEN_ID, EMBED_SCALE, IMAGE_TOKEN_ID, LayerType, ModelConfig};
 use crate::gemm::{self, Gemm};
-use crate::loader::{LoadedModel, TEXT_TENSOR_PREFIX, TensorStore, load_model_directory};
+use crate::loader::{LoadedModel, TEXT_TENSOR_PREFIX, TensorStore, Towers, load_model_directory};
+use crate::vision::Vision;
 
 /// The model's context window. Longer sequences are refused, not truncated.
 pub const MAX_SEQUENCE_TOKENS: usize = 8192;
@@ -26,7 +30,7 @@ pub const MAX_SEQUENCE_TOKENS: usize = 8192;
 /// Rows per chunk when a GEMM and its consumer run back to back. Chunking
 /// bounds the f32 scratch. Unchunked, the gate/up buffer for 8,192 tokens
 /// would be 8,192 x 4,096 x 4 bytes = 134 MB and the QKV buffer about 100 MB.
-const CHUNK_TOKENS: usize = 1024;
+pub(crate) const CHUNK_TOKENS: usize = 1024;
 // The GEMM pads a chunk up to a row bucket, so the scratch behind every chunk
 // must hold a full chunk.
 const _: () = assert!(MAX_SEQUENCE_TOKENS.is_multiple_of(CHUNK_TOKENS));
@@ -68,10 +72,15 @@ struct Indices {
     device: DeviceIndices,
 }
 
-/// Everything that runs on the device, used by one turn at a time.
+/// Everything that runs on the device, used by one batch at a time.
 struct Device {
     stream: Stream,
     gemm: Gemm,
+    model_dir: PathBuf,
+    /// Loaded by the first image.
+    vision: Option<Vision>,
+    /// Loaded by the first audio clip.
+    audio: Option<AudioRuntime>,
 
     embed_table: DeviceBuffer<Bf16>,
     final_norm: DeviceBuffer<Bf16>,
@@ -97,6 +106,9 @@ struct Device {
     query_bf16: DeviceBuffer<Bf16>,
     key_bf16: DeviceBuffer<Bf16>,
     value_bf16: DeviceBuffer<Bf16>,
+    /// The transposed copy the attention kernel reads, with a stride that is
+    /// a multiple of 32 tokens; the transpose zero-fills each column's tail.
+    value_t_bf16: DeviceBuffer<Bf16>,
     context_bf16: DeviceBuffer<Bf16>,
     temp_f32: DeviceBuffer<f32>,
     gate_up_f32: DeviceBuffer<f32>,
@@ -109,48 +121,13 @@ struct Device {
     probe: DeviceBuffer<u32>,
 }
 
-/// Device turns in arrival order, one batch each. A plain mutex lets the
-/// thread that just released it take it straight back, so a long request
-/// would still starve the requests queued behind it.
-#[derive(Default)]
-struct Turns {
-    state: Mutex<(u64, u64)>,
-    changed: Condvar,
-}
-
-struct Turn<'a> {
-    turns: &'a Turns,
-}
-
-impl Turns {
-    fn lock(&self) -> MutexGuard<'_, (u64, u64)> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Waits for this caller's turn: tickets are served in the order taken.
-    fn take(&self) -> Turn<'_> {
-        let mut state = self.lock();
-        let ticket = state.0;
-        state.0 += 1;
-        while state.1 != ticket {
-            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
-        Turn { turns: self }
-    }
-}
-
-impl Drop for Turn<'_> {
-    fn drop(&mut self) {
-        self.turns.lock().1 += 1;
-        self.turns.changed.notify_all();
-    }
-}
-
 pub struct EncoderRuntime {
     config: ModelConfig,
     device: Mutex<Device>,
     lost: AtomicBool,
-    turns: Turns,
+    /// Packs concurrent text calls into shared batches, gives each call with
+    /// an image or audio a batch of its own, and runs one batch at a time.
+    scheduler: BatchScheduler,
 }
 
 fn hip(error: impl std::fmt::Display) -> String {
@@ -158,13 +135,17 @@ fn hip(error: impl std::fmt::Display) -> String {
 }
 
 /// One BF16 tensor, uploaded synchronously into its own exact allocation.
-fn upload(stream: &Stream, store: &TensorStore, name: &str) -> Result<DeviceBuffer<Bf16>, String> {
+pub(crate) fn upload(
+    stream: &Stream,
+    store: &TensorStore,
+    name: &str,
+) -> Result<DeviceBuffer<Bf16>, String> {
     upload_concatenated(stream, store, &[name.to_owned()])
 }
 
 /// BF16 tensors that share a column count, concatenated row-wise into one
 /// device allocation.
-fn upload_concatenated(
+pub(crate) fn upload_concatenated(
     stream: &Stream,
     store: &TensorStore,
     names: &[String],
@@ -235,7 +216,7 @@ fn scratch<T: DeviceCopy>(stream: &Stream, len: usize) -> Result<DeviceBuffer<T>
 }
 
 impl Device {
-    fn new(loaded: &LoadedModel) -> Result<Self, String> {
+    fn new(loaded: &LoadedModel, model_dir: &Path) -> Result<Self, String> {
         let stream = Stream::new().map_err(hip)?;
         let gemm = Gemm::new(&stream)?;
         let store = &loaded.store;
@@ -321,6 +302,7 @@ impl Device {
             query_bf16: scratch(&stream, n * query_width)?,
             key_bf16: scratch(&stream, n * key_width)?,
             value_bf16: scratch(&stream, n * key_width)?,
+            value_t_bf16: scratch(&stream, n.div_ceil(32) * 32 * key_width)?,
             context_bf16: scratch(&stream, n * query_width)?,
             temp_f32: scratch(&stream, n * hidden)?,
             gate_up_f32: scratch(&stream, chunk * 2 * intermediate)?,
@@ -338,6 +320,9 @@ impl Device {
             layers,
             rope,
             gemm,
+            model_dir: model_dir.to_owned(),
+            vision: None,
+            audio: None,
             stream,
         })
     }
@@ -359,7 +344,8 @@ impl Device {
         let mut rows = 0;
         while rows < CHUNK_TOKENS {
             rows = gemm::bucket(rows + 1, CHUNK_TOKENS);
-            self.run_batch(config, &[vec![1000; rows]])?;
+            let filler = EncoderSequence::text(vec![1000; rows]);
+            self.run_batch(config, &[&filler])?;
         }
         Ok(())
     }
@@ -369,7 +355,7 @@ impl Device {
     fn run_batch(
         &mut self,
         config: &ModelConfig,
-        sequences: &[Vec<u32>],
+        sequences: &[&EncoderSequence],
     ) -> Result<Vec<Vec<f32>>, String> {
         let text = &config.text;
         let hidden = text.hidden_size as usize;
@@ -378,7 +364,7 @@ impl Device {
         let embedding_dim = text.embedding_dim as usize;
         let epsilon = text.rms_norm_eps;
         let heads = text.num_attention_heads;
-        let tokens: usize = sequences.iter().map(Vec::len).sum();
+        let tokens: usize = sequences.iter().map(|s| s.tokens.len()).sum();
         let count = sequences.len();
         let n = MAX_SEQUENCE_TOKENS;
         let stream = &self.stream;
@@ -394,8 +380,8 @@ impl Device {
             offsets[0] = 0;
             for (s, sequence) in sequences.iter().enumerate() {
                 let begin = at as u32;
-                let end = (at + sequence.len()) as u32;
-                for (t, &id) in sequence.iter().enumerate() {
+                let end = (at + sequence.tokens.len()) as u32;
+                for (t, &id) in sequence.tokens.iter().enumerate() {
                     ids[at] = id;
                     positions[at] = t as u32;
                     begins[at] = begin;
@@ -430,6 +416,42 @@ impl Device {
             text.vocab_size as usize,
         )
         .map_err(launch)?;
+
+        // Image and audio features replace their placeholder rows.
+        let mut offset = 0;
+        for sequence in sequences {
+            for clip in &sequence.audio {
+                if self.audio.is_none() {
+                    self.audio = Some(AudioRuntime::new(&self.model_dir, stream)?);
+                }
+                let audio = self.audio.as_mut().expect("loaded audio tower");
+                let features =
+                    audio.run(stream, &clip.features, sequence.is_cancelled.as_deref())?;
+                let at = (offset + clip.offset) * 512;
+                k::vision_insert(
+                    stream,
+                    features,
+                    self.state.slice_mut(at..n * hidden),
+                    self.embeddings_bf16.slice_mut(at..n * hidden),
+                    clip.features.soft_tokens(),
+                )
+                .map_err(launch)?;
+            }
+            for image in &sequence.images {
+                if self.vision.is_none() {
+                    self.vision = Some(Vision::load(&self.model_dir, stream)?);
+                }
+                let at = (offset + image.offset) * 512;
+                self.vision.as_mut().expect("loaded vision tower").run(
+                    stream,
+                    &self.gemm,
+                    &image.patches,
+                    self.state.slice_mut(at..n * hidden),
+                    self.embeddings_bf16.slice_mut(at..n * hidden),
+                )?;
+            }
+            offset += sequence.tokens.len();
+        }
 
         let ple_scale = 1.0f32 / (hidden as f32).sqrt();
         let chunks = || (0..tokens).step_by(CHUNK_TOKENS);
@@ -491,11 +513,21 @@ impl Device {
                 .map_err(launch)?;
             }
             let key_rows = self.key_bf16.len() / key_width;
+            k::transpose_values(
+                stream,
+                self.value_bf16.slice(0..tokens * key_width),
+                self.value_t_bf16
+                    .slice_mut(0..tokens.div_ceil(32) * 32 * key_width),
+                tokens,
+                key_width as u32,
+            )
+            .map_err(launch)?;
             let attended = k::attention(
                 stream,
                 self.query_bf16.as_slice(),
                 self.key_bf16.as_slice(),
-                self.value_bf16.as_slice(),
+                self.value_t_bf16
+                    .slice(0..key_rows.div_ceil(32) * 32 * key_width),
                 self.context_bf16.as_mut_slice(),
                 self.sequence_begin.device.view(),
                 self.sequence_end.device.view(),
@@ -732,13 +764,14 @@ impl Device {
 
 impl EncoderRuntime {
     /// Loads the checkpoint, uploads the text backbone and tunes every GEMM
-    /// row bucket. The checkpoint is unmapped before the warm-up: the device
-    /// then holds every weight, and unmapping releases the page-cache
-    /// residency, about 650 MB of host memory.
+    /// row bucket. Vision and audio weights load on the first request for
+    /// each. The checkpoint is unmapped before the warm-up: the device then
+    /// holds every weight, and unmapping releases the page-cache residency,
+    /// about 650 MB of host memory.
     pub fn create(model_dir: &Path) -> Result<Self, String> {
-        let loaded = load_model_directory(model_dir)?;
+        let loaded = load_model_directory(model_dir, Towers::default())?;
         let fail = |error: String| format!("embedding_gemma2: {error}");
-        let mut device = Device::new(&loaded).map_err(fail)?;
+        let mut device = Device::new(&loaded, model_dir).map_err(fail)?;
         let LoadedModel { config, store } = loaded;
         drop(store);
         if let Err(error) = device.warmup(&config) {
@@ -749,7 +782,7 @@ impl EncoderRuntime {
             config,
             device: Mutex::new(device),
             lost: AtomicBool::new(false),
-            turns: Turns::default(),
+            scheduler: BatchScheduler::new(MAX_SEQUENCE_TOKENS),
         })
     }
 
@@ -763,66 +796,136 @@ impl EncoderRuntime {
     }
 
     /// One mean-pooled, L2-normalised embedding of `config().text.
-    /// embedding_dim` floats for each sequence. Sequences are packed into as
-    /// few device batches of MAX_SEQUENCE_TOKENS as fit. The call polls
-    /// `is_cancelled` at the start of each device turn; a cancelled call
-    /// fails with [`CANCELLED_MESSAGE`]. After a device failure that a probe
+    /// embedding_dim` floats for each sequence. Sequences are packed into
+    /// device batches of up to MAX_SEQUENCE_TOKENS, together with those of
+    /// concurrent calls. `is_cancelled` is polled before each device batch
+    /// that would take this call's sequences; the poll may run on another
+    /// call's thread with the scheduler's lock held, so it must not block. A
+    /// cancelled call fails with [`CANCELLED_MESSAGE`]. A failed batch fails
+    /// every call with sequences in it. After a device failure that a probe
     /// confirms, [`Self::device_lost`] turns true and every later call fails
     /// with [`DEVICE_LOST_MESSAGE`].
     pub fn embed(
         &self,
         sequences: &[Vec<u32>],
-        is_cancelled: Option<&dyn Fn() -> bool>,
+        is_cancelled: Option<CancelCheck>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let inputs = sequences
+            .iter()
+            .map(|tokens| EncoderSequence::text(tokens.clone()))
+            .collect();
+        self.embed_multimodal(inputs, is_cancelled)
+    }
+
+    /// Like [`Self::embed`], for sequences that may hold images or audio. A
+    /// call with an image or audio runs in a batch of its own, in arrival
+    /// order. The first such call loads the vision or audio tower in that
+    /// batch, so a failed load fails only that call.
+    pub fn embed_multimodal(
+        &self,
+        sequences: Vec<EncoderSequence>,
+        is_cancelled: Option<CancelCheck>,
     ) -> Result<Vec<Vec<f32>>, String> {
         let text = &self.config.text;
-        for sequence in sequences {
-            if sequence.is_empty() {
+        for sequence in &sequences {
+            let tokens = &sequence.tokens;
+            if tokens.is_empty() {
                 return Err("embedding_gemma2: empty token sequence".into());
             }
-            if sequence.len() > MAX_SEQUENCE_TOKENS {
+            if tokens.len() > MAX_SEQUENCE_TOKENS {
                 return Err(format!(
                     "embedding_gemma2: sequence exceeds {MAX_SEQUENCE_TOKENS} tokens"
                 ));
             }
-            if sequence.iter().any(|&id| id >= text.vocab_size) {
+            let mut previous_end = 0;
+            for image in &sequence.images {
+                let patches = &image.patches;
+                let n = patches.soft_tokens();
+                if patches.rows == 0
+                    || patches.columns == 0
+                    || patches.rows % 3 != 0
+                    || patches.columns % 3 != 0
+                    || n > 280
+                    || patches.pixels.len() != n * 9 * 768
+                    || image.offset < previous_end
+                    || image.offset > tokens.len()
+                    || n > tokens.len() - image.offset
+                {
+                    return Err("embedding_gemma2: invalid image patches or token offset".into());
+                }
+                if tokens[image.offset..image.offset + n]
+                    .iter()
+                    .any(|&id| id != IMAGE_TOKEN_ID)
+                {
+                    return Err("embedding_gemma2: image placeholder mismatch".into());
+                }
+                previous_end = image.offset + n;
+            }
+            previous_end = 0;
+            for clip in &sequence.audio {
+                let features = &clip.features;
+                let n = features.soft_tokens();
+                let mut padding = false;
+                for &valid in &features.mask {
+                    if valid > 1 || (padding && valid != 0) {
+                        return Err("embedding_gemma2: invalid audio feature mask".into());
+                    }
+                    padding = padding || valid == 0;
+                }
+                if features.mask.is_empty()
+                    || features.mask.len() > 2999
+                    || n == 0
+                    || features.values.len() != features.mask.len() * 128
+                    || !features.values.iter().all(|x| x.is_finite())
+                    || clip.offset < previous_end
+                    || clip.offset > tokens.len()
+                    || n > tokens.len() - clip.offset
+                {
+                    return Err("embedding_gemma2: invalid audio features or token offset".into());
+                }
+                if tokens[clip.offset..clip.offset + n]
+                    .iter()
+                    .any(|&id| id != AUDIO_TOKEN_ID)
+                {
+                    return Err("embedding_gemma2: audio placeholder mismatch".into());
+                }
+                previous_end = clip.offset + n;
+            }
+            if tokens.iter().any(|&id| id >= text.vocab_size) {
                 return Err("embedding_gemma2: token id out of range".into());
             }
         }
-        let mut embeddings = Vec::with_capacity(sequences.len());
-        let mut first = 0;
-        while first < sequences.len() {
-            let mut last = first;
-            let mut tokens = 0;
-            while last < sequences.len() && tokens + sequences[last].len() <= MAX_SEQUENCE_TOKENS {
-                tokens += sequences[last].len();
-                last += 1;
-            }
-            // Each batch takes a new turn, so requests that arrived meanwhile
-            // run before the next batch of this one.
-            let _turn = self.turns.take();
-            if self.device_lost() {
-                return Err(DEVICE_LOST_MESSAGE.into());
-            }
-            if is_cancelled.is_some_and(|cancelled| cancelled()) {
-                return Err(CANCELLED_MESSAGE.into());
-            }
-            let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
-            match device.run_batch(&self.config, &sequences[first..last]) {
-                Ok(batch) => embeddings.extend(batch),
-                Err(failure) => {
-                    // Kernels from the failed batch may still be queued. They
-                    // read the index buffers the next batch overwrites, so
-                    // drain the stream before the turn passes on.
-                    let _ = device.stream.synchronize();
-                    if !device.usable() {
-                        self.lost.store(true, Ordering::Release);
-                        return Err(format!("{DEVICE_LOST_MESSAGE}: {failure}"));
-                    }
-                    return Err(format!("embedding_gemma2: {failure}"));
-                }
-            }
-            first = last;
+        match self
+            .scheduler
+            .run(sequences.into(), is_cancelled, &|batch| {
+                self.on_device(batch)
+            }) {
+            Outcome::Ok(embeddings) => Ok(embeddings),
+            Outcome::Cancelled => Err(CANCELLED_MESSAGE.into()),
+            Outcome::Failed(error) => Err(error),
         }
-        Ok(embeddings)
+    }
+
+    /// Runs one scheduled batch and turns a failure into an error,
+    /// confirming a lost device with the probe (`OnDevice`).
+    fn on_device(&self, sequences: &[&EncoderSequence]) -> Result<Vec<Vec<f32>>, String> {
+        if self.device_lost() {
+            return Err(DEVICE_LOST_MESSAGE.into());
+        }
+        let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        device
+            .run_batch(&self.config, sequences)
+            .map_err(|failure| {
+                // Kernels from the failed work may still be queued. They read the
+                // index buffers the next batch overwrites, so drain the stream
+                // before the next batch starts.
+                let _ = device.stream.synchronize();
+                if device.usable() {
+                    format!("embedding_gemma2: {failure}")
+                } else {
+                    self.lost.store(true, Ordering::Release);
+                    format!("{DEVICE_LOST_MESSAGE}: {failure}")
+                }
+            })
     }
 }

@@ -7,11 +7,13 @@
 use std::ops::{Add, Mul, Shr};
 
 use gufo_core::image::{Image, MAX_IMAGE_PIXELS};
-use gufo_core::text::{Error, Result};
+use gufo_core::text::{Error, ImageDetail, Result};
 
 use super::{MAX_ENCODER_PIXELS, RESIZE_FACTOR};
 
 const MIN_PIXELS: u64 = 65536;
+/// The longest side of a resized image of [`ImageDetail::Low`].
+const LOW_DETAIL_MAX_SIDE: u32 = 512;
 
 /// Round half to even, as Python's `round`.
 fn round_even(x: f64) -> u32 {
@@ -200,26 +202,54 @@ fn vertical<A: Accumulator>(
     }
 }
 
-/// The target size of `(width, height)`.
-fn target_size(width: u32, height: u32) -> (u32, u32) {
+/// The target size of `(width, height)` at `detail`.
+fn target_size(width: u32, height: u32, detail: ImageDetail) -> (u32, u32) {
     let factor = RESIZE_FACTOR;
     let mut h = round_even(f64::from(height) / f64::from(factor)) * factor;
     let mut w = round_even(f64::from(width) / f64::from(factor)) * factor;
+    let raised_to_minimum = || {
+        let beta = (MIN_PIXELS as f64 / (f64::from(width) * f64::from(height))).sqrt();
+        (
+            ((f64::from(width) * beta / f64::from(factor)).ceil() as u32) * factor,
+            ((f64::from(height) * beta / f64::from(factor)).ceil() as u32) * factor,
+        )
+    };
     let rounded = u64::from(h) * u64::from(w);
     if rounded > MAX_ENCODER_PIXELS {
         let beta = (f64::from(width) * f64::from(height) / MAX_ENCODER_PIXELS as f64).sqrt();
         h = factor.max(((f64::from(height) / beta / f64::from(factor)).floor() as u32) * factor);
         w = factor.max(((f64::from(width) / beta / f64::from(factor)).floor() as u32) * factor);
     } else if rounded < MIN_PIXELS {
-        let beta = (MIN_PIXELS as f64 / (f64::from(width) * f64::from(height))).sqrt();
-        h = ((f64::from(height) * beta / f64::from(factor)).ceil() as u32) * factor;
-        w = ((f64::from(width) * beta / f64::from(factor)).ceil() as u32) * factor;
+        (w, h) = raised_to_minimum();
+    }
+    if detail == ImageDetail::Low && (w > LOW_DETAIL_MAX_SIDE || h > LOW_DETAIL_MAX_SIDE) {
+        // A floating-point scale can land just below 512 on the longest side
+        // and floor it to 480, so the bound uses integer arithmetic.
+        let longest = u64::from(width.max(height));
+        let bound = |side: u32| {
+            let scaled = (u64::from(side) * u64::from(LOW_DETAIL_MAX_SIDE) / longest) as u32;
+            factor.max(scaled / factor * factor)
+        };
+        let automatic = (w, h);
+        (w, h) = (bound(width), bound(height));
+        // For extreme aspect ratios the model's minimum overrides the bound,
+        // but rounding that minimum up must not make 'low' larger than
+        // 'auto'.
+        if u64::from(w) * u64::from(h) < MIN_PIXELS {
+            (w, h) = raised_to_minimum();
+            if u64::from(w) * u64::from(h) > u64::from(automatic.0) * u64::from(automatic.1) {
+                (w, h) = automatic;
+            }
+        }
     }
     (w, h)
 }
 
-/// Resizes a decoded image to the encoder's grid.
-pub fn resize_image(image: &Image) -> Result<Image> {
+/// Resizes a decoded image to the encoder's grid. [`ImageDetail::Low`]
+/// limits both sides to 512 pixels, at most 16 x 16 merged tokens, unless
+/// the model's minimum size is larger; it never exceeds the `Auto` size,
+/// which uses the model's full range.
+pub fn resize_image(image: &Image, detail: ImageDetail) -> Result<Image> {
     let (width, height) = (image.width, image.height);
     if width == 0
         || height == 0
@@ -229,7 +259,7 @@ pub fn resize_image(image: &Image) -> Result<Image> {
     {
         return Err(Error::invalid("invalid image dimensions or aspect ratio"));
     }
-    let (w, h) = target_size(width, height);
+    let (w, h) = target_size(width, height, detail);
     if w == width && h == height {
         return Ok(image.clone());
     }
@@ -265,18 +295,19 @@ pub fn resize_image(image: &Image) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ImageDetail::{Auto, Low};
 
     #[test]
     fn sizes_follow_the_smart_resize() {
         // Rounds to multiples of 32 with ties to even.
-        assert_eq!(target_size(640, 480), (640, 480));
-        assert_eq!(target_size(650, 470), (640, 480));
-        assert_eq!(target_size(336, 336), (320, 320));
-        assert_eq!(target_size(368, 368), (384, 384));
+        assert_eq!(target_size(640, 480, Auto), (640, 480));
+        assert_eq!(target_size(650, 470, Auto), (640, 480));
+        assert_eq!(target_size(336, 336, Auto), (320, 320));
+        assert_eq!(target_size(368, 368, Auto), (384, 384));
         // Small images grow to at least 65,536 pixels.
-        assert_eq!(target_size(100, 100), (256, 256));
+        assert_eq!(target_size(100, 100, Auto), (256, 256));
         // Large images shrink below 16,777,216 pixels.
-        let (w, h) = target_size(8000, 6000);
+        let (w, h) = target_size(8000, 6000, Auto);
         assert!(u64::from(w) * u64::from(h) <= MAX_ENCODER_PIXELS);
         assert_eq!((w % 32, h % 32), (0, 0));
     }
@@ -284,16 +315,45 @@ mod tests {
     #[test]
     fn identity_sizes_keep_the_pixels_and_extreme_aspects_fail() {
         let image = Image::new(64, 1024, (0..64 * 1024 * 3).map(|i| i as u8).collect()).unwrap();
-        assert_eq!(resize_image(&image).unwrap(), image);
+        assert_eq!(resize_image(&image, Auto).unwrap(), image);
         let thin = Image::new(201, 1, vec![0; 603]).unwrap();
-        assert!(resize_image(&thin).is_err());
+        assert!(resize_image(&thin, Auto).is_err());
     }
 
     #[test]
     fn a_constant_image_stays_constant() {
         let image = Image::new(333, 251, vec![77; 333 * 251 * 3]).unwrap();
-        let resized = resize_image(&image).unwrap();
+        let resized = resize_image(&image, Auto).unwrap();
         assert_eq!((resized.width, resized.height), (320, 256));
         assert!(resized.pixels.iter().all(|&p| p == 77));
+    }
+
+    #[test]
+    fn low_detail_bounds_both_sides_to_512_pixels() {
+        assert_eq!(target_size(2048, 1536, Auto), (2048, 1536));
+        assert_eq!(target_size(2048, 1536, Low), (512, 384));
+        // Rounding near the bound: 600 x 500 rounds to 608 x 512 under auto.
+        assert_eq!(target_size(600, 500, Auto), (608, 512));
+        assert_eq!(target_size(600, 500, Low), (512, 416));
+        // The longest side reaches exactly 512 for sizes where a
+        // floating-point scale would round it down to 480.
+        assert_eq!(target_size(561, 400, Low), (512, 352));
+        // A very wide image keeps both sides within 512 pixels.
+        assert_eq!(target_size(4000, 1000, Auto), (4000, 992));
+        assert_eq!(target_size(4000, 1000, Low), (512, 128));
+        // For extreme aspect ratios the model minimum overrides the bound.
+        assert_eq!(target_size(10000, 1000, Low), (832, 96));
+        // Raising to the minimum would give 576 x 128 and 2048 x 64; 'low'
+        // keeps the smaller 'auto' size instead.
+        for (width, height, expected) in [(551, 122, (544, 128)), (2032, 32, (2048, 32))] {
+            assert_eq!(target_size(width, height, Auto), expected);
+            assert_eq!(target_size(width, height, Low), expected);
+        }
+        // Images below the bound resize the same for both details.
+        let small = Image::new(320, 240, vec![5; 320 * 240 * 3]).unwrap();
+        assert_eq!(
+            resize_image(&small, Low).unwrap(),
+            resize_image(&small, Auto).unwrap()
+        );
     }
 }

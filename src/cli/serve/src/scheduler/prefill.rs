@@ -106,6 +106,7 @@ impl<R: TextModelRunner> Worker<R> {
             let decode_start = Instant::now();
             let selection = work.runner()?.select_next()?;
             if selection.stop {
+                self.publish_terminal_logprobs(work, selection.logprobs.as_ref())?;
                 work.result.decode_ms += elapsed_ms(decode_start);
                 self.complete_success(work, FinishReason::Stop)?;
                 return Ok(None);
@@ -154,6 +155,13 @@ impl<R: TextModelRunner> Worker<R> {
             return false;
         }
         work.generated_output_bytes += selection.piece.len();
+        let logprobs = match self.retain_logprobs(work, selection.logprobs.as_ref()) {
+            Ok(logprobs) => logprobs,
+            Err(failure) => {
+                self.complete_failure(work, failure);
+                return false;
+            }
+        };
         work.result.tokens.push(selection.token);
         work.shared
             .live_generated_tokens
@@ -165,9 +173,13 @@ impl<R: TextModelRunner> Worker<R> {
             selection.piece.clone()
         };
         // Without a stop filter every token is an event, also one without
-        // text; a filter publishes only released bytes.
-        if (!piece.is_empty() || !work.stop_filter.enabled())
-            && !work.shared.publish_piece(piece.clone())
+        // text; a filter publishes only released bytes, and every token
+        // with log probabilities.
+        if (!piece.is_empty() || !work.stop_filter.enabled() || logprobs.is_some())
+            && !work.shared.publish_piece(
+                piece.clone(),
+                logprobs.and_then(|index| work.result.logprobs.get(index)),
+            )
         {
             self.complete_failure(
                 work,
@@ -185,6 +197,58 @@ impl<R: TextModelRunner> Worker<R> {
             work.result.stop_sequence = sequence.to_owned();
         }
         !self.complete_if_stopped(work)
+    }
+
+    /// Decodes and keeps `values` in the result; the index of the kept
+    /// entries (`RetainLogprobs`). Bounded by the token budget, not the text
+    /// byte limit: at `top_logprobs` 20 that limit would end a default
+    /// request near 600 tokens.
+    pub(super) fn retain_logprobs(
+        &self,
+        work: &mut Work<R>,
+        values: Option<&TokenLogprobs>,
+    ) -> Result<Option<usize>> {
+        let Some(values) = values else {
+            return Ok(None);
+        };
+        let runner = self.pool.runner();
+        let mut failure = None;
+        let decoded =
+            work.logprob_decoder
+                .decode_token(values, |token| match runner.decode(&[token]) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        Vec::new()
+                    }
+                });
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        work.result.logprobs.push(decoded);
+        Ok(Some(work.result.logprobs.len() - 1))
+    }
+
+    /// Publishes the log probabilities of the stop token that ends `work`
+    /// as a piece without text (`PublishTerminalLogprobs`).
+    pub(super) fn publish_terminal_logprobs(
+        &self,
+        work: &mut Work<R>,
+        values: Option<&TokenLogprobs>,
+    ) -> Result<()> {
+        let Some(index) = self.retain_logprobs(work, values)? else {
+            return Ok(());
+        };
+        if !work
+            .shared
+            .publish_piece(Vec::new(), work.result.logprobs.get(index))
+        {
+            return Err(Error::generation(
+                GenerationErrorCode::OutputBackpressure,
+                "logprobs exceed buffered output limit",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn finish_advanced(&self, work: &mut Work<R>, decode_start: Instant) -> Result<()> {

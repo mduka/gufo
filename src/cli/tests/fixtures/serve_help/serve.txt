@@ -7,7 +7,7 @@ Commands:
   image     Serve Qwen-Image-2.1 (/v1/images/generations, /v1/images/edits)
   tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)
   asr       Serve Qwen3-ASR transcription (/v1/audio/transcriptions)
-  embedding Serve EmbeddingGemma 2 text embeddings (/v1/embeddings)
+  embedding Serve EmbeddingGemma 2 text, image and audio embeddings (/v1/embeddings)
 
 Server:
   -i, --host <IP>        Bind address (default: 127.0.0.1)

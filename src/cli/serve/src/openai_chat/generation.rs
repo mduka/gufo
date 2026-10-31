@@ -73,10 +73,75 @@ pub(crate) fn parse_openai_response_format(
     Ok(())
 }
 
+/// Where `part`, a slice of `source`, starts in it; `None` for text that
+/// does not lie in `source` (an empty constant).
+fn source_offset(source: &str, part: &str) -> Option<usize> {
+    let offset = (part.as_ptr() as usize).checked_sub(source.as_ptr() as usize)?;
+    (offset + part.len() <= source.len()).then_some(offset)
+}
+
+/// `size` bytes from `offset` of a text whose pieces come from the source
+/// ranges `source`, as source ranges (`AppendTextSpans`).
+pub(super) fn append_text_spans(
+    output: &mut Vec<TextSourceSpan>,
+    source: &[TextSourceSpan],
+    mut offset: usize,
+    mut size: usize,
+) {
+    for span in source {
+        if offset >= span.size {
+            offset -= span.size;
+            continue;
+        }
+        let count = size.min(span.size - offset);
+        if count > 0 {
+            output.push(TextSourceSpan {
+                begin: span.begin + offset,
+                size: count,
+            });
+        }
+        size -= count;
+        if size == 0 {
+            break;
+        }
+        offset = 0;
+    }
+}
+
+/// Sets the parsed text to `text`, a slice of `source`, and its source
+/// range when `track` (`SetParsedText`).
+fn set_parsed_text(parsed: &mut ParsedGeneration, text: &str, source: &str, track: bool) {
+    parsed.text = text.to_owned();
+    parsed.text_spans.clear();
+    push_text_span(parsed, text, source, track);
+}
+
+/// Records the source range of `text`, just appended to the parsed text.
+fn push_text_span(parsed: &mut ParsedGeneration, text: &str, source: &str, track: bool) {
+    if track
+        && !text.is_empty()
+        && let Some(begin) = source_offset(source, text)
+    {
+        parsed.text_spans.push(TextSourceSpan {
+            begin,
+            size: text.len(),
+        });
+    }
+}
+
+/// Moves the source ranges of a text parsed from `offset` into its source
+/// (`RebaseTextSpans`).
+fn rebase_text_spans(parsed: &mut ParsedGeneration, offset: usize) {
+    for span in &mut parsed.text_spans {
+        span.begin += offset;
+    }
+}
+
 /// `enforce_required` is false when a stop sequence or the token limit cut
 /// the generation short of a required tool call. Only `syntax.markers` begin
 /// tool markup ([`tool_syntax`]); without them reasoning ends at `</think>`
-/// alone.
+/// alone. `track_text` records the source ranges of the content in `raw`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn parse_generation(
     raw: &str,
     initial_output_state: InitialOutputState,
@@ -85,6 +150,7 @@ pub(super) fn parse_generation(
     enforce_required: bool,
     syntax: ToolSyntax,
     partial: bool,
+    track_text: bool,
 ) -> Result<ParsedGeneration> {
     let ToolSyntax {
         markers,
@@ -123,12 +189,12 @@ pub(super) fn parse_generation(
                 if unclosed_marker(content, marker) {
                     reasoning_call_context = Some(content);
                 }
-                parsed.text = content[marker..].to_owned();
+                set_parsed_text(&mut parsed, &content[marker..], raw, track_text);
             }
             Some(end) => {
                 parsed.reasoning_content = trim(&content[..end]).to_owned();
-                parsed.text =
-                    after_reasoning_separator(&content[end + THINK_END.len()..], qwen).to_owned();
+                let text = after_reasoning_separator(&content[end + THINK_END.len()..], qwen);
+                set_parsed_text(&mut parsed, text, raw, track_text);
             }
         }
     } else if initial_output_state == InitialOutputState::Auto
@@ -153,28 +219,31 @@ pub(super) fn parse_generation(
             Some(end) => {
                 parsed.reasoning_content = trim(&content[think_content_start..end]).to_owned();
                 let remaining = after_reasoning_separator(&content[end + THINK_END.len()..], qwen);
-                parsed.text = if think_start > 0 {
-                    format!("{}{}", &content[..think_start], remaining)
+                if think_start > 0 {
+                    set_parsed_text(&mut parsed, &content[..think_start], raw, track_text);
+                    parsed.text.push_str(remaining);
+                    push_text_span(&mut parsed, remaining, raw, track_text);
                 } else {
-                    remaining.to_owned()
-                };
+                    set_parsed_text(&mut parsed, remaining, raw, track_text);
+                }
             }
             None => {
                 let remaining = &content[think_content_start..];
                 let marker = earliest_marker_in(remaining, markers).map(|(p, _)| p);
                 parsed.reasoning_content =
                     trim(&remaining[..marker.unwrap_or(remaining.len())]).to_owned();
-                parsed.text = content[..think_start].to_owned();
+                set_parsed_text(&mut parsed, &content[..think_start], raw, track_text);
                 if let Some(marker) = marker {
                     if unclosed_marker(remaining, marker) {
                         reasoning_call_context = Some(remaining);
                     }
                     parsed.text.push_str(&remaining[marker..]);
+                    push_text_span(&mut parsed, &remaining[marker..], raw, track_text);
                 }
             }
         }
     } else {
-        parsed.text = content.to_owned();
+        set_parsed_text(&mut parsed, content, raw, track_text);
     }
 
     let recognize_tools = !tools.is_empty() && choice != ToolChoice::None;
@@ -219,15 +288,22 @@ pub(super) fn parse_generation(
             if let Some(context) = reasoning_call_context {
                 let end = context.find(THINK_END);
                 let mut kept = match end {
-                    Some(end) => parse_generation(
-                        &context[end + THINK_END.len()..],
-                        InitialOutputState::Content,
-                        tools,
-                        choice,
-                        enforce_required,
-                        syntax,
-                        partial,
-                    )?,
+                    Some(end) => {
+                        let mut kept = parse_generation(
+                            &context[end + THINK_END.len()..],
+                            InitialOutputState::Content,
+                            tools,
+                            choice,
+                            enforce_required,
+                            syntax,
+                            partial,
+                            track_text,
+                        )?;
+                        if let Some(offset) = source_offset(raw, context) {
+                            rebase_text_spans(&mut kept, offset + end + THINK_END.len());
+                        }
+                        kept
+                    }
                     None => ParsedGeneration::default(),
                 };
                 kept.reasoning_content = context[..end.unwrap_or(context.len())].to_owned();
@@ -244,13 +320,23 @@ pub(super) fn parse_generation(
             // Text outside complete call blocks is content; framing echoed
             // directly after a call goes, as for Qwen calls.
             let full = std::mem::take(&mut parsed.text);
+            let old_spans = std::mem::take(&mut parsed.text_spans);
             let content = |begin: usize, end: usize, after_call: bool| {
                 content_before(&full, begin, end, closers, &quotes, tools, after_call)
             };
-            let mut text = content(0, marker, false).to_owned();
+            let mut text = String::new();
+            let mut append = |part: &str| {
+                text.push_str(part);
+                if !part.is_empty()
+                    && let Some(offset) = source_offset(&full, part)
+                {
+                    append_text_spans(&mut parsed.text_spans, &old_spans, offset, part.len());
+                }
+            };
+            append(content(0, marker, false));
             let mut cursor = marker;
             for &(begin, end) in &spans {
-                text.push_str(content(cursor, marker + begin, cursor > marker));
+                append(content(cursor, marker + begin, cursor > marker));
                 cursor = marker + end;
             }
             if !spans.is_empty() {
@@ -262,7 +348,7 @@ pub(super) fn parse_generation(
                         unfinished = Some(full.len() - held);
                     }
                 }
-                text.push_str(content(cursor, unfinished.unwrap_or(full.len()), true));
+                append(content(cursor, unfinished.unwrap_or(full.len()), true));
             }
             parsed.text = text;
             parsed.hide_tool_markup = true;
@@ -271,7 +357,7 @@ pub(super) fn parse_generation(
         // Without a marker the text is content, but the framing it carries
         // still goes: the streamed response drops it as the turn ends, and
         // both transports report the same content.
-        parsed.text = content_before(
+        let part = content_before(
             &parsed.text,
             0,
             parsed.text.len(),
@@ -279,8 +365,15 @@ pub(super) fn parse_generation(
             &quotes,
             tools,
             false,
-        )
-        .to_owned();
+        );
+        let mut spans = Vec::new();
+        if !part.is_empty()
+            && let Some(offset) = source_offset(&parsed.text, part)
+        {
+            append_text_spans(&mut spans, &parsed.text_spans, offset, part.len());
+        }
+        parsed.text = part.to_owned();
+        parsed.text_spans = spans;
     }
     if enforce_required && choice == ToolChoice::Required && parsed.tool_calls.is_empty() {
         return Err(tool_choice_unsatisfied());
@@ -303,6 +396,7 @@ pub(super) fn parse_structured_generation(
     tool_only: bool,
     syntax: ToolSyntax,
     partial: bool,
+    track_text: bool,
 ) -> Result<ParsedGeneration> {
     const TOOL_START: &str = "<tool_call>";
     let ToolSyntax {
@@ -312,6 +406,7 @@ pub(super) fn parse_structured_generation(
     } = syntax;
     let earliest = |text: &str| earliest_marker_in(text, markers).map(|(position, _)| position);
     let mut parsed = ParsedGeneration::default();
+    let source = raw;
     let mut raw = raw;
     let mut initial = initial;
     // An automatic start opens reasoning with a leading `<think>`.
@@ -367,7 +462,11 @@ pub(super) fn parse_structured_generation(
             enforce_required,
             syntax,
             partial,
+            track_text,
         )?;
+        if let Some(offset) = source_offset(source, content) {
+            rebase_text_spans(&mut native, offset);
+        }
         native.reasoning_content = parsed.reasoning_content;
         return Ok(native);
     }
@@ -403,9 +502,13 @@ pub(super) fn parse_structured_generation(
             let prose = |begin: usize, end: usize| {
                 content_before(content, begin, end, closers, &quotes, tools, begin > 0)
             };
+            let append = |call: &mut ParsedGeneration, part: &str| {
+                call.text.push_str(part);
+                push_text_span(call, part, source, track_text);
+            };
             let mut cursor = 0;
             for &(begin, end) in &spans {
-                call.text.push_str(prose(cursor, begin));
+                append(&mut call, prose(cursor, begin));
                 cursor = end;
             }
             let tail = &content[cursor..];
@@ -424,17 +527,20 @@ pub(super) fn parse_structured_generation(
             };
             // The model repeats the framing of the call it just made: that
             // echo is markup, not prose a client replays on the next turn.
-            call.text.push_str(prose(
-                cursor,
-                cut.map_or(content.len(), |cut| (cursor + cut).min(content.len())),
-            ));
+            append(
+                &mut call,
+                prose(
+                    cursor,
+                    cut.map_or(content.len(), |cut| (cursor + cut).min(content.len())),
+                ),
+            );
         }
         // A marker in an unclosed quote without a valid call is prose.
         if call.tool_calls.is_empty()
             && choice != ToolChoice::Required
             && quotes.unclosed_at(marker)
         {
-            parsed.text = raw.to_owned();
+            set_parsed_text(&mut parsed, raw, source, track_text);
             return Ok(parsed);
         }
         call.hide_tool_markup = true;
@@ -458,11 +564,12 @@ pub(super) fn parse_structured_generation(
     // A constrained turn without a call is still reported without framing:
     // the streamed response drops it as the turn ends, and both transports
     // report the same content.
-    parsed.text = if tool_only {
-        content_before(raw, 0, raw.len(), closers, &quotes, tools, false).to_owned()
+    let text = if tool_only {
+        content_before(raw, 0, raw.len(), closers, &quotes, tools, false)
     } else {
-        raw.to_owned()
+        raw
     };
+    set_parsed_text(&mut parsed, text, source, track_text);
     Ok(parsed)
 }
 
@@ -485,7 +592,8 @@ pub(super) fn finish_reason(result: &GenerationResult, has_tool_calls: bool) -> 
 /// reasoning markup. `partial` reads a streamed prefix, returning the
 /// unfinished call too; only a native grammar establishes argument framing
 /// before the value completes, so recovery from unconstrained or JSON
-/// fallback text still needs a complete call.
+/// fallback text still needs a complete call. `track_text` records the
+/// source ranges of the content in `raw`.
 pub(super) fn parse_request_generation(
     chat: &ChatRequest,
     syntax: ToolSyntax,
@@ -493,6 +601,7 @@ pub(super) fn parse_request_generation(
     initial: InitialOutputState,
     enforce_required: bool,
     partial: bool,
+    track_text: bool,
 ) -> Result<ParsedGeneration> {
     let partial = partial && syntax.markers.len() <= 2;
     if chat.response_format.is_some() || chat.constrained_tools {
@@ -505,6 +614,7 @@ pub(super) fn parse_request_generation(
             chat.constrained_tools && chat.response_format.is_none(),
             syntax,
             partial,
+            track_text,
         )
     } else {
         parse_generation(
@@ -515,6 +625,7 @@ pub(super) fn parse_request_generation(
             enforce_required,
             syntax,
             partial,
+            track_text,
         )
     }
 }

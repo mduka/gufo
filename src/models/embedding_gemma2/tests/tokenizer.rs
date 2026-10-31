@@ -200,6 +200,48 @@ fn token_ids_match_hugging_face() {
         tokenizer.encode(b"", false).is_empty(),
         "empty text without specials"
     );
+    // #726: truncation keeps <bos>, the first content tokens and <eos>.
+    let mut over_limit = String::new();
+    while over_limit.len() < 64 * 1024 {
+        over_limit.push_str("The quick brown fox jumps over the lazy dog. ");
+    }
+    let full_ids = tokenizer.encode(over_limit.as_bytes(), true);
+    assert!(
+        full_ids.len() > 8192,
+        "the over-limit text exceeds 8192 tokens"
+    );
+    let cut_ids = tokenizer.encode_truncated(over_limit.as_bytes(), 8192);
+    assert!(
+        cut_ids.len() == 8192 && cut_ids[0] == 2 && *cut_ids.last().unwrap() == 1,
+        "a truncated encoding fills the limit between bos and eos"
+    );
+    assert_eq!(
+        cut_ids[..8191],
+        full_ids[..8191],
+        "it keeps the first tokens"
+    );
+    assert_eq!(
+        tokenizer.encode_truncated(b"short text", 8192),
+        tokenizer.encode(b"short text", true),
+        "a text within the limit is not changed"
+    );
+    assert_eq!(
+        tokenizer.encode_truncated(over_limit.as_bytes(), 1),
+        full_ids,
+        "a limit below the two markers leaves the encoding whole"
+    );
+    // A small limit encodes only a short leading slice of the text; the
+    // kept tokens must still match the full encoding.
+    for limit in [3, 16, 64, 257] {
+        let small = tokenizer.encode_truncated(over_limit.as_bytes(), limit);
+        assert!(
+            small.len() == limit
+                && small[0] == 2
+                && *small.last().unwrap() == 1
+                && small[..limit - 1] == full_ids[..limit - 1],
+            "a short truncation keeps the full encoding's first tokens (limit {limit})"
+        );
+    }
     println!(
         "{} golden cases, load {load_ms:.1} ms, {} byte encode {long_ms:.2} ms",
         cases.len(),

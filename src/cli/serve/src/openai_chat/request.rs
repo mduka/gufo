@@ -2,6 +2,7 @@
 //! function calls, tools, `tool_choice` and the reasoning controls.
 
 use super::*;
+use std::collections::HashSet;
 
 pub(super) fn is_known_role(role: &str) -> bool {
     matches!(role, "system" | "developer" | "user" | "assistant" | "tool")
@@ -52,19 +53,26 @@ pub(super) fn parse_content(
                     return Err("image_url requires a user or tool message and a string URL".into());
                 }
             };
-            // Resolution is model-owned. The standard detail values all
-            // behave as 'auto', since clients such as Codex always send one;
-            // anything else is still a malformed request.
-            if let Some(detail) = image.and_then(|i| i.find("detail"))
+            // Resolution is model-owned, except that 'low' bounds it. The
+            // other standard values behave as 'auto', since clients such as
+            // Codex always send one; anything else is still a malformed
+            // request.
+            let detail = image.and_then(|i| i.find("detail"));
+            if let Some(detail) = detail
                 && (!detail.is_string()
                     || !matches!(detail.str(), "auto" | "low" | "high" | "original"))
             {
                 return Err("image_url.detail must be 'auto', 'low', 'high' or 'original'".into());
             }
+            let detail = match detail {
+                Some(detail) if detail.str() == "low" => gufo_core::text::ImageDetail::Low,
+                _ => gufo_core::text::ImageDetail::Auto,
+            };
             let bytes = read_image_url(url, budget).map_err(|e| e.message().to_owned())?;
             message.images.push(gufo_core::text::ImagePart {
                 offset: message.content.len(),
                 bytes: Arc::new(bytes),
+                detail,
             });
             continue;
         }
@@ -261,6 +269,17 @@ pub(super) fn parse_tools(
     output: &mut Vec<ChatTool>,
     allow_non_function: bool,
 ) -> std::result::Result<(), String> {
+    let mut names = output.iter().map(|tool| tool.name.clone()).collect();
+    parse_tool_list(tools, output, &mut names, allow_non_function)
+}
+
+/// [`parse_tools`] with the names already declared (`ParseToolList`).
+fn parse_tool_list(
+    tools: Option<&Value>,
+    output: &mut Vec<ChatTool>,
+    names: &mut HashSet<String>,
+    allow_non_function: bool,
+) -> std::result::Result<(), String> {
     let Some(tools) = tools.filter(|t| !t.is_null()) else {
         return Ok(());
     };
@@ -280,7 +299,7 @@ pub(super) fn parse_tools(
                 .find("tools")
                 .filter(|nested| nested.is_array())
                 .ok_or("namespace tools require a tools array")?;
-            parse_tools(Some(nested), output, allow_non_function)?;
+            parse_tool_list(Some(nested), output, names, allow_non_function)?;
             continue;
         }
         if kind != "function" {
@@ -314,7 +333,9 @@ pub(super) fn parse_tools(
         if !renderable_tool_name(&name) {
             return Err(TOOL_NAME_RULE.into());
         }
-        if output.iter().any(|previous| previous.name == name) {
+        // A set keeps the check linear: only the request body size bounds
+        // the number of functions.
+        if !names.insert(name.clone()) {
             return Err("function names must be unique".into());
         }
         if parameters.is_some_and(|p| !p.is_null() && !p.is_object()) {
@@ -367,10 +388,6 @@ pub(super) fn parse_tools(
         };
         definition.set("type", "function");
         definition.set("function", function_object);
-        // Counted per flattened function, whatever the namespace order.
-        if output.len() >= 128 {
-            return Err("'tools' supports at most 128 functions".into());
-        }
         output.push(ChatTool {
             name,
             description,
@@ -634,10 +651,13 @@ pub(crate) fn parse_reasoning_options(
     Ok(())
 }
 
+/// Without `require_model`, a request without `model` names the primary
+/// served model.
 pub(super) fn parse_request(
     request: &HttpRequest,
     backend: &Arc<dyn TextGenerationBackend>,
     output: &mut ParsedChatRequest,
+    require_model: bool,
 ) -> Option<HttpResponse> {
     let body = match json::parse(&request.body) {
         Ok(body) => body,
@@ -663,6 +683,9 @@ pub(super) fn parse_request(
         ));
     }
     output.model = body.member_str("model", "");
+    if output.model.is_empty() && !require_model {
+        output.model = backend.model_id();
+    }
     if output.model.is_empty() {
         return Some(error(
             400,
@@ -671,7 +694,7 @@ pub(super) fn parse_request(
             "missing_model",
         ));
     }
-    if output.model != backend.model_id() {
+    if !backend.serves_model(&output.model) {
         return Some(error(
             404,
             "Not Found",
@@ -709,6 +732,17 @@ pub(super) fn parse_request(
             ));
         };
         output.chat.cache_prompt = *cache_prompt;
+    }
+    if let Some(cache_persist) = body.find("cache_persist").filter(|value| !value.is_null()) {
+        let Value::Bool(cache_persist) = cache_persist else {
+            return Some(error(
+                400,
+                "Bad Request",
+                "'cache_persist' must be a boolean",
+                "invalid_cache_persist",
+            ));
+        };
+        output.chat.cache_persist = *cache_persist;
     }
     match body.find("return_progress") {
         None | Some(Value::Null) => {}
@@ -861,13 +895,15 @@ pub(super) fn parse_request(
             "unsupported_field",
         ));
     }
-    for unsupported in ["logprobs", "top_logprobs", "modalities", "audio"] {
+    if let Err(e) = parse_logprobs(&body, true, &mut output.sampling) {
+        return Some(error(400, "Bad Request", &e.message, &e.code));
+    }
+    for unsupported in ["modalities", "audio"] {
         let Some(value) = present(unsupported) else {
             continue;
         };
         // The values that ask for what the server does anyway.
         let default = match unsupported {
-            "logprobs" => matches!(value, Value::Bool(false)),
             "modalities" => {
                 value.is_array()
                     && value.len() == 1

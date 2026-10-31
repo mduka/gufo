@@ -12,7 +12,7 @@ use gufo_core::gguf::{Gguf, read_header};
 use gufo_core::gguf_identity;
 use gufo_core::json_constraint::{ConstraintVocabulary, ToolFormat};
 use gufo_core::qwen_tokenizer::QwenTokenizer;
-use gufo_core::sampling::{SamplerState, SamplingConfig};
+use gufo_core::sampling::{SamplerState, SamplingConfig, collect_logprobs};
 use gufo_core::text::{
     self, CancellationCheck, ChatRequest, Error, InitialOutputState, ReasoningTags, Result,
     TextDecodeSelection, TextDecodeStep, TextExecutionPlan, TextModelRunner, TextPrefillStep,
@@ -22,14 +22,14 @@ use gufo_core::text::{
 };
 use gufo_hip::{DeviceProbe, DeviceProbeStatus};
 use gufo_qwen::chat_template::{
-    ChatTemplate, OFFICIAL_TEMPLATE_SHA256, is_qwen38_named, render_and_tokenize, request_options,
-    request_tools,
+    ChatTemplate, OFFICIAL_TEMPLATE_SHA256, is_qwen38_named, render_and_tokenize, render_request,
+    request_options, request_tools,
 };
 use gufo_qwen::vision::{Encoder, ImageCache, ImageContext, count_request_tokens, prepare_request};
 
 use crate::engine::{
-    AdvanceRequest, DecodeRequest, Model, ModelOptions, SNAPSHOT_PAYLOAD_VERSION, Session,
-    SessionSnapshot, Snapshotter,
+    AdvanceRequest, DecodeRequest, DecodeResult, Model, ModelOptions, SNAPSHOT_PAYLOAD_VERSION,
+    Session, SessionSnapshot, Snapshotter,
 };
 use crate::executor::SessionMode;
 use crate::rope_scaling::{resolve_rope_scaling, rope_position_policy};
@@ -153,6 +153,7 @@ pub struct FlashNextRunner {
     resident_bytes: usize,
     state_bytes: usize,
     deferred_bytes: usize,
+    expanded_q8_0: usize,
     persistence: Option<TextRunnerPersistenceDescriptor>,
 }
 
@@ -221,6 +222,22 @@ impl text::TextRunnerState for FlashNextState {
 }
 
 impl FlashNextRunner {
+    /// The committed tokens of an engine step with their log probabilities
+    /// (`ResolveStepTokens`).
+    fn step_selections(&self, decoded: &mut DecodeResult) -> Vec<TextDecodeSelection> {
+        let mut logprobs = std::mem::take(&mut decoded.logprobs).into_iter();
+        decoded
+            .tokens
+            .iter()
+            .map(|&t| TextDecodeSelection {
+                stop: false,
+                token: t as Token,
+                piece: self.piece(t),
+                logprobs: logprobs.next(),
+            })
+            .collect()
+    }
+
     /// The vision encoder, when the model serves images.
     pub fn vision_encoder(&self) -> Option<&Encoder> {
         self.vision.as_deref()
@@ -312,9 +329,16 @@ impl FlashNextRunner {
             resident_bytes: model.resident_bytes(),
             state_bytes: model.session_bytes(mode, options.max_context),
             deferred_bytes: model.deferred_scratch_bytes(),
+            expanded_q8_0: model.expanded_q8_0_tensors(),
             persistence,
             exec: Mutex::new(model),
         })
+    }
+
+    /// Trunk tensors stored as Q8_0 that the official GGUF keeps in F32,
+    /// expanded to F32 at load ([`Model::expanded_q8_0_tensors`]).
+    pub fn expanded_q8_0_tensors(&self) -> usize {
+        self.expanded_q8_0
     }
 
     fn exec(&self) -> MutexGuard<'_, Model> {
@@ -422,6 +446,12 @@ impl TextModelRunner for FlashNextRunner {
             &request_options(request, self.max_context),
         )
         .ok())
+    }
+
+    fn render_prompt(&self, request: &ChatRequest) -> Result<Option<String>> {
+        render_request(request, self.max_context)
+            .map(Some)
+            .map_err(Error::invalid)
     }
 
     fn prepare_prompt(
@@ -676,16 +706,13 @@ impl TextModelRunner for FlashNextRunner {
             ));
         }
         let token = sampler.sample(logits)? as i32;
-        if state.stop_at_eos && self.is_stop(token) {
-            return Ok(TextDecodeSelection {
-                stop: true,
-                ..TextDecodeSelection::default()
-            });
-        }
+        let logprobs = collect_logprobs(logits, token as Token, sampler.config().logprobs)?;
+        let stop = state.stop_at_eos && self.is_stop(token);
         Ok(TextDecodeSelection {
-            stop: false,
+            stop,
             token: token as Token,
-            piece: self.piece(token),
+            piece: if stop { Vec::new() } else { self.piece(token) },
+            logprobs,
         })
     }
 
@@ -724,7 +751,7 @@ impl TextModelRunner for FlashNextRunner {
         let mut working = sampler.clone();
         // The engine bounds the physical block and stops at EOS; the whole
         // remaining budget lets its policy recognize a short tail.
-        let decoded = {
+        let mut decoded = {
             let mut model = self.exec();
             self.ready(&mut model, state);
             model
@@ -743,21 +770,14 @@ impl TextModelRunner for FlashNextRunner {
         state.position = state.session.position() as usize;
         let after = state.session.statistics();
         Ok(TextDecodeStep {
-            selections: decoded
-                .tokens
-                .iter()
-                .map(|&t| TextDecodeSelection {
-                    stop: false,
-                    token: t as Token,
-                    piece: self.piece(t),
-                })
-                .collect(),
+            selections: self.step_selections(&mut decoded),
             draft_rounds: (after.cycles - before.cycles) as usize,
             draft_tokens: (after.drafted - before.drafted) as usize,
             draft_accepted_tokens: (after.accepted - before.accepted) as usize,
             lookup_tokens: (after.lookup - before.lookup) as usize,
             lookup_accepted_tokens: (after.lookup_accepted - before.lookup_accepted) as usize,
             stop: decoded.stop,
+            terminal_logprobs: decoded.terminal_logprobs,
             execution_plan: TextExecutionPlan::SERIAL,
         })
     }
@@ -800,7 +820,8 @@ impl TextModelRunner for FlashNextRunner {
             .zip(results)
             .zip(samplers.iter().zip(before))
             .map(|((d, result), (sampler, before))| {
-                let decoded = result.map_err(|e| engine(format!("Flash-Next MTP failed: {e}")))?;
+                let mut decoded =
+                    result.map_err(|e| engine(format!("Flash-Next MTP failed: {e}")))?;
                 d.sampler.copy_draw_state_from(sampler);
                 d.state.position = d.state.session.position() as usize;
                 let after = d.state.session.statistics();
@@ -810,15 +831,7 @@ impl TextModelRunner for FlashNextRunner {
                     } else {
                         TextExecutionPlan::SERIAL
                     },
-                    selections: decoded
-                        .tokens
-                        .iter()
-                        .map(|&t| TextDecodeSelection {
-                            stop: false,
-                            token: t as Token,
-                            piece: self.piece(t),
-                        })
-                        .collect(),
+                    selections: self.step_selections(&mut decoded),
                     draft_rounds: (after.cycles - before.cycles) as usize,
                     draft_tokens: (after.drafted - before.drafted) as usize,
                     draft_accepted_tokens: (after.accepted - before.accepted) as usize,
@@ -826,6 +839,7 @@ impl TextModelRunner for FlashNextRunner {
                     lookup_accepted_tokens: (after.lookup_accepted - before.lookup_accepted)
                         as usize,
                     stop: decoded.stop,
+                    terminal_logprobs: decoded.terminal_logprobs,
                 })
             })
             .collect())

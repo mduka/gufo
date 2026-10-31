@@ -93,47 +93,51 @@ impl Backend {
         )
     }
 
-    /// The best token of one logit row after `previous_token` into
-    /// `out_index` (I32).
-    pub fn dspark_markov_argmax(
+    /// The best tokens of `rows` (1 to 8) logit rows, `vocab` floats apart,
+    /// into `out_index` (I32): the first after `previous_token`, each later
+    /// one after the token the previous row selected, which the device reads
+    /// itself (`ds4_gpu_dspark_markov_chain_tensor`).
+    pub fn dspark_markov_chain(
         &self,
         out_index: &mut impl Output,
         scratch_key: &mut impl Output,
-        logits_row: &impl Input,
+        logits_rows: &impl Input,
         w1: Weight,
         w2: Weight,
         vocab: u32,
         markov_rank: u32,
         previous_token: u32,
+        rows: u32,
     ) -> Result<()> {
-        const OP: &str = "dspark markov argmax";
-        ensure(OP, w1.model == w2.model && markov_rank.is_multiple_of(32))?;
+        const OP: &str = "dspark markov chain";
+        ensure(
+            OP,
+            w1.model == w2.model
+                && markov_rank != 0
+                && markov_rank.is_multiple_of(32)
+                && markov_rank <= 256,
+        )?;
         ensure(
             OP,
             w1.offset.is_multiple_of(2) && w2.offset.is_multiple_of(2),
         )?;
-        ensure(OP, previous_token < vocab)?;
-        let row_bytes = u64::from(markov_rank / 32) * 34;
-        let w1_row = Weight {
-            model: w1.model,
-            offset: w1
-                .offset
-                .checked_add(product(OP, &[u64::from(previous_token), row_bytes])?)
-                .ok_or(Error { op: OP })?,
-        };
-        let w1_row = self.weight_bytes(w1_row, row_bytes)?;
-        let w2 = self.weight_bytes(w2, product(OP, &[u64::from(vocab), row_bytes])?)?;
+        ensure(OP, previous_token < vocab && (1..=8).contains(&rows))?;
+        let table = product(OP, &[u64::from(vocab), u64::from(markov_rank / 32), 34])?;
+        let w1 = self.weight_bytes(w1, table)?;
+        let w2 = self.weight_bytes(w2, table)?;
         launched(
             OP,
-            generated::dspark_markov_argmax(
+            generated::dspark_markov_chain(
                 self.stream(),
                 typed_mut(OP, out_index.output())?,
                 typed_mut(OP, scratch_key.output())?,
-                typed(OP, logits_row.input())?,
-                w1_row,
+                typed(OP, logits_rows.input())?,
+                w1,
                 w2,
                 vocab,
                 markov_rank,
+                previous_token,
+                rows,
             ),
         )
     }

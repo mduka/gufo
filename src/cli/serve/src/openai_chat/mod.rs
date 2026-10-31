@@ -18,7 +18,7 @@ use gufo_core::utf8::Utf8Decoder;
 
 use crate::backend::{
     FinishReason, GenerationRequest, GenerationResult, InitialOutputState, PromptProgress,
-    StreamCallbacks, TextGenerationBackend, ToolFormat, start_chat,
+    StreamCallbacks, TextGenerationBackend, TokenPiece, ToolFormat, start_chat,
 };
 use crate::generation_metrics::{
     generation_log_details, generation_timings, prefill_tokens_per_second, prompt_progress_json,
@@ -27,6 +27,9 @@ use crate::generation_metrics::{
 use crate::http::{BodyWriter, HttpRequest, HttpResponse, StreamLog};
 use crate::image_url::{ImageReadBudget, read_image_url};
 use crate::logging;
+use crate::logprobs::{
+    ResponsesLogprobs, TextSourceSpan, chat_logprobs, parse_logprobs, responses_stream_logprobs,
+};
 use crate::metrics::record_server_metrics;
 use crate::quote_tracker::QuoteTracker;
 use crate::response_format::{parse_response_format, response_format_description};
@@ -76,6 +79,8 @@ struct ParsedGeneration {
     tool_calls: Vec<ParsedToolCall>,
     /// Tool markup is withheld from the content, also an unfinished call.
     hide_tool_markup: bool,
+    /// Where the pieces of `text` lie in the parsed output, when tracked.
+    text_spans: Vec<TextSourceSpan>,
 }
 
 /// Every known tool marker: the JSON fallback, whose grammar leaves text
@@ -146,6 +151,14 @@ trait CompatibilityOutput {
     /// Prompt progress before the first output.
     fn progress(&mut self, progress: &PromptProgress) -> bool;
     fn append(&mut self, piece: &str, reasoning: bool) -> bool;
+    /// The `top_logprobs` the document reports, for outputs with token log
+    /// probabilities.
+    fn set_logprobs(&mut self, _count: Option<u32>) {}
+    /// `append` with the log probabilities of the piece's tokens, which only
+    /// outputs with token log probabilities report.
+    fn append_logprobs(&mut self, piece: &str, reasoning: bool, _logprobs: Value) -> bool {
+        self.append(piece, reasoning)
+    }
     fn tool(&mut self, call: &ToolDelta<'_>) -> bool;
     /// Closes the open items and reports the final document.
     fn complete(&mut self, result: &GenerationResult) -> Value;
@@ -225,9 +238,33 @@ impl ResponsesReasoningTarget {
     }
 }
 
+/// Appends a filtered delta to `output`; content takes the log
+/// probabilities of the tokens behind its `source` ranges.
+fn append_delta(
+    output: &RefCell<Box<dyn CompatibilityOutput + '_>>,
+    probabilities: &RefCell<Option<ResponsesLogprobs>>,
+    text: &str,
+    reasoning: bool,
+    source: &[TextSourceSpan],
+) -> bool {
+    match probabilities.borrow_mut().as_mut().filter(|_| !reasoning) {
+        Some(probabilities) => {
+            let logprobs = probabilities.take(source);
+            output
+                .borrow_mut()
+                .append_logprobs(text, reasoning, logprobs)
+        }
+        None => output.borrow_mut().append(text, reasoning),
+    }
+}
+
 /// One Responses or Messages generation once validated
 /// (`CreateCompatibilityResponse`): through the Chat reasoning, UTF-8 and
 /// tool filters, buffered or as the SSE events of `make`'s output.
+/// `reports_logprobs` outputs (Responses) join requested token log
+/// probabilities to their content by source position, from the pieces even
+/// of a buffered response.
+#[allow(clippy::too_many_arguments)]
 fn create_compatibility_response(
     request: &HttpRequest,
     backend: &Arc<dyn TextGenerationBackend>,
@@ -236,33 +273,77 @@ fn create_compatibility_response(
     sampling: &SamplingConfig,
     stream: bool,
     make: MakeOutput,
+    reports_logprobs: bool,
+    requested_model: &str,
 ) -> Result<HttpResponse> {
     let initial = backend.initial_output_state(chat);
     let structured = chat.response_format.is_some();
     let tool_only = chat.constrained_tools && !structured;
     let return_progress = chat.return_progress;
-    let model = backend.model_id();
+    let model = if requested_model.is_empty() {
+        backend.model_id()
+    } else {
+        requested_model.to_owned()
+    };
+    let count = sampling.logprobs.filter(|_| reports_logprobs);
+    let observe = count.is_some();
     let mut generation = start_chat(
         backend,
         chat,
         max_tokens,
         sampling,
         request.is_cancelled.clone(),
-        stream,
+        stream || observe,
     )?;
     let syntax = tool_syntax(chat, generation.tool_format());
     if !stream {
-        let result = generation.wait(None)?;
         let output = RefCell::new(make(&model, None, chat));
+        output.borrow_mut().set_logprobs(count);
+        let probabilities = RefCell::new(count.map(ResponsesLogprobs::new));
         let mut filter = StreamingTextFilter::structured(
             initial,
-            |text: &str, reasoning: bool| output.borrow_mut().append(text, reasoning),
+            |text: &str, reasoning: bool, source: &[TextSourceSpan]| {
+                append_delta(&output, &probabilities, text, reasoning, source)
+            },
             structured,
             tool_only,
             syntax,
             &chat.tools,
         );
-        filter.push(&result.text, false);
+        let mut tools = StreamingToolCalls::default();
+        let result = if observe {
+            generation.wait(Some(&mut |piece| {
+                if let Some(probabilities) = probabilities.borrow_mut().as_mut() {
+                    probabilities.push(piece, false);
+                }
+                if !filter.push(piece, false) {
+                    return false;
+                }
+                !filter.tool_mode
+                    || syntax.markers.len() > 2
+                    || tools.update(
+                        &parse_request_generation(
+                            chat,
+                            syntax,
+                            &filter.raw,
+                            initial,
+                            false,
+                            true,
+                            false,
+                        )
+                        .map(|generated| generated.tool_calls)
+                        .unwrap_or_default(),
+                        &mut |call: &ToolDelta<'_>| output.borrow_mut().tool(call),
+                    )
+            }))?
+        } else {
+            let result = generation.wait(None)?;
+            filter.push(&result.text, false);
+            result
+        };
+        if let Some(probabilities) = probabilities.borrow_mut().as_mut() {
+            probabilities.push(&TokenPiece::new(&[]), true);
+        }
         filter.push(&[], true);
         let interrupted = result.finish_reason != FinishReason::Stop;
         let generated = parse_request_generation(
@@ -272,8 +353,9 @@ fn create_compatibility_response(
             initial,
             !interrupted,
             false,
+            observe,
         )?;
-        StreamingToolCalls::default().finish(
+        tools.finish(
             &generated.tool_calls,
             interrupted,
             &mut |call: &ToolDelta<'_>| output.borrow_mut().tool(call),
@@ -282,6 +364,7 @@ fn create_compatibility_response(
             generated.hide_tool_markup,
             &generated.text,
             &generated.reasoning_content,
+            &generated.text_spans,
         );
         drop(filter);
         let response = output.into_inner().complete(&result);
@@ -296,6 +379,8 @@ fn create_compatibility_response(
     let chat = chat.clone();
     let body: crate::http::StreamingBody = Box::new(move |writer| {
         let output = RefCell::new(make(&model, Some(writer), &chat));
+        output.borrow_mut().set_logprobs(count);
+        let probabilities = RefCell::new(count.map(ResponsesLogprobs::new));
         let started = std::cell::Cell::new(false);
         // The lifecycle events commit the deferred headers, once the request
         // starts or produces anything; failures before them are HTTP errors.
@@ -311,7 +396,9 @@ fn create_compatibility_response(
         }
         let mut filter = StreamingTextFilter::structured(
             initial,
-            |text: &str, reasoning: bool| output.borrow_mut().append(text, reasoning),
+            |text: &str, reasoning: bool, source: &[TextSourceSpan]| {
+                append_delta(&output, &probabilities, text, reasoning, source)
+            },
             structured,
             tool_only,
             syntax,
@@ -324,7 +411,10 @@ fn create_compatibility_response(
         let mut on_start = || begin();
         let outcome = (|| -> Result<()> {
             let result = generation.wait_streaming(StreamCallbacks {
-                on_token: Some(&mut |piece: &[u8]| {
+                on_token: Some(&mut |piece| {
+                    if let Some(probabilities) = probabilities.borrow_mut().as_mut() {
+                        probabilities.push(piece, false);
+                    }
                     if !begin() || !filter.push(piece, false) {
                         return false;
                     }
@@ -338,6 +428,7 @@ fn create_compatibility_response(
                                 initial,
                                 false,
                                 true,
+                                false,
                             )
                             .map(|generated| generated.tool_calls)
                             .unwrap_or_default(),
@@ -355,7 +446,13 @@ fn create_compatibility_response(
                 log.details = generation_log_details(&result);
             }
             record_server_metrics(&result);
-            if result.cancelled || !begin() || !filter.push(&[], true) {
+            if result.cancelled || !begin() {
+                return Ok(());
+            }
+            if let Some(probabilities) = probabilities.borrow_mut().as_mut() {
+                probabilities.push(&TokenPiece::new(&[]), true);
+            }
+            if !filter.push(&[], true) {
                 return Ok(());
             }
             let interrupted = result.finish_reason != FinishReason::Stop;
@@ -366,12 +463,14 @@ fn create_compatibility_response(
                 initial,
                 !interrupted,
                 false,
+                observe,
             )?;
             if !tools.finish(&generated.tool_calls, interrupted, &mut emit_tool)?
                 || !filter.finish(
                     generated.hide_tool_markup,
                     &generated.text,
                     &generated.reasoning_content,
+                    &generated.text_spans,
                 )
             {
                 return Ok(());
@@ -408,6 +507,8 @@ fn create_compatibility_response(
 
 /// `POST /v1/responses` once validated: one response, or its semantic SSE
 /// events (`CreateOpenAiResponse`), the reasoning where `target` puts it.
+/// `model` is the served name to report; empty reports the primary name.
+#[allow(clippy::too_many_arguments)]
 pub fn create_openai_response(
     request: &HttpRequest,
     backend: &Arc<dyn TextGenerationBackend>,
@@ -416,6 +517,7 @@ pub fn create_openai_response(
     sampling: &SamplingConfig,
     stream: bool,
     target: ResponsesReasoningTarget,
+    model: &str,
 ) -> Result<HttpResponse> {
     // A function per target: the streamed body outlives this call.
     let make: MakeOutput = match target {
@@ -444,11 +546,14 @@ pub fn create_openai_response(
             ))
         },
     };
-    create_compatibility_response(request, backend, chat, max_tokens, sampling, stream, make)
+    create_compatibility_response(
+        request, backend, chat, max_tokens, sampling, stream, make, true, model,
+    )
 }
 
 /// `POST /v1/messages` once validated: one message of content blocks, or
-/// Anthropic's SSE events (`CreateAnthropicMessage`).
+/// Anthropic's SSE events (`CreateAnthropicMessage`). `model` as for
+/// [`create_openai_response`].
 pub fn create_anthropic_message(
     request: &HttpRequest,
     backend: &Arc<dyn TextGenerationBackend>,
@@ -456,6 +561,7 @@ pub fn create_anthropic_message(
     max_tokens: usize,
     sampling: &SamplingConfig,
     stream: bool,
+    model: &str,
 ) -> Result<HttpResponse> {
     create_compatibility_response(
         request,
@@ -465,23 +571,31 @@ pub fn create_anthropic_message(
         sampling,
         stream,
         anthropic_output,
+        false,
+        model,
     )
 }
 
-pub fn handle_openai_chat(
-    request: &HttpRequest,
-    backend: &Arc<dyn TextGenerationBackend>,
-) -> Result<HttpResponse> {
+/// A Chat Completions request before parsing: the backend's sampling
+/// defaults.
+fn unparsed_chat(backend: &Arc<dyn TextGenerationBackend>) -> ParsedChatRequest {
     let defaults = backend.sampling_defaults();
-    let mut parsed = ParsedChatRequest {
+    ParsedChatRequest {
         chat: ChatRequest::default(),
         model: String::new(),
         max_tokens: defaults.max_tokens,
         sampling: defaults.sampling,
         stream: false,
         include_usage: false,
-    };
-    if let Some(response) = parse_request(request, backend, &mut parsed) {
+    }
+}
+
+pub fn handle_openai_chat(
+    request: &HttpRequest,
+    backend: &Arc<dyn TextGenerationBackend>,
+) -> Result<HttpResponse> {
+    let mut parsed = unparsed_chat(backend);
+    if let Some(response) = parse_request(request, backend, &mut parsed, true) {
         return Ok(response);
     }
     let initial = backend.initial_output_state(&parsed.chat);
@@ -495,9 +609,9 @@ pub fn handle_openai_chat(
     )
     .and_then(|generation| {
         if parsed.stream {
-            Ok(streaming_response(parsed, backend, generation, initial))
+            Ok(streaming_response(parsed, generation, initial))
         } else {
-            non_streaming_response(&parsed, backend, generation, initial)
+            non_streaming_response(&parsed, generation, initial)
         }
     });
     match outcome {
@@ -518,5 +632,56 @@ pub fn handle_openai_chat(
             _ => Err(failure),
         },
         ok => ok,
+    }
+}
+
+/// llama-server's `/apply-template` (`HandleApplyTemplate`): the prompt a
+/// Chat Completions body renders to, with the server's reasoning defaults
+/// applied, without generating. `model` is optional, as outside
+/// llama-server router mode.
+pub fn handle_apply_template(
+    request: &HttpRequest,
+    backend: &Arc<dyn TextGenerationBackend>,
+) -> Result<HttpResponse> {
+    let mut parsed = unparsed_chat(backend);
+    if let Some(response) = parse_request(request, backend, &mut parsed, false) {
+        return Ok(response);
+    }
+    // As in llama-server, `stream` is ignored: the prompt is one JSON
+    // response.
+    match backend.render_chat_prompt(&parsed.chat) {
+        Ok(Some(prompt)) => Ok(HttpResponse::new(
+            200,
+            "OK",
+            dump(&Value::object().with("prompt", prompt)),
+        )),
+        Ok(None) => Ok(HttpResponse::new(
+            501,
+            "Not Implemented",
+            dump(
+                &Value::object().with(
+                    "error",
+                    Value::object()
+                        .with("message", "endpoint not implemented on this text model")
+                        .with("type", "server_error")
+                        .with("code", "not_implemented"),
+                ),
+            ),
+        )),
+        Err(failure) => match failure.kind() {
+            ErrorKind::InvalidArgument => Ok(error(
+                400,
+                "Bad Request",
+                failure.message(),
+                "invalid_prompt",
+            )),
+            ErrorKind::Length => Ok(error(
+                400,
+                "Bad Request",
+                failure.message(),
+                "context_length_exceeded",
+            )),
+            _ => Err(failure),
+        },
     }
 }

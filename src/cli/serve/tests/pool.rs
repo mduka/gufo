@@ -16,7 +16,7 @@ use gufo_core::text::{
 use gufo_serve::logging;
 use gufo_serve::pool::{
     AcquireOptions, PoolRequest, TextRunnerDiskCacheOptions, TextRunnerPool,
-    TextRunnerRamCacheOptions,
+    TextRunnerRamCacheOptions, parse_ram_cache_option,
 };
 
 use common::Semaphore;
@@ -36,6 +36,8 @@ struct FakeStats {
     snapshot_restores: usize,
     snapshot_size_queries: usize,
     snapshot_captures: usize,
+    /// Reads of the runner's resource claim, which sizes the budget.
+    resource_claims: usize,
     cancellation_bindings: usize,
     cancellation_clears: usize,
     prepared_prefixes: Vec<Vec<Token>>,
@@ -238,6 +240,7 @@ impl TextModelRunner for FakeRunner {
     }
 
     fn resource_claim(&self) -> TextRunnerResourceClaim {
+        lock(&self.stats).resource_claims += 1;
         TextRunnerResourceClaim {
             resident_weights_bytes: None,
             state_capacity_bytes: Some(self.state_capacity_bytes),
@@ -394,6 +397,7 @@ impl TextModelRunner for FakeRunner {
             stop: false,
             token,
             piece: token.to_string().into_bytes(),
+            logprobs: None,
         })
     }
 
@@ -2096,16 +2100,306 @@ fn snapshot_startup_reports_selected_limits() {
                 None,
                 TextRunnerRamCacheOptions {
                     capacity_bytes: requested,
+                    ..TextRunnerRamCacheOptions::default()
                 },
             )
             .expect("pool");
         });
         let expected = format!(
             "event=snapshot_cache_configured sessions=2 snapshot_entries=128 \
-             capacity_bytes={selected} automatic_bytes=256 max_bytes=256"
+             capacity_bytes={selected} automatic_bytes=256 max_bytes=256 ram_cache=on"
         );
         assert_eq!(log.matches(&expected).count(), 1, "{requested}: {log}");
     }
+}
+
+#[test]
+fn ram_cache_option_parsing() {
+    let off = parse_ram_cache_option("off").expect("off");
+    assert!(!off.enabled, "off disables the RAM cache");
+    let automatic = parse_ram_cache_option("0").expect("0");
+    assert!(
+        automatic.enabled && automatic.capacity_bytes == 0,
+        "0 still selects the automatic budget"
+    );
+    let explicit = parse_ram_cache_option("17179869184").expect("bytes");
+    assert!(
+        explicit.enabled && explicit.capacity_bytes == 16 << 30,
+        "a byte count is an explicit budget"
+    );
+    for bad in [
+        "",
+        "OFF",
+        "Off",
+        " off",
+        "off ",
+        "none",
+        "-1",
+        "+5",
+        "1.5",
+        "16G",
+        "0x10",
+        "99999999999999999999999",
+    ] {
+        let error = parse_ram_cache_option(bad).expect_err(bad);
+        assert!(
+            error.contains("off") && error.contains("--cache-ram-bytes"),
+            "the error names the option and the off value: {bad}: {error}"
+        );
+    }
+}
+
+/// Off keeps no snapshot at all: nothing is captured or refused, the log
+/// says so, and a session still reuses its own live state.
+#[test]
+fn ram_cache_off_captures_nothing_and_keeps_live_state() {
+    let run = |options: TextRunnerRamCacheOptions, snapshot_budget: usize| {
+        let stats = stats();
+        let ((), log) = logging::capture(|| {
+            let runner = FakeRunner {
+                snapshots: true,
+                ..FakeRunner::sized(&stats, 64, 256, snapshot_budget)
+            };
+            let pool =
+                TextRunnerPool::with_ram_cache(Arc::new(runner), 1, None, options).expect("pool");
+            let mut request = pool.acquire(vec![1, 2, 3]).expect("acquire");
+            assert!(
+                request.prefill(3).expect("prefill").decode_ready,
+                "request completes"
+            );
+            request.commit().expect("commit");
+            let mut extension = pool.acquire(vec![1, 2, 3, 4]).expect("acquire");
+            assert!(
+                extension.cache_hit()
+                    && extension.cached_prompt_tokens() == 3
+                    && extension.cache_restore_bytes() == 0,
+                "live state remains reusable"
+            );
+            extension.invalidate();
+        });
+        (stats, log)
+    };
+    let off = TextRunnerRamCacheOptions {
+        enabled: false,
+        ..TextRunnerRamCacheOptions::default()
+    };
+    let (stats, log) = run(off, 64 << 30);
+    let claims_off = lock(&stats).resource_claims;
+    assert!(
+        lock(&stats).snapshot_captures == 0 && lock(&stats).snapshot_restores == 0,
+        "off captures and restores no snapshot"
+    );
+    assert!(
+        log.contains("ram_cache=off") && log.contains("capacity_bytes=0 "),
+        "startup says the RAM cache is off with no capacity: {log}"
+    );
+    assert!(
+        !log.contains("event=snapshot "),
+        "off tries no capture, so none is logged as skipped: {log}"
+    );
+    // The same flow with a budget too small for the snapshot does refuse it.
+    let (_, log) = run(TextRunnerRamCacheOptions::default(), SNAPSHOT_BYTES - 1);
+    assert!(
+        log.contains("event=snapshot action=skipped reason=byte_capacity"),
+        "a budget too small for the snapshot logs the refusal: {log}"
+    );
+    let (stats, log) = run(TextRunnerRamCacheOptions::default(), 64 << 30);
+    assert!(
+        lock(&stats).snapshot_captures != 0 && log.contains("ram_cache=on"),
+        "on captures the snapshot and says so: {log}"
+    );
+    assert!(
+        claims_off != 0 && lock(&stats).resource_claims > claims_off,
+        "off reads the claim only to validate the runner, never to size a budget"
+    );
+}
+
+/// With a disk cache, an off RAM cache keeps no checkpoint in RAM: the
+/// capture goes to disk alone, and the next process restores it from there
+/// (`RamCacheOffWithDiskCommitsOnlyStagingBacking`).
+#[test]
+fn ram_cache_off_with_disk_keeps_checkpoints_on_disk_only() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let options = TextRunnerDiskCacheOptions {
+        min_checkpoint_step_tokens: 1,
+        ..disk(&directory, 1 << 20, 1 << 20)
+    };
+    let off = TextRunnerRamCacheOptions {
+        enabled: false,
+        ..TextRunnerRamCacheOptions::default()
+    };
+    let prompt: Vec<Token> = vec![10, 11, 12, 13, 14, 15, 16, 17, 18];
+    let ((), log) = logging::capture(|| {
+        let stats = stats();
+        let runner = Arc::new(FakeRunner::persistent(&stats, "artifact-A", 256));
+        let pool =
+            TextRunnerPool::with_ram_cache(runner, 1, Some(options.clone()), off).expect("pool");
+        let mut request = pool.acquire(prompt.clone()).expect("acquire");
+        request.prefill(prompt.len()).expect("prefill");
+        let metrics = request.commit().expect("commit");
+        // Nothing is retained in RAM; the checkpoint goes to disk alone.
+        assert!(
+            metrics.snapshot_bytes == 0 && metrics.disk_queued_bytes > 0,
+            "{metrics:?}"
+        );
+        pool.flush_disk();
+    });
+    assert!(
+        !log.contains("event=snapshot action=skipped"),
+        "a disk-only checkpoint is no refused RAM capture: {log}"
+    );
+    let stats = stats();
+    let runner = Arc::new(FakeRunner::persistent(&stats, "artifact-A", 256));
+    let pool = TextRunnerPool::with_ram_cache(runner, 1, Some(options), off).expect("pool");
+    let mut request = pool.acquire(prompt.clone()).expect("acquire");
+    assert!(
+        request.cache_hit()
+            && request.cache_disk_hit()
+            && request.cached_prompt_tokens() == prompt.len(),
+        "the next process restores the disk checkpoint"
+    );
+    request.invalidate();
+}
+
+/// With the RAM cache off, a capture within the disk step of a published
+/// checkpoint has nowhere to go; it is not attempted, so nothing logs a
+/// failed capture. With the RAM cache on it goes to RAM
+/// (`RamCacheOffRefusesCapturesWithinTheDiskStep`).
+#[test]
+fn ram_cache_off_skips_captures_within_the_disk_step() {
+    for enabled in [true, false] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let stats = stats();
+        let runner = Arc::new(FakeRunner::persistent(&stats, "artifact-A", 256));
+        let ((), log) = logging::capture(|| {
+            let pool = TextRunnerPool::with_ram_cache(
+                runner,
+                2,
+                Some(disk(&directory, 1 << 20, 1 << 20)),
+                TextRunnerRamCacheOptions {
+                    enabled,
+                    ..TextRunnerRamCacheOptions::default()
+                },
+            )
+            .expect("pool");
+            let mut prompt: Vec<Token> = vec![10, 11, 12, 13, 14, 15, 16, 17, 18];
+            for turn in 0..2 {
+                let captures = lock(&stats).snapshot_captures;
+                let mut request = pool.acquire(prompt.clone()).expect("acquire");
+                let tail = prompt.len() - request.cached_prompt_tokens();
+                request.prefill(tail).expect("prefill");
+                let metrics = request.commit().expect("commit");
+                pool.flush_disk();
+                // The first turn has no checkpoint within the step. The
+                // second is one token past one, far inside the default step.
+                let captured = lock(&stats).snapshot_captures > captures;
+                assert_eq!(
+                    captured,
+                    turn == 0 || enabled,
+                    "turn {turn} enabled {enabled}"
+                );
+                // Only the RAM cache retains the capture.
+                assert_eq!(
+                    metrics.snapshot_bytes != 0,
+                    enabled,
+                    "turn {turn}: {metrics:?}"
+                );
+                prompt.push(99);
+            }
+        });
+        assert!(!log.contains("action=failed"), "{log}");
+    }
+}
+
+/// Regular files below `directory`, recursively.
+fn regular_files(directory: &std::path::Path) -> usize {
+    std::fs::read_dir(directory)
+        .expect("directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                regular_files(&path)
+            } else {
+                usize::from(path.is_file())
+            }
+        })
+        .sum()
+}
+
+/// `cache_persist: false` writes nothing to the disk cache but still
+/// restores existing disk checkpoints (`TestUnpersistedRequestStaysOffDisk`).
+#[test]
+fn unpersisted_request_stays_off_disk() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let options = disk(&directory, 4096, 4096);
+    let unpersisted = || AcquireOptions {
+        persist: false,
+        ..AcquireOptions::default()
+    };
+    let empty;
+    {
+        let stats = stats();
+        let runner = Arc::new(FakeRunner::persistent(
+            &stats,
+            "artifact-A",
+            SNAPSHOT_BYTES - 1,
+        ));
+        let pool = disk_pool(&runner, 1, &options);
+        empty = regular_files(directory.path());
+        let mut request = pool
+            .acquire_with(vec![1, 2, 3], unpersisted())
+            .expect("acquire");
+        assert!(
+            request.prefill(3).expect("prefill").decode_ready,
+            "unpersisted request prefills"
+        );
+        assert_eq!(
+            request.commit().expect("commit").disk_queued_bytes,
+            0,
+            "cache_persist=false queues nothing for disk"
+        );
+        pool.flush_disk();
+    }
+    assert_eq!(
+        regular_files(directory.path()),
+        empty,
+        "cache_persist=false leaves no file in the disk cache"
+    );
+    {
+        let stats = stats();
+        let runner = Arc::new(FakeRunner::persistent(&stats, "artifact-A", 256));
+        let pool = disk_pool(&runner, 1, &options);
+        let mut cold = pool.acquire(vec![1, 2, 3, 4]).expect("acquire");
+        assert!(
+            !cold.cache_disk_hit() && lock(&stats).snapshot_restores == 0,
+            "a restarted pool finds nothing of an unpersisted request"
+        );
+        assert!(
+            cold.prefill(4).expect("prefill").decode_ready,
+            "persisting request prefills"
+        );
+        assert!(
+            cold.commit().expect("commit").disk_queued_bytes > 0,
+            "the default still persists the same prompt"
+        );
+        pool.flush_disk();
+    }
+    assert!(
+        regular_files(directory.path()) > empty,
+        "a default request writes to the disk cache"
+    );
+    let stats = stats();
+    let runner = Arc::new(FakeRunner::persistent(&stats, "artifact-A", 256));
+    let pool = disk_pool(&runner, 1, &options);
+    let mut reader = pool
+        .acquire_with(vec![1, 2, 3, 4, 5], unpersisted())
+        .expect("acquire");
+    assert!(
+        reader.cache_disk_hit() && reader.cached_prompt_tokens() == 4,
+        "cache_persist=false still restores existing disk checkpoints"
+    );
+    reader.invalidate();
 }
 
 /// Losing a retained prefix to record pressure is logged, unlike routine

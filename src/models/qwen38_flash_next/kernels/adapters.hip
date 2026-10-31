@@ -104,7 +104,7 @@ bool GatedDeltaNetRows(
     std::uint32_t k_heads, std::uint32_t v_heads, std::uint32_t kernel,
     bool row_split, bool convolved, float eps, std::uint32_t out_half_stride,
     float* checkpoint_state, float* checkpoint_history,
-    std::uint32_t checkpoint_tokens, hipStream_t stream) {
+    std::uint32_t checkpoint_tokens, hipEvent_t z_ready, hipStream_t stream) {
   const bool snapshots = state_first != nullptr;
   const bool checkpoint = checkpoint_state != nullptr;
   if (checkpoint != (checkpoint_history != nullptr) ||
@@ -139,14 +139,15 @@ bool GatedDeltaNetRows(
       conv_rows.rows[i + 1] = conv_rest[i];
     }
   }
-  GatedDeltaNet(qkv, qkv_stride, z, z_stride, alpha_beta, conv_w, a, dt, norm_w,
-                conv_state, conv_scratch, qn, kn, raw, state, out, out_q8,
-                state_rows, conv_rows, n_tokens, k_heads, v_heads, 128, kernel,
-                row_split, convolved, eps, stream, out_half,
-                GdnCheckpoint{checkpoint_state, checkpoint_history,
-                              checkpoint_tokens},
-                out_half_stride, out_rows);
-  return true;
+  // False when the wait for `z_ready` cannot be queued.
+  return GatedDeltaNet(qkv, qkv_stride, z, z_stride, alpha_beta, conv_w, a, dt,
+                       norm_w, conv_state, conv_scratch, qn, kn, raw, state,
+                       out, out_q8, state_rows, conv_rows, n_tokens, k_heads,
+                       v_heads, 128, kernel, row_split, convolved, eps, stream,
+                       out_half,
+                       GdnCheckpoint{checkpoint_state, checkpoint_history,
+                                     checkpoint_tokens},
+                       out_half_stride, out_rows, z_ready);
 }
 
 bool HcMixEpilogueQ8_1(const float* xn, const float* gate,

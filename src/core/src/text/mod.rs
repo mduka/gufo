@@ -6,8 +6,8 @@ mod error;
 mod runner;
 
 pub use chat::{
-    ChatMessage, ChatRequest, ChatRole, ChatTool, ImagePart, OutputGrammar, ReasoningEffort,
-    ReasoningOptions, ToolArgument, ToolCall, ToolChoice,
+    ChatMessage, ChatRequest, ChatRole, ChatTool, ImageDetail, ImagePart, OutputGrammar,
+    ReasoningEffort, ReasoningOptions, ToolArgument, ToolCall, ToolChoice,
 };
 pub use error::{
     DEVICE_LOST_MESSAGE, Error, ErrorKind, GenerationErrorCode, Result, SCHEDULER_FAILED_MESSAGE,

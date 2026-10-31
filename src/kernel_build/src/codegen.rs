@@ -27,7 +27,8 @@ fn cpp_param_type(p: &Param, format_type: &str, f16_type: &str) -> String {
         (Kind::Quant, _, _) => "const void*".into(),
         (Kind::Format, _, _) => format_type.into(),
         (Kind::Const | Kind::Table, _, _) => p.cpp_type.clone().unwrap_or_default(),
-        (Kind::Stream, _, _) => "hipStream_t".into(),
+        (Kind::Stream | Kind::SideStream, _, _) => "hipStream_t".into(),
+        (Kind::Event, _, _) => "hipEvent_t".into(),
         (Kind::Alias, Some(e), _) if p.read_only => format!("const {}*", elem(e)),
         (Kind::Alias, Some(e), _) => format!("{}*", elem(e)),
         (Kind::In, Some(e), _) => format!("const {}*", elem(e)),
@@ -51,6 +52,7 @@ fn rust_ffi_type(p: &Param) -> String {
         (Kind::Quant, _, _) => "*const u8".into(),
         (Kind::Format, _, _) => "u16".into(),
         (Kind::Table, _, _) => "*const ::std::ffi::c_void".into(),
+        (Kind::SideStream | Kind::Event, _, _) => "*mut ::std::ffi::c_void".into(),
         (Kind::Alias, Some(e), _) if p.read_only => format!("*const {}", e.rust()),
         (Kind::Alias, Some(e), _) => format!("*mut {}", e.rust()),
         (Kind::In, Some(e), _) => format!("*const {}", e.rust()),
@@ -702,6 +704,31 @@ fn rust_wrapper(l: &Launcher, prefix: &str) -> String {
                 args.push(format!("{of}.format().id() as u16"));
             }
             (Kind::Const | Kind::Stream, _, _) => {}
+            (Kind::SideStream | Kind::Event, _, _) => {
+                let ty = if p.kind == Kind::SideStream {
+                    "Stream"
+                } else {
+                    "Event"
+                };
+                signature.push(format!("{n}: Option<&::gufo_hip::{ty}>"));
+                let _ = writeln!(
+                    checks,
+                    "    if {n}.is_some() && stream.is_recording() {{
+        return Err(::gufo_hip::LaunchError::InvalidArgument {{ param: \"{n}\", reason: \"cross-stream ordering cannot join a graph capture\" }});
+    }}"
+                );
+                if p.kind == Kind::SideStream {
+                    let _ = writeln!(
+                        checks,
+                        "    if {n}.is_some_and(|side| side.id() == stream.id()) {{
+        return Err(::gufo_hip::LaunchError::InvalidArgument {{ param: \"{n}\", reason: \"the side stream is the launch stream\" }});
+    }}"
+                    );
+                }
+                args.push(format!(
+                    "{n}.map_or(::std::ptr::null_mut(), |h| h.as_raw().cast())"
+                ));
+            }
             (Kind::Table, Some(e), _) => {
                 let width = p.width.unwrap_or(1);
                 signature.push(format!(

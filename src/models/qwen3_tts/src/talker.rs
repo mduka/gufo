@@ -675,6 +675,8 @@ impl Talker {
             region,
         };
         let weights = Self::load_weights(&device, checkpoint, &config)?;
+        // The bounded uploads above have finished.
+        checkpoint.release_host_pages();
 
         let stream = &device.stream;
         let hidden = talker.hidden_size as usize;

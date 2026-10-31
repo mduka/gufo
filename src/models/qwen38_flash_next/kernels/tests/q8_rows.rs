@@ -428,6 +428,7 @@ fn gated_delta_net_rows_equal_the_quantizer() {
                     None,
                     None,
                     0,
+                    None,
                 ),
                 None => k::gated_delta_net(
                     &stream,
@@ -462,6 +463,7 @@ fn gated_delta_net_rows_equal_the_quantizer() {
                     None,
                     None,
                     0,
+                    None,
                 ),
             }
             .unwrap();

@@ -1,5 +1,6 @@
-//! The attention kernel against a direct f64 evaluation for both head
-//! widths, packed sequences, and windowed and whole-sequence masks:
+//! The value transpose and the attention kernel against a direct f64
+//! evaluation for both head widths, packed sequences, and windowed and
+//! whole-sequence masks (`attention_hip_test.cpp`):
 //! cargo test -p gufo-embedding-gemma2-kernels --features gpu --test attention
 
 #![cfg(feature = "gpu")]
@@ -45,19 +46,19 @@ fn indices(stream: &Stream, host: &[u32], bound: u32) -> DeviceIndices {
     indices
 }
 
-fn run_case(head_dim: u32, kv_heads: u32, window: u32, lengths: &[u32]) {
+fn run_case(head_dim: u32, kv_heads: u32, window: u32, lengths: &[u32], query_scale: f32) {
     let stream = Stream::new().unwrap();
     let tokens: usize = lengths.iter().map(|&l| l as usize).sum();
     let hd = head_dim as usize;
     let mut random = Rng(0x9e37_79b9_7f4a_7c15 ^ u64::from(head_dim + window));
-    let mut fill = |heads: u32| -> Vec<Bf16> {
+    let mut fill = |heads: u32, scale: f32| -> Vec<Bf16> {
         (0..tokens * heads as usize * hd)
-            .map(|_| Bf16::from_f32(random.normal()))
+            .map(|_| Bf16::from_f32(random.normal() * scale))
             .collect()
     };
-    let query = fill(HEADS);
-    let key = fill(kv_heads);
-    let value = fill(kv_heads);
+    let query = fill(HEADS, query_scale);
+    let key = fill(kv_heads, 1.0);
+    let value = fill(kv_heads, 1.0);
     let mut begin = Vec::new();
     let mut end = Vec::new();
     let mut offset = 0u32;
@@ -71,7 +72,35 @@ fn run_case(head_dim: u32, kv_heads: u32, window: u32, lengths: &[u32]) {
 
     let d_query = device(&stream, &query);
     let d_key = device(&stream, &key);
-    let d_value = device(&stream, &value);
+    // The kernel reads values transposed, [kv head][column][token], padded
+    // to a multiple of 32 tokens with zeros. The device transpose must match
+    // the host one, including the zero tail; the buffer starts as NaN to
+    // show that the tail is written.
+    let stride = tokens.div_ceil(32) * 32;
+    let columns = kv_heads as usize * hd;
+    let mut expected_value_t = vec![Bf16::default(); columns * stride];
+    for t in 0..tokens {
+        for c in 0..columns {
+            expected_value_t[c * stride + t] = value[t * columns + c];
+        }
+    }
+    let d_untransposed = device(&stream, &value);
+    let mut d_value = stream.alloc::<Bf16>(columns * stride).unwrap();
+    stream.fill_bytes(d_value.as_mut_slice(), 0xff).unwrap();
+    k::transpose_values(
+        &stream,
+        d_untransposed.as_slice(),
+        d_value.as_mut_slice(),
+        tokens,
+        columns as u32,
+    )
+    .unwrap();
+    let mut value_t = vec![Bf16::default(); columns * stride];
+    stream.download(d_value.as_slice(), &mut value_t).unwrap();
+    assert!(
+        value_t == expected_value_t,
+        "device transpose differs from the host transpose"
+    );
     let rows = tokens as u32;
     let d_begin = indices(&stream, &begin, rows);
     let d_end = indices(&stream, &end, rows + 1);
@@ -145,13 +174,16 @@ fn run_case(head_dim: u32, kv_heads: u32, window: u32, lengths: &[u32]) {
 
 #[test]
 fn attention_matches_a_direct_evaluation() {
-    run_case(256, 2, 5, &[40, 17, 1, 130]);
-    run_case(256, 2, 0, &[40, 17, 1, 130]);
-    run_case(512, 1, 0, &[64, 33, 7]);
-    run_case(512, 1, 9, &[64, 33, 7]);
-    run_case(256, 2, 100, &[700]);
-    run_case(256, 2, 0, &[31, 32, 33, 1]);
-    run_case(512, 1, 0, &[32, 16, 15]);
+    run_case(256, 2, 5, &[40, 17, 1, 130], 1.0);
+    run_case(256, 2, 0, &[40, 17, 1, 130], 1.0);
+    run_case(512, 1, 0, &[64, 33, 7], 1.0);
+    run_case(512, 1, 9, &[64, 33, 7], 1.0);
+    run_case(256, 2, 100, &[700], 1.0);
+    run_case(256, 2, 0, &[31, 32, 33, 1], 1.0);
+    run_case(512, 1, 0, &[32, 16, 15], 1.0);
+    run_case(256, 2, 0, &[32, 32], 1.0);
+    run_case(512, 1, 5, &[64], 1.0);
+    run_case(256, 2, 0, &[200], 0.05);
 }
 
 #[test]
@@ -162,7 +194,7 @@ fn unsupported_geometries_are_declined() {
         let width = rows * heads as usize * head_dim as usize;
         let query = stream.alloc::<Bf16>(width).unwrap();
         let key = stream
-            .alloc::<Bf16>(rows * kv_heads as usize * head_dim as usize)
+            .alloc::<Bf16>(rows.div_ceil(32) * 32 * kv_heads as usize * head_dim as usize)
             .unwrap();
         let mut context = stream.alloc::<Bf16>(width).unwrap();
         let begin = stream.alloc_indices(rows, rows as u32).unwrap();

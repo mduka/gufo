@@ -10,6 +10,19 @@ pub struct Utf8Decoder {
 
 impl Utf8Decoder {
     pub fn push(&mut self, bytes: &[u8], last: bool) -> String {
+        self.push_observed(bytes, last, |_, _| {})
+    }
+
+    /// [`Utf8Decoder::push`] that reports each decoded scalar's consumed
+    /// input bytes and produced UTF-8 bytes, so consumers keep token
+    /// provenance across byte fallback and malformed sequences without a
+    /// second decoder.
+    pub fn push_observed(
+        &mut self,
+        bytes: &[u8],
+        last: bool,
+        mut observe: impl FnMut(usize, usize),
+    ) -> String {
         self.pending.extend_from_slice(bytes);
         let pending = &self.pending;
         let mut output = String::with_capacity(pending.len());
@@ -19,6 +32,7 @@ impl Utf8Decoder {
             if lead < 0x80 {
                 output.push(char::from(lead));
                 offset += 1;
+                observe(1, 1);
                 continue;
             }
             let length = match lead {
@@ -30,6 +44,7 @@ impl Utf8Decoder {
             if length == 0 {
                 output.push('\u{FFFD}');
                 offset += 1;
+                observe(1, 3);
                 continue;
             }
             let mut prefix = 1;
@@ -51,11 +66,13 @@ impl Utf8Decoder {
                     Err(_) => output.push('\u{FFFD}'),
                 }
                 offset += length;
+                observe(length, length);
             } else if offset + prefix == pending.len() && !last {
                 break;
             } else {
                 output.push('\u{FFFD}');
                 offset += prefix;
+                observe(prefix, 3);
             }
         }
         self.pending.drain(..offset);

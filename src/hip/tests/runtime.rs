@@ -178,6 +178,53 @@ fn views_share_overlapping_reads_and_keep_writes_exclusive() {
 }
 
 #[test]
+fn forks_hand_buffers_to_the_side_until_they_join() {
+    let (parent, side) = (Stream::new().unwrap(), Stream::new().unwrap());
+    let (start, done) = (Event::new().unwrap(), Event::new().unwrap());
+    let mut handed = parent.alloc::<u8>(64).unwrap();
+    let mut read = parent.alloc::<u8>(64).unwrap();
+    parent.fill_bytes(handed.as_mut_slice(), 1).unwrap();
+    parent.fill_bytes(read.as_mut_slice(), 2).unwrap();
+    let mut back = [0u8; 64];
+    // A view made before the fork follows the hand-over too.
+    let early = read.as_slice();
+    let fork = parent.fork(&side, &start, &done).unwrap();
+    fork.hand_over(handed.allocation()).unwrap();
+    fork.lend(read.allocation()).unwrap();
+    // The side writes the handed-over buffer after the parent's fill; the
+    // parent cannot touch it.
+    side.fill_bytes(handed.as_mut_slice(), 3).unwrap();
+    assert!(parent.fill_bytes(handed.as_mut_slice(), 4).is_err());
+    assert!(parent.download(handed.as_slice(), &mut back).is_err());
+    // Both streams read the lent buffer; neither writes it.
+    parent.download(early, &mut back).unwrap();
+    assert_eq!(back, [2; 64]);
+    side.download(read.as_slice(), &mut back).unwrap();
+    assert!(parent.fill_bytes(read.as_mut_slice(), 5).is_err());
+    assert!(side.fill_bytes(read.as_mut_slice(), 5).is_err());
+    // A buffer is lent once for writing, and only by its own stream.
+    assert!(fork.hand_over(read.allocation()).is_err());
+    assert!(fork.lend(handed.allocation()).is_err());
+    let foreign = side.alloc::<u8>(1).unwrap();
+    assert!(fork.hand_over(foreign.allocation()).is_err());
+    fork.join().unwrap();
+    // The parent runs after the side's fill and owns both buffers again.
+    parent.download(handed.as_slice(), &mut back).unwrap();
+    assert_eq!(back, [3; 64]);
+    assert!(side.fill_bytes(handed.as_mut_slice(), 6).is_err());
+    parent.fill_bytes(read.as_mut_slice(), 7).unwrap();
+    // Dropping a fork joins it as well.
+    {
+        let fork = parent.fork(&side, &start, &done).unwrap();
+        fork.hand_over(handed.allocation()).unwrap();
+        side.fill_bytes(handed.as_mut_slice(), 8).unwrap();
+    }
+    parent.download(handed.as_slice(), &mut back).unwrap();
+    assert_eq!(back, [8; 64]);
+    assert!(parent.fork(&parent, &start, &done).is_err());
+}
+
+#[test]
 fn two_dimensional_copies_move_strided_rows_within_bounds() {
     let stream = Stream::new().unwrap();
     let values: Vec<u32> = (0..24).collect();
@@ -974,7 +1021,9 @@ mod weights {
         assert!(weights.get(e).is_empty());
         match placement {
             Placement::DirectCopy | Placement::CachedCopy => assert_eq!(b.offset() % 256, 0),
-            Placement::Map | Placement::HostCopy => assert_eq!(b.offset(), 4098),
+            Placement::Map | Placement::HostCopy | Placement::DeviceImage => {
+                assert_eq!(b.offset(), 4098)
+            }
         }
     }
 
@@ -1016,6 +1065,15 @@ mod weights {
             Path::new(env!("CARGO_TARGET_TMPDIR")),
             "host-copy",
             Placement::HostCopy,
+        );
+    }
+
+    #[test]
+    fn device_images_reproduce_the_file() {
+        round_trip(
+            Path::new(env!("CARGO_TARGET_TMPDIR")),
+            "device-image",
+            Placement::DeviceImage,
         );
     }
 

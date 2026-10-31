@@ -18,7 +18,7 @@ use gufo_core::gguf::{Gguf, read_header};
 use gufo_core::gguf_identity;
 use gufo_core::json_constraint::{ConstraintVocabulary, ToolFormat};
 use gufo_core::qwen_tokenizer::{QwenTokenizer, StopTokens};
-use gufo_core::sampling::{SamplerState, SamplingConfig};
+use gufo_core::sampling::{SamplerState, SamplingConfig, TokenLogprobs, collect_logprobs};
 use gufo_core::text::{
     self, ChatRequest, Error, InitialOutputState, ReasoningTags, Result, TextDecodeSelection,
     TextDecodeStep, TextExecutionPlan, TextExecutionPlanKind, TextModelRunner, TextPrefillStep,
@@ -40,7 +40,8 @@ use crate::persistent::{
 };
 use crate::verifier::{SpecExec, StepRequest, StepResult, Verifier, VerifierSnapshot};
 use gufo_qwen::chat_template::{
-    ChatTemplate, OFFICIAL_TEMPLATE_SHA256, render_and_tokenize, request_options, request_tools,
+    ChatTemplate, OFFICIAL_TEMPLATE_SHA256, render_and_tokenize, render_request, request_options,
+    request_tools,
 };
 use gufo_qwen::vision::{
     Encoder, ImageCache, ImageContext, ImageGrid, RopeLayout, count_request_tokens, prepare_request,
@@ -618,6 +619,27 @@ impl QwenRunner {
             .map_err(engine)
     }
 
+    /// The log probabilities of `token` in the frontier logits
+    /// (`CopyFrontierLogits`: the retained row, else the target's last) when
+    /// the request asks for them.
+    fn frontier_logprobs(
+        model: &Model,
+        state: &QwenState,
+        token: u32,
+        sampler: &SamplerState,
+    ) -> Result<Option<TokenLogprobs>> {
+        let count = sampler.config().logprobs;
+        if count.is_none() {
+            return Ok(None);
+        }
+        if state.frontier_logits.is_empty() {
+            let logits = model.logits(&state.session).map_err(engine)?;
+            collect_logprobs(&logits, token, count)
+        } else {
+            collect_logprobs(&state.frontier_logits, token, count)
+        }
+    }
+
     /// `PrimeSpeculative`: a fresh target and draft over `prompt`.
     fn prime_speculative(
         &self,
@@ -690,15 +712,18 @@ impl QwenRunner {
         Ok(())
     }
 
-    /// `AppendSpeculativeSelection`: publishes `token` unless it stops.
+    /// `AppendSpeculativeSelection`: publishes `token` with its log
+    /// probabilities unless it stops.
     fn append_selection(
         &self,
         state: &mut QwenState,
         token: u32,
         sampler: &mut SamplerState,
         result: &mut TextDecodeStep,
+        logprobs: Option<TokenLogprobs>,
     ) -> Result<bool> {
         if state.stop_at_eos && self.stop_tokens().contains(token) {
+            result.terminal_logprobs = logprobs;
             result.stop = true;
             return Ok(false);
         }
@@ -706,6 +731,7 @@ impl QwenRunner {
             stop: false,
             token,
             piece: self.tokenizer.decode(&[token]),
+            logprobs,
         });
         state.sequence.push(token);
         state.set_pending_token(Some(token));
@@ -739,7 +765,8 @@ impl QwenRunner {
             let frontier = state
                 .frontier
                 .ok_or_else(|| Error::logic("Qwen speculative state has no frontier"))?;
-            if !self.append_selection(state, frontier, sampler, result)? {
+            let logprobs = Self::frontier_logprobs(model, state, frontier, sampler)?;
+            if !self.append_selection(state, frontier, sampler, result, logprobs)? {
                 return Ok(false);
             }
             state.frontier_published = true;
@@ -769,11 +796,12 @@ impl QwenRunner {
             },
             physical_width: verification.physical_width,
         };
+        let mut logprobs = verification.logprobs.into_iter();
         for &token in &verification.emitted {
             // Each prediction consumes one input, including a terminal
             // prediction; the stop token stays the unpublished frontier.
             state.position += 1;
-            if !self.append_selection(state, token, sampler, result)? {
+            if !self.append_selection(state, token, sampler, result, logprobs.next())? {
                 break;
             }
             state.rollback_tokens.push(token);
@@ -1024,6 +1052,12 @@ impl TextModelRunner for QwenRunner {
         .ok())
     }
 
+    fn render_prompt(&self, request: &ChatRequest) -> Result<Option<String>> {
+        render_request(request, self.max_context)
+            .map(Some)
+            .map_err(Error::invalid)
+    }
+
     fn prepare_prompt(
         &self,
         request: &ChatRequest,
@@ -1264,12 +1298,20 @@ impl TextModelRunner for QwenRunner {
         state: &mut QwenState,
         sampler: &mut SamplerState,
     ) -> Result<TextDecodeSelection> {
-        let token = Self::select_frontier(&mut self.exec().model, state, sampler)?;
+        let (token, logprobs) = {
+            let model = &mut self.exec().model;
+            let token = Self::select_frontier(model, state, sampler)?;
+            (
+                token,
+                Self::frontier_logprobs(model, state, token, sampler)?,
+            )
+        };
         if state.stop_at_eos && self.stop_tokens().contains(token) {
             return Ok(TextDecodeSelection {
                 stop: true,
-                token: 0,
+                token,
                 piece: Vec::new(),
+                logprobs,
             });
         }
         // Keep the selected token apart from the argmax frontier: sampled
@@ -1279,6 +1321,7 @@ impl TextModelRunner for QwenRunner {
             stop: false,
             token,
             piece: self.tokenizer.decode(&[token]),
+            logprobs,
         })
     }
 

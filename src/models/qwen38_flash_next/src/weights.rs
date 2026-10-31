@@ -186,6 +186,25 @@ pub struct LayerRefs {
     pub nextn: Option<NextnRefs>,
 }
 
+impl LayerRefs {
+    /// Hyper-connection inject and GDN alpha/beta tensors stored as Q8_0
+    /// (`ExpandedQ8_0Tensors`). The official trunk GGUF keeps them in F32;
+    /// the device expands Q8_0 copies to F32 at load, because their W8A8
+    /// route breaks copied identifiers.
+    pub fn expanded_q8_0_tensors(&self) -> usize {
+        let linear = match &self.mixer {
+            MixerKind::Linear(s) => [Some(&s.alpha), Some(&s.beta)],
+            MixerKind::Attention(_) => [None, None],
+        };
+        [self.hc_attn.inject.as_ref(), self.hc_ffn.inject.as_ref()]
+            .into_iter()
+            .chain(linear)
+            .flatten()
+            .filter(|t| t.ty == GgmlType::Q8_0)
+            .count()
+    }
+}
+
 /// The trunk artifact.
 #[derive(Debug, Clone)]
 pub struct ModelTensors {

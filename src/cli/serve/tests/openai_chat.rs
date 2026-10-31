@@ -8,24 +8,30 @@ use std::time::Duration;
 
 use gufo_core::json::{self, Value};
 use gufo_core::json_constraint::JsonConstraint;
-use gufo_core::sampling::SamplingConfig;
+use gufo_core::sampling::{SamplingConfig, TokenLogprob, TokenLogprobs};
 use gufo_core::text::{
-    CancellationCheck, ChatRequest, Error, GenerationErrorCode, ReasoningEffort, ReasoningOptions,
-    Result, ToolChoice,
+    CancellationCheck, ChatRequest, Error, GenerationErrorCode, ImageDetail, OutputGrammar,
+    ReasoningEffort, ReasoningOptions, Result, ToolChoice,
 };
 use gufo_serve::backend::{
-    FinishReason, GenerationRequest, GenerationResult, InitialOutputState, SamplingDefaults,
-    TextGenerationBackend, TokenCallback, ToolFormat,
+    DecodedLogprobs, FinishReason, GenerationRequest, GenerationResult, InitialOutputState,
+    SamplingDefaults, TextGenerationBackend, TokenCallback, TokenPiece, ToolFormat,
 };
 use gufo_serve::generation_metrics::prefill_tokens_per_second;
 use gufo_serve::http::{HttpRequest, HttpResponse};
+use gufo_serve::logprobs::{DecodedLogprob, LogprobDecoder};
 use gufo_serve::openai_chat::{
     ResponsesReasoningTarget, create_anthropic_message, create_openai_response, handle_openai_chat,
     parse_tool_controls,
 };
+use gufo_serve::response_format::parse_response_format;
 
 struct Config {
+    /// The served names, the primary first.
+    names: Vec<String>,
     pieces: Vec<Vec<u8>>,
+    /// The log probabilities of each piece's token, for requests that ask.
+    logprob_pieces: Vec<DecodedLogprobs>,
     cache_miss_reason: String,
     finish_reason: FinishReason,
     stop_sequence: String,
@@ -70,7 +76,9 @@ impl FakeBackend {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             config: Mutex::new(Config {
+                names: vec!["test-model".into()],
                 pieces: Vec::new(),
+                logprob_pieces: Vec::new(),
                 cache_miss_reason: String::new(),
                 finish_reason: FinishReason::Stop,
                 stop_sequence: String::new(),
@@ -122,6 +130,10 @@ impl TextGenerationBackend for FakeBackend {
         "test-model".into()
     }
 
+    fn model_ids(&self) -> Vec<String> {
+        self.config().names.clone()
+    }
+
     fn ready(&self) -> bool {
         true
     }
@@ -154,9 +166,10 @@ impl TextGenerationBackend for FakeBackend {
         _: usize,
         _: &SamplingConfig,
         _: Option<&CancellationCheck>,
-        _: Option<&mut dyn FnMut(&[u8]) -> bool>,
+        _: Option<&mut dyn FnMut(&TokenPiece<'_>) -> bool>,
         _: &str,
         _: &[String],
+        _: bool,
         _: bool,
     ) -> Result<GenerationResult> {
         Ok(GenerationResult::default())
@@ -168,7 +181,7 @@ impl TextGenerationBackend for FakeBackend {
         max_tokens: usize,
         sampling: &SamplingConfig,
         is_cancelled: Option<&CancellationCheck>,
-        mut on_token: Option<&mut dyn FnMut(&[u8]) -> bool>,
+        mut on_token: Option<&mut dyn FnMut(&TokenPiece<'_>) -> bool>,
     ) -> Result<GenerationResult> {
         self.chat_calls.fetch_add(1, Ordering::SeqCst);
         {
@@ -177,10 +190,11 @@ impl TextGenerationBackend for FakeBackend {
             observed.last_max_tokens = max_tokens;
             observed.last_sampling = sampling.clone();
         }
-        let (pieces, miss, finish, stop_sequence, block) = {
+        let (pieces, logprob_pieces, miss, finish, stop_sequence, block) = {
             let config = self.config();
             (
                 config.pieces.clone(),
+                config.logprob_pieces.clone(),
                 config.cache_miss_reason.clone(),
                 config.finish_reason,
                 config.stop_sequence.clone(),
@@ -215,8 +229,17 @@ impl TextGenerationBackend for FakeBackend {
             result.cache_checkpoint_tokens = 5;
         }
         for piece in pieces {
+            let probabilities = logprob_pieces
+                .get(result.tokens.len())
+                .filter(|_| sampling.logprobs.is_some());
+            if let Some(probabilities) = probabilities {
+                result.logprobs.push(probabilities.clone());
+            }
             let cancelled = is_cancelled.is_some_and(|c| c());
-            let refused = !cancelled && on_token.as_mut().is_some_and(|callback| !callback(&piece));
+            let refused = !cancelled
+                && on_token.as_mut().is_some_and(|callback| {
+                    !callback(&TokenPiece::with_logprobs(&piece, probabilities))
+                });
             if cancelled || refused {
                 result.cancelled = true;
                 result.finish_reason = FinishReason::Cancelled;
@@ -360,6 +383,7 @@ fn responses(
         &SamplingConfig::default(),
         stream,
         ResponsesReasoningTarget::default(),
+        "",
     )
     .expect("response")
 }
@@ -524,7 +548,7 @@ fn stop_sequences_and_default_fields() {
         "explicit text-only and disabled logprobs defaults work"
     );
     for (field, value) in [
-        ("logprobs", "true"),
+        ("logprobs", "1"),
         ("top_logprobs", "3"),
         ("modalities", r#"["text","audio"]"#),
         ("audio", "{}"),
@@ -2887,21 +2911,14 @@ fn unsupported_sampling_controls_are_rejected() {
         "draft_policy",
         "samplers",
         "typical_p",
-        "tfs_z",
         "mirostat",
-        "mirostat_eta",
-        "mirostat_tau",
         "dynatemp_range",
-        "dynatemp_exponent",
         "xtc_probability",
-        "xtc_threshold",
         "dry_multiplier",
-        "dry_base",
-        "dry_allowed_length",
-        "dry_penalty_last_n",
-        "dry_sequence_breakers",
         "top_n_sigma",
         "logit_bias",
+        "xtc_unknown",
+        "dry_unknown",
     ] {
         let mut body = json::parse_str(HELLO).expect("json");
         body.set(field, 0.8);
@@ -2909,6 +2926,121 @@ fn unsupported_sampling_controls_are_rejected() {
         assert!(
             response.status == 400 && body_text(&response).contains("unsupported_sampling"),
             "unsupported sampling must not be silently ignored: {field}"
+        );
+    }
+}
+
+/// llama.cpp sampler fields gufo does not implement are accepted when
+/// absent, null or neutral (the llama.cpp chain is unchanged) and rejected
+/// when they would activate the sampler (`TestNeutralLlamaSamplerFields`).
+#[test]
+fn neutral_llama_sampler_fields() {
+    let sampling_of = |backend: &Arc<FakeBackend>| {
+        backend
+            .observed
+            .lock()
+            .expect("observed")
+            .last_sampling
+            .clone()
+    };
+    let baseline = FakeBackend::new();
+    assert_eq!(
+        chat(&baseline, HELLO).status,
+        200,
+        "plain sampling request is accepted"
+    );
+    let expected = sampling_of(&baseline);
+    let run = |fields: &str| {
+        let backend = FakeBackend::new();
+        let mut body = json::parse_str(HELLO).expect("json");
+        for (field, value) in json::parse_str(fields).expect("fields").members() {
+            body.set(field, value.clone());
+        }
+        let response = chat(&backend, &body.dump().expect("dump"));
+        if response.status == 200 {
+            let actual = sampling_of(&backend);
+            assert!(
+                actual.temperature == expected.temperature
+                    && actual.top_k == expected.top_k
+                    && actual.top_p == expected.top_p,
+                "neutral fields changed sampling: {fields}"
+            );
+        }
+        response
+    };
+    for fields in [
+        // Open WebUI 0.12 payloads.
+        r#"{"mirostat":0,"mirostat_eta":0.1,"mirostat_tau":5.0}"#,
+        r#"{"mirostat":0,"mirostat_eta":0,"mirostat_tau":0}"#,
+        r#"{"mirostat":-1}"#,
+        r#"{"mirostat_tau":5.0}"#,
+        r#"{"typical_p":1.0}"#,
+        r#"{"typical_p":1.5}"#,
+        r#"{"tfs_z":0.5}"#,
+        r#"{"dynatemp_range":0,"dynatemp_exponent":2}"#,
+        r#"{"dynatemp_range":-1}"#,
+        r#"{"top_n_sigma":0}"#,
+        r#"{"top_n_sigma":-1}"#,
+        r#"{"xtc_probability":0,"xtc_threshold":0.1}"#,
+        r#"{"xtc_probability":0.5,"xtc_threshold":0.51}"#,
+        r#"{"xtc_probability":-0.5}"#,
+        r#"{"xtc_threshold":0.3}"#,
+        concat!(
+            r#"{"dry_multiplier":0,"dry_base":1.75,"dry_allowed_length":2,"#,
+            r#""dry_penalty_last_n":64,"dry_sequence_breakers":["\n"]}"#
+        ),
+        r#"{"dry_multiplier":0.8,"dry_penalty_last_n":0}"#,
+        r#"{"dry_base":0.5}"#,
+        concat!(
+            r#"{"mirostat":null,"mirostat_tau":null,"mirostat_eta":null,"#,
+            r#""typical_p":null,"tfs_z":null,"dynatemp_range":null,"#,
+            r#""dynatemp_exponent":null,"top_n_sigma":null,"#,
+            r#""xtc_probability":null,"xtc_threshold":null,"#,
+            r#""dry_multiplier":null,"dry_base":null,"#,
+            r#""dry_allowed_length":null,"dry_penalty_last_n":null,"#,
+            r#""dry_sequence_breakers":null}"#
+        ),
+    ] {
+        assert_eq!(
+            run(fields).status,
+            200,
+            "neutral llama.cpp sampler fields are accepted: {fields}"
+        );
+    }
+    for fields in [
+        r#"{"mirostat":1}"#,
+        r#"{"mirostat":2,"mirostat_tau":5.0}"#,
+        r#"{"typical_p":0.99}"#,
+        r#"{"dynatemp_range":0.5}"#,
+        r#"{"top_n_sigma":1}"#,
+        r#"{"xtc_probability":0.5}"#,
+        r#"{"xtc_probability":0.5,"xtc_threshold":0.5}"#,
+        r#"{"xtc_probability":2,"xtc_threshold":-1}"#,
+        r#"{"dry_multiplier":0.8}"#,
+        r#"{"dry_multiplier":0.8,"dry_penalty_last_n":1}"#,
+        r#"{"dry_multiplier":-0.8,"dry_base":0.5}"#,
+    ] {
+        let response = run(fields);
+        assert!(
+            response.status == 400 && body_text(&response).contains("unsupported_sampling"),
+            "active llama.cpp samplers are rejected: {fields}"
+        );
+    }
+    for fields in [
+        r#"{"mirostat":"0"}"#,
+        r#"{"tfs_z":true}"#,
+        r#"{"mirostat_eta":[0.1]}"#,
+        r#"{"dry_allowed_length":-1}"#,
+        r#"{"dry_penalty_last_n":2147483648}"#,
+        r#"{"dry_penalty_last_n":1.5}"#,
+        r#"{"dry_sequence_breakers":[]}"#,
+        r#"{"dry_sequence_breakers":[1]}"#,
+        r#"{"dry_sequence_breakers":"\n"}"#,
+    ] {
+        let response = run(fields);
+        assert!(
+            response.status == 400 && body_text(&response).contains("invalid_sampling"),
+            "malformed llama.cpp sampler fields are rejected: {fields}"
         );
     }
 }
@@ -3164,6 +3296,79 @@ fn wrong_model_is_rejected() {
 }
 
 #[test]
+fn served_model_names_are_echoed() {
+    let backend = FakeBackend::new();
+    backend.config().names = vec!["test-model".into(), "additional".into()];
+    backend.set_pieces(&["ok"]);
+    for model in ["test-model", "additional"] {
+        for stream in [false, true] {
+            let mut response = chat(
+                &backend,
+                &format!(
+                    r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"stream":{stream}}}"#
+                ),
+            );
+            assert_eq!(response.status, 200, "Every served model name is accepted");
+            let body = body_text(&response) + &drain(&mut response);
+            assert!(
+                body.contains(&format!(r#""model":"{model}""#)),
+                "The response names the model the request selected"
+            );
+        }
+    }
+    backend.config().names = vec!["test-model".into()];
+    let response = chat(
+        &backend,
+        r#"{"model":"additional","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert!(
+        response.status == 404 && body_text(&response).contains("model_not_found"),
+        "A single served name accepts nothing else"
+    );
+}
+
+/// `cache_persist` accepts only JSON booleans or null and reaches both
+/// buffered and streaming backends (`TestCachePersistOption`).
+#[test]
+fn cache_persist_option() {
+    for stream in [false, true] {
+        for value in ["true", "false", "null", "0", r#""false""#] {
+            let backend = FakeBackend::new();
+            let mut response = chat(
+                &backend,
+                &format!(
+                    r#"{{"model":"test-model","messages":[{{"role":"user","content":"hello"}}],"stream":{stream},"cache_persist":{value}}}"#
+                ),
+            );
+            let valid = matches!(value, "true" | "false" | "null");
+            assert_eq!(
+                response.status,
+                if valid { 200 } else { 400 },
+                "cache_persist accepts only JSON booleans or null: {value}"
+            );
+            if valid {
+                drain(&mut response);
+                let request = backend.last_request();
+                assert_eq!(
+                    request.cache_persist,
+                    value != "false",
+                    "cache_persist reaches both buffered and streaming backends"
+                );
+                assert!(
+                    request.cache_prompt,
+                    "cache_persist leaves prompt reuse enabled"
+                );
+            } else {
+                assert!(
+                    body_text(&response).contains("invalid_cache_persist"),
+                    "a non-boolean cache_persist names its error code"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn client_identity_reaches_backend() {
     let backend = FakeBackend::new();
     backend.set_pieces(&["ok"]);
@@ -3252,17 +3457,22 @@ fn image_parts_retain_order_and_identity() {
             "unsupported image role, policy and URL are rejected"
         );
     }
-    // Codex sends "high" from view_image; every standard value behaves as
-    // auto.
+    // Codex sends "high" from view_image. Only low changes the resolution.
     for detail in ["auto", "low", "high", "original"] {
         let body = format!(
             r#"{{"model":"test-model","messages":[{{"role":"user","content":[
             {{"type":"image_url","image_url":{{"url":"data:image/png;base64,AQID","detail":"{detail}"}}}}]}}]}}"#
         );
+        let status = chat(&backend, &body).status;
+        let images = backend.last_request().messages[0].images.clone();
+        let expected = if detail == "low" {
+            ImageDetail::Low
+        } else {
+            ImageDetail::Auto
+        };
         assert!(
-            chat(&backend, &body).status == 200
-                && backend.last_request().messages[0].images.len() == 1,
-            "standard image detail {detail} is accepted as auto"
+            status == 200 && images.len() == 1 && images[0].detail == expected,
+            "standard image detail {detail} is accepted, and only low bounds the resolution"
         );
     }
 }
@@ -4682,6 +4892,26 @@ fn tool_closing_framing() {
         case(format!("{call}\n</invoke>\n<|im_end|>"), 1, arg, "<|im_end|>".into()),
         case(format!("</invoke>\n{call}"), 1, arg, "</invoke>\n".into()),
         case("</invoke>".into(), 0, "", "</invoke>".into()),
+        // The prose shapes of tool_reasoning.py ENVELOPE_CASES, which Qwen27
+        // Q4 answers with a terminal call instead of writing them.
+        case(
+            "</invoke>\nIt closes an invoke element.".into(),
+            0,
+            "",
+            "</invoke>\nIt closes an invoke element.".into(),
+        ),
+        case(
+            "<｜DSML｜invoke name=\"f\">".into(),
+            0,
+            "",
+            "<｜DSML｜invoke name=\"f\">".into(),
+        ),
+        case(
+            "The call opens with `<invoke name=\"f\">` and that is only the opener.".into(),
+            0,
+            "",
+            "The call opens with `<invoke name=\"f\">` and that is only the opener.".into(),
+        ),
         case("Text </parameter>".into(), 0, "", "Text </parameter>".into()),
         case("The token is <|im_end|>".into(), 0, "", "The token is <|im_end|>".into()),
         case("<parameter>x</parameter>".into(), 0, "", "<parameter>x</parameter>".into()),
@@ -5584,6 +5814,7 @@ fn tool_boundary_request(
                 4096,
                 &SamplingConfig::default(),
                 stream,
+                "",
             )
             .expect("message")
         }
@@ -6334,6 +6565,7 @@ fn incremental_tool_arguments() {
                             512,
                             &SamplingConfig::default(),
                             true,
+                            "",
                         )
                         .expect("message")
                     }
@@ -6609,6 +6841,17 @@ fn tool_images_retain_order_and_identity() {
             && message.images[0].offset == 5
             && message.images[1].offset == 11
     );
+    let response = chat(
+        &backend,
+        r#"{"model":"test-model","messages":[{"role":"tool","tool_call_id":"call_picture",
+        "content":[
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}]}]}"#,
+    );
+    let images = backend.last_request().messages[0].images.clone();
+    assert!(
+        response.status == 200 && images.len() == 1 && images[0].detail == ImageDetail::Low,
+        "tool images carry their requested detail"
+    );
     for role in ["assistant", "system", "developer"] {
         let body = format!(
             r#"{{"model":"test-model","messages":[{{"role":"{role}","content":[
@@ -6627,5 +6870,560 @@ fn tool_images_retain_order_and_identity() {
             {{"type":"image_url","image_url":{image}}}]}}]}}"#
         );
         assert_eq!(chat(&backend, &body).status, 400, "{image}");
+    }
+}
+
+/// The `logprobs` content entries of a Chat Completions response, buffered
+/// or streamed.
+fn chat_logprob_entries(response: &mut HttpResponse, stream: bool) -> (Vec<Value>, String) {
+    let wire = if stream {
+        drain(response)
+    } else {
+        body_text(response)
+    };
+    let payloads: Vec<Value> = if stream {
+        wire.split("\n\n")
+            .filter_map(|chunk| chunk.strip_prefix("data: "))
+            .filter(|data| !data.starts_with("[DONE]"))
+            .map(|data| json::parse_str(data).expect("chunk"))
+            .collect()
+    } else {
+        vec![json::parse_str(&wire).expect("body")]
+    };
+    let mut entries = Vec::new();
+    for payload in &payloads {
+        for choice in payload.find("choices").expect("choices").items() {
+            if let Some(probabilities) = choice.find("logprobs").filter(|v| !v.is_null()) {
+                entries.extend(
+                    probabilities
+                        .find("content")
+                        .expect("content")
+                        .items()
+                        .to_vec(),
+                );
+            }
+        }
+    }
+    (entries, wire)
+}
+
+fn decoded(entries: &[(u32, &str, f64)]) -> DecodedLogprobs {
+    DecodedLogprobs {
+        entries: entries
+            .iter()
+            .map(|&(id, token, logprob)| DecodedLogprob {
+                id,
+                token: token.into(),
+                logprob,
+            })
+            .collect(),
+    }
+}
+
+/// Chat Completions log probabilities, buffered and streamed: the selected
+/// token first, independent of its alternatives, UTF-8 bytes, the candidate
+/// limit, metadata on reasoning and tool tokens, and request validation
+/// (`TestLogprobs`).
+#[test]
+fn logprobs() {
+    for stream in [false, true] {
+        for count in [0u32, 1, 2, 20] {
+            let backend = FakeBackend::new();
+            backend.set_pieces(&["A", "é"]);
+            // An independent vLLM v0.32.0 fixture: the selected token is
+            // outside the top two.
+            backend.config().logprob_pieces = vec![
+                decoded(&[(3, "A", -3.0), (1, "B", -0.5), (2, "C", -1.5)]),
+                decoded(&[(4, "é", -0.25), (1, "B", -10000.0)]),
+            ];
+            let mut body = json::parse_str(
+                r#"{"model":"test-model","messages":[{"role":"user","content":"go"}],"logprobs":true}"#,
+            )
+            .expect("json");
+            body.set("stream", stream);
+            body.set("top_logprobs", count);
+            let mut response = chat(&backend, &body.dump().expect("dump"));
+            assert_eq!(response.status, 200, "logprobs request accepted");
+            let (entries, _) = chat_logprob_entries(&mut response, stream);
+            assert_eq!(
+                backend
+                    .observed
+                    .lock()
+                    .expect("observed")
+                    .last_sampling
+                    .logprobs,
+                Some(count),
+                "count reaches backend"
+            );
+            assert!(
+                entries.len() == 2
+                    && entries[0].member_str("token", "") == "A"
+                    && entries[0].member_double("logprob", 0.0) == -3.0,
+                "selected probability remains independent of alternatives"
+            );
+            assert_eq!(
+                entries[1]
+                    .find("bytes")
+                    .expect("bytes")
+                    .dump()
+                    .expect("dump"),
+                "[195,169]",
+                "UTF-8 byte arrays"
+            );
+            let top = entries[0].find("top_logprobs").expect("top").items();
+            assert_eq!(top.len(), (count as usize).min(3), "chat candidate limit");
+            if count > 0 {
+                assert_eq!(
+                    top[0].member_str("token", ""),
+                    "A",
+                    "vLLM sampled-first ordering"
+                );
+            }
+        }
+    }
+    for tools in [false, true] {
+        for stream in [false, true] {
+            let backend = FakeBackend::new();
+            let pieces: &[&str] = if tools {
+                &[
+                    "<tool_call>",
+                    r#"{"name":"get_weather","arguments":{"city":"Rome"}}"#,
+                    "</tool_call>",
+                ]
+            } else {
+                &["consider", "</think>", "answer"]
+            };
+            backend.set_pieces(pieces);
+            backend.config().logprob_pieces = pieces
+                .iter()
+                .enumerate()
+                .map(|(i, piece)| decoded(&[(i as u32, piece, -1.0)]))
+                .collect();
+            let mut body = json::parse_str(
+                r#"{"model":"test-model","messages":[{"role":"user","content":"go"}],"logprobs":true}"#,
+            )
+            .expect("json");
+            body.set("stream", stream);
+            body.set(
+                "chat_template_kwargs",
+                Value::object().with("enable_thinking", !tools),
+            );
+            if tools {
+                body.set(
+                    "tools",
+                    json::parse_str(
+                        r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]"#,
+                    )
+                    .expect("json"),
+                );
+            }
+            let mut response = chat(&backend, &body.dump().expect("dump"));
+            assert_eq!(response.status, 200, "parsed logprob request accepted");
+            let (entries, wire) = chat_logprob_entries(&mut response, stream);
+            if stream {
+                assert!(
+                    wire.ends_with("data: [DONE]\n\n"),
+                    "logprob stream terminates"
+                );
+            }
+            let tokens: Vec<String> = entries.iter().map(|e| e.member_str("token", "")).collect();
+            assert_eq!(
+                tokens, pieces,
+                "reasoning and tool markers retain their token metadata"
+            );
+            assert!(
+                wire.contains(if tools {
+                    "tool_calls"
+                } else {
+                    "reasoning_content"
+                }),
+                "logprobs preserve parser output"
+            );
+        }
+    }
+    for fields in [
+        r#"{"logprobs":"true"}"#,
+        r#"{"logprobs":true,"top_logprobs":-1}"#,
+        r#"{"logprobs":true,"top_logprobs":21}"#,
+        r#"{"logprobs":true,"top_logprobs":1.5}"#,
+        r#"{"logprobs":true,"top_logprobs":true}"#,
+        r#"{"logprobs":false,"top_logprobs":1}"#,
+    ] {
+        let backend = FakeBackend::new();
+        let mut body = json::parse_str(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"go"}]}"#,
+        )
+        .expect("json");
+        for (key, value) in json::parse_str(fields).expect("json").members() {
+            body.set(key, value.clone());
+        }
+        assert!(
+            chat(&backend, &body.dump().expect("dump")).status == 400
+                && backend.chat_calls.load(Ordering::SeqCst) == 0,
+            "invalid logprobs rejected before generation: {fields}"
+        );
+    }
+}
+
+/// One Responses logprob fixture: the pieces, the indices of the pieces
+/// whose tokens are visible text, and how the output starts.
+struct ResponsesLogprobFixture {
+    pieces: Vec<Vec<u8>>,
+    visible: Vec<usize>,
+    initial: InitialOutputState,
+    tools: bool,
+    structured: bool,
+    deepseek: bool,
+}
+
+/// Responses `output_text` log probabilities join their content by source
+/// position: only visible tokens score, each once and in order, buffered
+/// and streamed alike, with the part and event schemas, without changing
+/// the visible text or usage (`TestResponsesLogprobs`).
+#[test]
+fn responses_logprobs() {
+    let call = "<tool_call>\n<function=record>\n<parameter=value>repeat\n</parameter>\n</function>\n</tool_call>";
+    let fixture = |pieces: &[&[u8]], visible: &[usize], initial, tools, structured, deepseek| {
+        ResponsesLogprobFixture {
+            pieces: pieces.iter().map(|p| p.to_vec()).collect(),
+            visible: visible.to_vec(),
+            initial,
+            tools,
+            structured,
+            deepseek,
+        }
+    };
+    use InitialOutputState::{Auto, Content, Reasoning};
+    let repeated = format!("repeat{call}repeat");
+    let fixtures = [
+        fixture(&[b"Hel", b"lo", b""], &[0, 1], Content, false, false, false),
+        fixture(&[b"only thought", b""], &[], Reasoning, false, false, false),
+        fixture(&[call.as_bytes(), b"\n"], &[], Content, true, false, false),
+        fixture(&[repeated.as_bytes()], &[0], Content, true, false, false),
+        fixture(
+            &[
+                b"repeat",
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"record\">".as_bytes(),
+                "<｜DSML｜parameter name=\"value\" string=\"true\">repeat</｜DSML｜parameter>"
+                    .as_bytes(),
+                "</｜DSML｜invoke></｜DSML｜tool_calls>".as_bytes(),
+                b"repeat",
+            ],
+            &[0, 4],
+            Content,
+            true,
+            false,
+            true,
+        ),
+        fixture(
+            &[
+                b"<think>", b"repeat", b"</thi", b"nk>", b"\n", b"repeat", b"!",
+            ],
+            &[5, 6],
+            Reasoning,
+            false,
+            false,
+            false,
+        ),
+        fixture(
+            &[
+                b" \n",
+                b"<thi",
+                b"nk>",
+                b"secret",
+                b"</think>",
+                b"\n",
+                b"answer",
+            ],
+            &[6],
+            Auto,
+            false,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"secret</think>answer"],
+            &[0],
+            Reasoning,
+            false,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"A", b"\xc3", b"\xa9", b"Z"],
+            &[0, 1, 2, 3],
+            Content,
+            false,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"\xe2", b"A", b"\xe2"],
+            &[0, 1, 2],
+            Content,
+            false,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"literal <", b"tool_call>", b"text"],
+            &[0, 1, 2],
+            Content,
+            false,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"repeat", b" <", b"not-a-call>"],
+            &[0, 1, 2],
+            Content,
+            true,
+            false,
+            false,
+        ),
+        fixture(
+            &[
+                b"repeat",
+                b" ",
+                b"<tool",
+                b"_call>\n<function=record>\n",
+                b"<parameter=value>repeat\n</parameter>\n</function>\n</tool_call>",
+                b"\n",
+                b"repeat",
+            ],
+            &[0, 1, 5, 6],
+            Content,
+            true,
+            false,
+            false,
+        ),
+        fixture(
+            &[call.as_bytes(), b"\n", b"repeat"],
+            &[1, 2],
+            Content,
+            true,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"repeat", b"</think>\n", call.as_bytes(), b"\n", b"repeat"],
+            &[3, 4],
+            Reasoning,
+            true,
+            false,
+            false,
+        ),
+        fixture(
+            &[b"{\"tag\":\"", b"<think>", b"<tool_call>", b"\"}"],
+            &[0, 1, 2, 3],
+            Content,
+            false,
+            true,
+            false,
+        ),
+    ];
+    let visible_text = |response: &Value| {
+        let mut text = String::new();
+        for item in response.find("output").expect("output").items() {
+            if item.member_str("type", "") == "message" {
+                for part in item.find("content").expect("content").items() {
+                    text.push_str(&part.member_str("text", ""));
+                }
+            }
+        }
+        text
+    };
+    for (index, fixture) in fixtures.iter().enumerate() {
+        for count in [0u32, 2, 20] {
+            for limited in [false, true] {
+                let backend = FakeBackend::new();
+                let mut chat = ChatRequest::default();
+                {
+                    let mut config = backend.config();
+                    config.initial = Some(fixture.initial);
+                    config.pieces = fixture.pieces.clone();
+                    config.finish_reason = if limited {
+                        FinishReason::Length
+                    } else {
+                        FinishReason::Stop
+                    };
+                    if fixture.tools {
+                        config.tool_format = Some(if fixture.deepseek {
+                            ToolFormat::DeepSeek
+                        } else {
+                            ToolFormat::Qwen
+                        });
+                    }
+                    // Independent scores identify the source token even when
+                    // its spelling repeats in thought, a tool argument and
+                    // visible text.
+                    let mut decoder = LogprobDecoder::default();
+                    for i in 0..fixture.pieces.len() {
+                        let mut values = decoder.decode_token(
+                            &TokenLogprobs {
+                                selected: TokenLogprob {
+                                    token: i as u32,
+                                    logprob: -1.0 - i as f64,
+                                },
+                                top: Vec::new(),
+                            },
+                            |token| fixture.pieces[token as usize].clone(),
+                        );
+                        for top in 1..20u32 {
+                            values.entries.push(DecodedLogprob {
+                                id: 1000 + top,
+                                token: "alternative".into(),
+                                logprob: -100.0 - f64::from(top),
+                            });
+                        }
+                        config.logprob_pieces.push(values);
+                    }
+                }
+                if fixture.tools {
+                    let body = json::parse_str(
+                        r#"{"tools":[{"type":"function","name":"record","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}]}"#,
+                    )
+                    .expect("json");
+                    parse_tool_controls(&body, &mut chat, true).expect("tool fixture parses");
+                }
+                if fixture.structured {
+                    let format = json::parse_str(r#"{"type":"json_object"}"#).expect("json");
+                    chat.response_format = parse_response_format(Some(&format), true)
+                        .expect("structured fixture parses")
+                        .map(OutputGrammar);
+                }
+                let dynamic: Arc<dyn TextGenerationBackend> = backend.clone();
+                let respond = |sampling: &SamplingConfig, stream: bool| {
+                    create_openai_response(
+                        &request("{}"),
+                        &dynamic,
+                        &chat,
+                        128,
+                        sampling,
+                        stream,
+                        ResponsesReasoningTarget::default(),
+                        "",
+                    )
+                    .expect("response")
+                };
+                let baseline =
+                    json::parse(&respond(&SamplingConfig::default(), false).body).expect("body");
+                let sampling = SamplingConfig {
+                    logprobs: Some(count),
+                    ..SamplingConfig::default()
+                };
+                let body = json::parse(&respond(&sampling, false).body).expect("body");
+                assert_eq!(
+                    visible_text(&body),
+                    visible_text(&baseline),
+                    "enabling Responses logprobs preserves visible text ({index})"
+                );
+                assert_eq!(
+                    body.find("usage").expect("usage").dump().expect("dump"),
+                    baseline.find("usage").expect("usage").dump().expect("dump"),
+                    "enabling Responses logprobs preserves usage"
+                );
+                let check_entries = |entries: &Value, bytes: bool| {
+                    let mut indices = Vec::new();
+                    for entry in entries.items() {
+                        let value = entry.member_double("logprob", 0.0);
+                        assert!(
+                            value <= -1.0 && value >= -(fixture.pieces.len() as f64),
+                            "Responses preserves independently assigned selected scores ({index})"
+                        );
+                        indices.push((-value - 1.0) as usize);
+                        assert_eq!(
+                            entry.find("top_logprobs").expect("top").len(),
+                            count as usize,
+                            "Responses retains the requested candidate count"
+                        );
+                        assert_eq!(
+                            entry.contains("bytes"),
+                            bytes,
+                            "Responses uses the part/event byte schemas"
+                        );
+                    }
+                    indices
+                };
+                let check_output = |output: &Value, actual: &mut Vec<usize>| {
+                    let mut parts = Value::array();
+                    for item in output.items() {
+                        if item.member_str("type", "") != "message" {
+                            continue;
+                        }
+                        for part in item.find("content").expect("content").items() {
+                            actual.extend(check_entries(part.find("logprobs").expect("lp"), true));
+                            parts.push(part.clone());
+                        }
+                    }
+                    parts
+                };
+                let mut actual = Vec::new();
+                let buffered_parts =
+                    check_output(body.find("output").expect("output"), &mut actual);
+                assert_eq!(
+                    actual,
+                    fixture.visible,
+                    "only visible source tokens have Responses scores ({index}): {}",
+                    body.dump().expect("dump")
+                );
+                let mut streamed = respond(&sampling, true);
+                let mut streamed_indices: Vec<usize> = Vec::new();
+                let mut item_indices: Vec<usize> = Vec::new();
+                let mut terminal = Value::Null;
+                for (sequence, event) in events(&mut streamed, true).into_iter().enumerate() {
+                    assert_eq!(
+                        event.member_size("sequence_number", usize::MAX),
+                        sequence,
+                        "logprob events keep contiguous sequence numbers"
+                    );
+                    let kind = event.member_str("type", "");
+                    if kind == "response.output_text.delta" {
+                        let indices = check_entries(event.find("logprobs").expect("lp"), false);
+                        streamed_indices.extend(&indices);
+                        item_indices.extend(indices);
+                    } else if kind == "response.output_text.done" {
+                        assert_eq!(
+                            check_entries(event.find("logprobs").expect("lp"), false),
+                            item_indices,
+                            "done events contain exactly the accumulated delta scores"
+                        );
+                        item_indices.clear();
+                    } else if kind == "response.content_part.done" {
+                        let part = event.find("part").expect("part");
+                        if let Some(entries) = part.find("logprobs") {
+                            check_entries(entries, true);
+                        }
+                    } else if kind.starts_with("response.reasoning")
+                        || kind.starts_with("response.function_call_arguments")
+                    {
+                        assert!(
+                            !event.contains("logprobs"),
+                            "reasoning and tool events do not acquire text scores"
+                        );
+                    }
+                    if kind == "response.completed" || kind == "response.incomplete" {
+                        terminal = event.find("response").expect("response").clone();
+                    }
+                }
+                assert_eq!(
+                    streamed_indices, fixture.visible,
+                    "streaming preserves token order without duplicates ({index})"
+                );
+                let mut actual = Vec::new();
+                assert_eq!(
+                    check_output(terminal.find("output").expect("output"), &mut actual)
+                        .dump()
+                        .expect("dump"),
+                    buffered_parts.dump().expect("dump"),
+                    "buffered and streamed Responses have identical text and logprobs ({index})"
+                );
+                assert_eq!(
+                    terminal.find("usage").expect("usage").dump().expect("dump"),
+                    body.find("usage").expect("usage").dump().expect("dump"),
+                    "logprob transport leaves usage unchanged"
+                );
+            }
+        }
     }
 }

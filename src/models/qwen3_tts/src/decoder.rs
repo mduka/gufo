@@ -6,6 +6,7 @@
 //! attention K/V to produce the same audio in pieces. Launch order, scratch
 //! assignment and the rocBLAS calls are the C++ ones.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -270,10 +271,22 @@ impl DecoderHistory {
     }
 }
 
+/// `F32Gemm`: the rocBLAS handle, with the C operand of one-row GEMMs.
+struct F32Gemm {
+    blas: RocBlas,
+    /// Keeps single-frame tails on the same GEMM reduction as longer
+    /// chunks: an in-place one-row GEMM runs as a GEMV with another sum
+    /// tree on ROCm 10.1, changing audio when a stream or cached reference
+    /// splits there. A separate C (unread: beta is 0) disables that shortcut;
+    /// it is reserved with the weights, so a streamed tail never allocates
+    /// or synchronizes.
+    zero_beta_input: DeviceBuffer<f32>,
+}
+
 /// `SpeechDecoderHipRuntime`.
 pub struct SpeechDecoder {
     stream: Stream,
-    gemm: RocBlas,
+    gemm: F32Gemm,
     region: DeviceRegion,
     weights: Weights,
     codebook_size: usize,
@@ -323,9 +336,16 @@ struct Loader<'a> {
     checkpoint: &'a Checkpoint,
     region: &'a DeviceRegion,
     next_id: usize,
+    /// The widest one-row GEMM output of the loaded weights
+    /// (`F32Gemm::PrepareColumns`).
+    gemm_columns: Cell<usize>,
 }
 
 impl Loader<'_> {
+    fn prepare_columns(&self, columns: usize) {
+        self.gemm_columns.set(self.gemm_columns.get().max(columns));
+    }
+
     fn f32(&self, name: &str, shape: &[u64]) -> Result<View<f32>, String> {
         resolve_f32(self.checkpoint, self.region, name, shape)
     }
@@ -341,6 +361,7 @@ impl Loader<'_> {
         output_columns: usize,
         bias: bool,
     ) -> Result<Linear, String> {
+        self.prepare_columns(output_columns);
         Ok(Linear {
             weight: self.f32(
                 &format!("{prefix}.weight"),
@@ -374,6 +395,9 @@ impl Loader<'_> {
             ],
         )?;
         let bias = self.vector(&format!("{prefix}.bias"), output_channels)?;
+        if !depthwise {
+            self.prepare_columns(output_channels);
+        }
         self.next_id += 1;
         Ok(Conv {
             id: self.next_id,
@@ -403,6 +427,7 @@ impl Loader<'_> {
             &[input_channels as u64, output_channels as u64, kernel as u64],
         )?;
         let elements = input_channels * output_channels * kernel;
+        self.prepare_columns(output_channels * kernel);
         let mut transformed = self
             .stream
             .alloc_persistent::<f32>(elements)
@@ -449,6 +474,7 @@ impl Loader<'_> {
     }
 
     fn conv_projection(&self, prefix: &str) -> Result<Linear, String> {
+        self.prepare_columns(512);
         Ok(Linear {
             weight: self.f32(&format!("{prefix}.weight"), &[512, 256, 1])?,
             bias: None,
@@ -481,11 +507,19 @@ impl SpeechDecoder {
             return Err("unsupported Qwen3-TTS speech decoder configuration".into());
         }
         let codebook_size = config.codebook_size as usize;
-        let weights = Self::load_weights(&stream, checkpoint, &region, codebook_size)?;
+        let (weights, gemm_columns) =
+            Self::load_weights(&stream, checkpoint, &region, codebook_size)?;
+        let zero_beta_input = stream
+            .alloc_persistent::<f32>(gemm_columns)
+            .map_err(hip("hipMalloc Qwen3-TTS speech decoder"))?;
         stream
             .synchronize()
             .map_err(hip("synchronize Qwen3-TTS speech weights"))?;
-        let gemm = RocBlas::new(&stream).map_err(hip("rocblas_create_handle"))?;
+        checkpoint.release_host_pages();
+        let gemm = F32Gemm {
+            blas: RocBlas::new(&stream).map_err(hip("rocblas_create_handle"))?,
+            zero_beta_input,
+        };
         Ok(Self {
             gemm,
             region,
@@ -514,13 +548,14 @@ impl SpeechDecoder {
         checkpoint: &Checkpoint,
         region: &DeviceRegion,
         codebook_size: usize,
-    ) -> Result<Weights, String> {
+    ) -> Result<(Weights, usize), String> {
         let config = &checkpoint.config.speech_tokenizer;
         let mut loader = Loader {
             stream,
             checkpoint,
             region,
             next_id: 0,
+            gemm_columns: Cell::new(0),
         };
         let semantic_codebook = loader.codebook(
             "decoder.quantizer.rvq_first.vq.layers.0._codebook.",
@@ -650,7 +685,7 @@ impl SpeechDecoder {
         let output_activation =
             loader.snake_beta("decoder.decoder.5.alpha", "decoder.decoder.5.beta", 96)?;
         let output_conv = loader.conv("decoder.decoder.6.conv", 96, 1, 7, 1, false)?;
-        Ok(Weights {
+        let weights = Weights {
             semantic_codebook,
             acoustic_codebooks,
             semantic_projection,
@@ -665,7 +700,8 @@ impl SpeechDecoder {
             decoder_blocks,
             output_activation,
             output_conv,
-        })
+        };
+        Ok((weights, loader.gemm_columns.get()))
     }
 
     /// `Workspace::Ensure`: scratch, columns and codes for `frames` frames.
@@ -1567,7 +1603,7 @@ impl SpeechDecoder {
 /// `RunLinear`: `output = input · weightᵀ (+ bias)` over `rows` rows.
 fn run_linear(
     stream: &Stream,
-    gemm: &RocBlas,
+    gemm: &F32Gemm,
     region: &DeviceRegion,
     weights: &Linear,
     input: DeviceSlice<'_, f32>,
@@ -1633,7 +1669,7 @@ fn conv_weight<'a>(
 #[allow(clippy::too_many_arguments)]
 fn run_conv_raw(
     stream: &Stream,
-    gemm: &RocBlas,
+    gemm: &F32Gemm,
     region: &DeviceRegion,
     columns: &mut DeviceBuffer<f32>,
     weights: &Conv,
@@ -1745,7 +1781,7 @@ fn grow(
 #[allow(clippy::too_many_arguments)]
 fn run_conv(
     stream: &Stream,
-    gemm: &RocBlas,
+    gemm: &F32Gemm,
     region: &DeviceRegion,
     conv: &mut ConvSpace,
     history: Option<&mut DecoderHistory>,
@@ -1844,7 +1880,7 @@ fn run_conv(
 #[allow(clippy::too_many_arguments)]
 fn gemm_f32(
     stream: &Stream,
-    gemm: &RocBlas,
+    gemm: &F32Gemm,
     weight: DeviceSlice<'_, f32>,
     input: DeviceSlice<'_, f32>,
     output: DeviceSliceMut<'_, f32>,
@@ -1859,22 +1895,27 @@ fn gemm_f32(
         || rows > maximum
         || output_columns > maximum
         || reduction > maximum
+        || (rows == 1 && output_columns > gemm.zero_beta_input.len())
     {
         return Err("invalid Qwen3-TTS speech decoder GEMM shape".into());
     }
-    gemm.gemm_f32(
-        stream,
-        Op::T,
-        Op::N,
-        output_columns,
-        rows,
-        reduction,
-        weight,
-        reduction,
-        input,
-        reduction,
-        output,
-        output_columns,
-    )
-    .map_err(launch)
+    // A single frame keeps the GEMM reduction of longer chunks (`F32Gemm`).
+    let accumulation = (rows == 1).then(|| gemm.zero_beta_input.slice(0..output_columns));
+    gemm.blas
+        .gemm_f32(
+            stream,
+            Op::T,
+            Op::N,
+            output_columns,
+            rows,
+            reduction,
+            weight,
+            reduction,
+            input,
+            reduction,
+            accumulation,
+            output,
+            output_columns,
+        )
+        .map_err(launch)
 }

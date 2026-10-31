@@ -165,6 +165,36 @@ impl Tokenizer {
         self.ids.get(token.as_bytes()).copied()
     }
 
+    /// `EncodeTruncated`: encodes like `encode(text, true)`, then drops the
+    /// content tokens past `max_tokens`, keeping the `<bos>` and `<eos>`
+    /// markers. A result that already fits, or a limit too small for the
+    /// markers, is returned whole. Only the leading bytes the kept tokens can
+    /// need are encoded.
+    pub fn encode_truncated(&self, mut text: &[u8], max_tokens: usize) -> Vec<u32> {
+        let markers = self.prefix_ids.len() + self.suffix_ids.len();
+        if max_tokens < markers {
+            return self.encode(text, true);
+        }
+        // The kept tokens span at most max_tokens * max_token_bytes() bytes,
+        // since normalization never shortens the text. Encoding twice that
+        // keeps the cut, and any merge it changes, far from them while
+        // bounding the work.
+        if let Some(span) = max_tokens.checked_mul(self.max_token_bytes)
+            && self.max_token_bytes != 0
+            && text.len() / 2 > span
+        {
+            text = &text[..2 * span];
+        }
+        let mut ids = self.encode(text, true);
+        if ids.len() <= max_tokens {
+            return ids;
+        }
+        let suffix = self.suffix_ids.len();
+        let end = ids.len() - suffix;
+        ids.drain(max_tokens - suffix..end);
+        ids
+    }
+
     fn find_merge(&self, left: u32, right: u32) -> Option<Merge> {
         self.merges.get(&pair_key(left, right)).copied()
     }

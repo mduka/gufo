@@ -58,7 +58,8 @@ impl LoadingResponder {
     }
 
     /// Stops answering and releases the port, within one poll interval plus
-    /// the bounded wait for a request that is still arriving.
+    /// the bounded waits for a request that is still arriving and for the
+    /// answered client to close.
     pub fn stop(&mut self) {
         self.stopped.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
@@ -73,10 +74,39 @@ impl Drop for LoadingResponder {
     }
 }
 
+/// One read from `client` into `into` (when given); false once `deadline`
+/// passes, the client closes or `stopped` is set.
+fn receive_until(
+    client: &mut TcpStream,
+    stopped: &AtomicBool,
+    deadline: Instant,
+    into: Option<&mut Vec<u8>>,
+) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if stopped.load(Ordering::Acquire)
+        || remaining.is_zero()
+        || client.set_read_timeout(Some(remaining)).is_err()
+    {
+        return false;
+    }
+    let mut buffer = [0u8; 4096];
+    match client.read(&mut buffer) {
+        Ok(0) | Err(_) => false,
+        Ok(count) => {
+            if let Some(into) = into {
+                into.extend_from_slice(&buffer[..count]);
+            }
+            true
+        }
+    }
+}
+
 /// The loading responder's accept loop: one connection at a time is enough
-/// for probes. It reads the request head before replying, so closing does
-/// not reset an unread request, but bounds that wait: a client that connects
-/// and sends nothing must not delay `stop`.
+/// for probes. It reads the request head before replying, and after
+/// replying reads what the client still sends (a request body) until it
+/// closes: closing with unread data resets the connection, and the client
+/// can lose the reply. Both waits are bounded: a client that connects and
+/// sends nothing must not delay `stop`.
 pub(super) fn serve_loading(listener: &TcpListener, stopped: &AtomicBool) {
     const REQUEST_WAIT: Duration = Duration::from_millis(500);
     let reply = build_response(
@@ -101,24 +131,16 @@ pub(super) fn serve_loading(listener: &TcpListener, stopped: &AtomicBool) {
         let Ok((mut client, _)) = listener.accept() else {
             continue;
         };
-        let deadline = Instant::now() + REQUEST_WAIT;
+        let head_deadline = Instant::now() + REQUEST_WAIT;
         let mut head = Vec::new();
-        let mut buffer = [0u8; 2048];
         while !head.windows(4).any(|w| w == b"\r\n\r\n")
             && head.len() < 8192
-            && !stopped.load(Ordering::Acquire)
-        {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || client.set_read_timeout(Some(remaining)).is_err() {
-                break;
-            }
-            match client.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => head.extend_from_slice(&buffer[..count]),
-            }
-        }
+            && receive_until(&mut client, stopped, head_deadline, Some(&mut head))
+        {}
         let _ = client.write_all(&reply);
         let _ = client.shutdown(Shutdown::Write);
+        let drain_deadline = Instant::now() + REQUEST_WAIT;
+        while receive_until(&mut client, stopped, drain_deadline, None) {}
     }
 }
 
@@ -336,13 +358,14 @@ pub(super) fn is_event_stream(response: &HttpResponse) -> bool {
     })
 }
 
-pub(super) fn handle_connection(shared: &Shared, stream: TcpStream) {
-    serve_connection(shared, stream);
+pub(super) fn handle_connection(shared: &Shared, stream: TcpStream, response_sent: &AtomicBool) {
+    serve_connection(shared, stream, response_sent);
     // Act on a failure this request found now, not at the next poll.
     fatal_failure(shared);
 }
 
-pub(super) fn serve_connection(shared: &Shared, mut stream: TcpStream) {
+/// `response_sent` is set once the final response is written.
+pub(super) fn serve_connection(shared: &Shared, mut stream: TcpStream, response_sent: &AtomicBool) {
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
     let start = Instant::now();
@@ -417,6 +440,7 @@ pub(super) fn serve_connection(shared: &Shared, mut stream: TcpStream) {
         Ok(response) => response,
         Err(error) => {
             fail(&mut stream, &request, &error, false, 0, elapsed_ms());
+            response_sent.store(true, Ordering::Release);
             return;
         }
     };
@@ -504,6 +528,7 @@ pub(super) fn serve_connection(shared: &Shared, mut stream: TcpStream) {
             connected = link.connected;
             if let Err(error) = streamed {
                 fail(&mut stream, &request, &error, started, status, elapsed_ms());
+                response_sent.store(true, Ordering::Release);
                 return;
             }
             // A stream that ended without writing still commits a valid,
@@ -524,6 +549,7 @@ pub(super) fn serve_connection(shared: &Shared, mut stream: TcpStream) {
     } else {
         connected = send_all(&mut stream, &build_response(&response));
     }
+    response_sent.store(true, Ordering::Release);
     let mut outcome = if connected {
         "completed"
     } else {

@@ -9,7 +9,7 @@
 //! requests whose acceptance is low.
 
 use gufo_core::qwen_tokenizer::StopTokens;
-use gufo_core::sampling::{SamplerState, SamplingConfig};
+use gufo_core::sampling::{SamplerState, SamplingConfig, TokenLogprobs, collect_logprobs};
 use gufo_hip::Stream;
 
 use crate::dflash::draft::{Draft, DraftConfig, DraftContext, DraftSnapshot, ProposalRequest};
@@ -88,6 +88,9 @@ pub struct StepResult {
     /// Of the drafted and accepted tokens: those copied from the history.
     pub lookup_tokens: usize,
     pub lookup_accepted_tokens: usize,
+    /// The raw target log probabilities of each emitted token, for a
+    /// request that asks for them.
+    pub logprobs: Vec<TokenLogprobs>,
 }
 
 /// One session's side of speculative decoding.
@@ -152,6 +155,17 @@ struct Prepared {
     verified_rows: usize,
     accepted: usize,
     physical_width: usize,
+    /// Of the accepted rows so far, for a request that asks for them.
+    logprobs: Vec<TokenLogprobs>,
+}
+
+/// The log probabilities of `token` in `logits` when `count` asks for them.
+fn token_logprobs(
+    logits: &[f32],
+    token: u32,
+    count: Option<u32>,
+) -> Result<Option<TokenLogprobs>, String> {
+    collect_logprobs(logits, token, count).map_err(|e| e.message().to_owned())
 }
 
 /// What a verification pass returned for one session.
@@ -676,6 +690,12 @@ impl Verifier {
         } else {
             Vec::new()
         };
+        let count = request.sampler.config().logprobs;
+        let logprobs = match count {
+            None => None,
+            Some(_) if !logits.is_empty() => token_logprobs(&logits, next, count)?,
+            Some(_) => token_logprobs(&exec.model.logits(request.session)?, next, count)?,
+        };
         let verifier = &mut *request.verifier;
         verifier.stats.verification_steps += 1;
         verifier.stats.emitted_tokens += 1;
@@ -685,6 +705,7 @@ impl Verifier {
             next_token_logits: logits,
             hit_eos: request.stops.contains(next),
             physical_width: 1,
+            logprobs: logprobs.into_iter().collect(),
             ..StepResult::default()
         });
         Ok(())
@@ -794,6 +815,14 @@ impl Verifier {
             if let Some(working) = &step.working {
                 request.sampler.set_rng_state(working.rng_state());
             }
+            let count = request.sampler.config().logprobs;
+            let logprobs = match count {
+                None => None,
+                Some(_) if !logits.is_empty() => token_logprobs(&logits, next, count)?,
+                Some(_) => {
+                    token_logprobs(&exec.model.verification_logits(session, 0)?, next, count)?
+                }
+            };
             verifier.stats.verification_steps += 1;
             verifier.stats.emitted_tokens += 1;
             return Ok(Some(StepResult {
@@ -802,6 +831,7 @@ impl Verifier {
                 next_token_logits: logits,
                 hit_eos: stops.contains(next),
                 physical_width: 1,
+                logprobs: logprobs.into_iter().collect(),
                 ..StepResult::default()
             }));
         }
@@ -863,6 +893,14 @@ impl Verifier {
             break;
         }
         let accepted = step.accepted;
+        let count = request.sampler.config().logprobs;
+        if count.is_some() {
+            for row in chunk_begin..accepted {
+                let logits = exec.model.verification_logits(session, row - chunk_begin)?;
+                step.logprobs
+                    .extend(token_logprobs(&logits, step.proposal.tokens[row], count)?);
+            }
+        }
         let complete = accepted < chunk_end;
         let committed = if complete { accepted + 1 } else { chunk_end };
         // Only committed rows reach the draft, in their order.
@@ -895,6 +933,17 @@ impl Verifier {
         } else {
             Vec::new()
         };
+        if count.is_some() {
+            let fetched;
+            let logits = if frontier.is_empty() {
+                fetched = exec.model.verification_logits(session, correction_row)?;
+                &fetched
+            } else {
+                &frontier
+            };
+            step.logprobs
+                .extend(token_logprobs(logits, correction, count)?);
+        }
         if chunk_end > committed {
             exec.model.restore_state(session)?;
             exec.model
@@ -922,6 +971,7 @@ impl Verifier {
             physical_width: 1,
             lookup_tokens: if copied { drafts } else { 0 },
             lookup_accepted_tokens: if copied { accepted } else { 0 },
+            logprobs: std::mem::take(&mut step.logprobs),
         }))
     }
 

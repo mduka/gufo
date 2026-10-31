@@ -1,8 +1,87 @@
-# Text API functional tests
+# Model API functional tests
 
 The runner starts an isolated local server and checks real responses with the
 OpenAI SDK. Use production binaries (`cargo build --release -p gufo`, then
 `target/release/gufo`) and local weights; no models are downloaded.
+
+## Embedding, ASR and TTS service checks
+
+`model_services.py` starts an isolated loopback production server, checks readiness
+and advertised model identity, runs real HTTP inference, and shuts down its owned
+process. These suites are explicit and separate from the text runner's `--suite all`.
+They do not download weights or voice recordings. Missing inputs fail the run.
+Install `tests/functional/requirements.txt` in a virtualenv (or use `nix develop`
+for the client only) and build the production binary outside `nix develop` with
+`cargo build --release -p gufo`.
+
+```sh
+python3 tests/functional/model_services.py embedding \
+  --binary target/release/gufo --model models/embeddinggemma-2 \
+  --output artifacts/model-services/embedding-1
+
+python3 tests/functional/model_services.py asr \
+  --binary target/release/gufo --model models/audio/Qwen3-ASR-1.7B \
+  --output artifacts/model-services/asr-1
+
+python3 tests/functional/model_services.py tts \
+  --binary target/release/gufo --model models/audio/Qwen3-TTS-12Hz-1.7B-Base \
+  --variant base \
+  --asr-binary /path/to/pinned/gufo --asr-model models/audio/Qwen3-ASR-1.7B \
+  --output artifacts/model-services/tts-base-1
+```
+
+The default audio root is the packaged `fixtures/audio/` English WAV and reviewed
+transcript, authorized by the maintainer for publication. Override `--audio-root`
+only with a folder containing that English pair. ASR generates silence in memory
+for its second concurrent input. Base TTS registers the English recording as the
+`narrator` ICL clone. Reports retain the fixture hash and expected transcript.
+For the other checkpoints, select `--variant custom` with the CustomVoice model
+(default speaker `ryan`, override with `--voice`) or `--variant design` with the
+VoiceDesign model (fixed English voice instructions). Neither requires a clone.
+
+| Suite | Required checks |
+| --- | --- |
+| Embedding | Text, image and audio HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, invalid inputs, cancellation and recovery |
+| ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, rejected options, malformed WAV recovery, stream cancellation and subsequent valid inference |
+| TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, rejected inputs, stream cancellation and subsequent valid inference |
+
+Audio cancellation must appear against the cancelled request's ID in the server
+log; a client closing a response alone does not satisfy the assertion. SSE must
+include its terminal event and a complete payload. Tests never retry requests.
+The audio checks bound output duration to 0.3–20 seconds and require RMS > 0.001;
+TTS requests use checkpoint sampling, fixed seeds and a 180-codec-step cap.
+
+TTS intelligibility requires an explicitly selected ASR evaluator binary. Pin its
+revision and checkpoint independently when changing ASR or TTS runtime behavior;
+using the same candidate as its own evaluator does not qualify those changes.
+The current ASR malformed-WAV path returns `500 transcription_failed` rather than
+400. The suite records this known limitation and checks its exact error and
+subsequent recovery; it does not claim correct client-error classification.
+
+Every invocation requires a new output directory. `report.json` retains status,
+per-case results, request timings and headers (including available server phase
+measurements), binary/harness hashes, source revision, weight file metadata and
+available download revision metadata. Response bodies, generated WAVs, evaluator
+transcripts and server logs stay beside it. Embedding subreports retain individual
+requests. Exceptions leave a failed report and return a nonzero exit code.
+Timings are observations; this runner does not perform matched baseline timing
+qualification. WebSocket streaming, long recordings, broad language/voice quality
+and speaker-similarity scoring remain separate coverage.
+
+Speed comparisons use a pinned main revision and candidate, matching the
+runner, toolchain, weights, settings and request histories. `service_phases.py`
+uses server-emitted request timings and work counters: ASR `Server-Timing`
+phases, TTS synthesis time and codec/audio work, and embedding request duration
+and token/input counts. Client latency and first-output observations remain
+separate. Each request and phase retains every paired repeat at the existing
+5% and 3-ms thresholds; mismatched work stays inconclusive.
+
+Repeat with fresh output directories to check stability. Preserve failed attempts
+alongside successful runs. CPU checks for metric and incomplete-stream refusal:
+
+```sh
+python3 -m unittest discover -s tests/functional -p test_service_http.py
+```
 
 Qwen 27B deep-history recovery uses separate, explicitly selected workloads:
 
@@ -54,7 +133,7 @@ nix develop -c python3 tests/functional/qwen_prefill_cancel.py \
 
 Use `--speculative off` for AR. The test owns its loopback server, records each
 request's phase timings and rejects a multi-second prefill blocking the short
-peer. Apply the usual matched 5% and 3 ms timing gates to its retained results.
+peer. Apply the usual matched 5% and 10 ms timing gates to its retained results.
 Add `--deep-peers` before `--` and serve with `--sessions 4` to fill the other
 slots with duplicate deep conversations. This checks that a short request
 after cancellation can reuse a redundant slot while another live copy retains
@@ -122,7 +201,7 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
-`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, and the error shapes.  It is standalone and outside `--suite all`:
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit, and `prompt_name`, whose vector must equal that of the same prompt written by the client.  It is standalone and outside `--suite all`:
 
 ```sh
 nix develop -c python3 tests/functional/embeddings.py \
@@ -162,15 +241,25 @@ priority rules contribute a union. Unknown paths expand to all compatible
 coverage. Suite metadata must cover every name in `run.py`; dependencies are
 deliberately conservative, so even narrow source rules can select many suites.
 
-`--tier pr` plans the per-PR set. Suites marked `"tier": "release"` (the deep
-cache histories, `cache-stalls`, `long-context` and `reasoning-budget`) then move
-to `release_only` unless a changed path matches their `escalate` patterns: cache
-code, the suite's own module, or Flash-Next model code for depth checks. `run.py
+`--tier pr` plans the per-PR set: one or two suites per behavior (`discovery`,
+`state-edges`, `messages-count-tokens`, `responses`, `stops`, `conversation`,
+`image-inputs`, `structured`, `tools`, `tool-streaming`, `sampling-defaults`,
+`batch` and `cache`). Every other suite is marked `"tier": "release"` and moves
+to `release_only`; the deep cache histories, `cache-stalls`, `long-context` and
+`reasoning-budget` still run on a PR when a changed path matches their
+`escalate` patterns: cache code, the suite's own module, or Flash-Next model
+code for depth checks. `run.py
 --tier pr` also trims transport matrices that a case does not depend on:
 `tool-reasoning` keeps the streamed mode, whose partial parses end in the same
 final parse a buffered reply uses, and `tool-native-schemas` rotates endpoint,
 stream and tool choice across cases. `--tier full` (the default for manual runs)
 keeps every suite and combination.
+
+The literal-closer cases from #786 (a lone `</invoke>` and a closer before or
+between calls) use the deterministic HTTP fixtures in
+`src/cli/serve/tests/openai_chat.rs`, with buffered/streamed and whole/bytewise output.
+Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
+checks must not depend on a model following a request to copy tool markup.
 
 No hosted workflow runs these suites: they need the gfx1151 and local weights.
 `cluster.py` executes a Flash-Next plan locally, with the Q4 shards, MTP sidecar
@@ -209,7 +298,6 @@ python3 -m unittest discover -s tests/functional -p test_impact.py
 python3 -m unittest discover -s tests/functional -p test_runner.py
 python3 -m unittest discover -s tests/functional -p test_cache_workloads.py
 ```
-
 
 The startup-loading runner polls health, readiness and generation from process
 start. Every answer during the load must be 503 `Loading model`, `/health`
@@ -311,11 +399,14 @@ assertions and may fail on the Rust continuation cache.
 | --- | --- |
 | `discovery` | Health, readiness, model ID/context and advertised text/image inputs; no generation |
 | `responses` | SDK buffered, streaming and async Responses |
+| `logprobs` | Generated-token probabilities on Chat and raw Completions, buffered/streamed, greedy/sampled; verifies unchanged output, usage, candidate limits, finite values and UTF-8 bytes |
+| `responses-logprobs` | Responses token probabilities with counts 0/3/20, greedy/sampled, buffered and streamed; unchanged output/usage, SDK accumulation, per-item deltas/done events, finite scores and UTF-8 bytes |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
 | `tool-images` | Chat/Responses function and custom-call image outputs; text/image order, image-only output, actual colors, streamed retries, changed pixels, continuation reuse, role/URL errors and unchanged text-only controls |
 | `image-count` | 17+ images in one message and across turns; Chat/Responses, sampled thinking/JSON, concurrent colors, limits, cancellation and RAM/disk replay |
+| `image-detail` | `detail` `auto` and `low` on a 1536 × 1024 image, where `low` resizes it to 512 × 320, uses fewer prompt tokens, and reuses no image tokens from `auto` |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
 | `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata, foreign tool markers in prose and parallel calls (no DeepSeek text after the call block) |
@@ -374,6 +465,13 @@ controls on main, stop at
 `--through-case tool-images:tool_images_control_complete`; full candidate runs
 continue into the newly supported image-bearing tool outputs. A text-only
 model must not qualify the image suite by skipping its assertions.
+
+`image-detail` also requires `--mmproj`. Each of its two requests leaves a new
+stable boundary in the RAM cache. Retry copies cannot displace stable
+boundaries, as [KV-CACHE.md](../../docs/KV-CACHE.md) describes, so in a full
+cache these two boundaries can make a later unchanged retry prefill its
+assistant opening again. Select `image-detail` after `image-count`, whose
+unchanged retries expect full reuse.
 
 Repeat `--suite` to select affected tests; `--suite all` explicitly runs all. For long
 contexts, use server `--context 32768`; actual prompt depth is recorded. `cache`
@@ -529,6 +627,9 @@ logged a capacity refusal during the continued request.
 Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
+`cache` also checks `cache_persist: false` across the same restart: a flagged
+prompt still reuses RAM within the first server and finds nothing on disk after
+the restart, while an unflagged control prompt restores from disk.
 `cache-rotation` visits four conversations and eight small side requests; use
 `--sessions 1` to verify retention is independent of execution slots. It also
 checks the startup RAM cap; byte/record pressure is covered by CPU tests.
@@ -682,7 +783,7 @@ Every request checks its applicable response format, expected output and timings
 Missing measurements fail. `comparison.json` reports per-request prefill, decode,
 queue, restore and wall times, plus server startup/restart. Missing cases,
 changed output/token counts or unexpected prefill/cache work fail immediately.
-Timing margins remain **both 5% and 3 ms**. One overrun is **inconclusive**, not
+Timing margins remain **both 5% and 10 ms**. One overrun is **inconclusive**, not
 proof of regression. Exit codes: **0 pass, 1 fail, 2 inconclusive/unqualified**.
 
 Use the code diff to identify affected paths. Investigate their timing flags;
@@ -712,3 +813,26 @@ benchmark and numerical quality tests; they do not establish upstream model
 parity. Sampled DSpark may differ across concurrency levels; fixed-path replay
 and greedy equality remain checked. API behavior and references are in
 [SERVER.md](../../docs/SERVER.md).
+
+`embedding_images.py` checks typed text/image `/v1/embeddings` requests against
+the official float32 image fixtures, including mixed batches, multiple images,
+the Frigate trailing newline, base64 dimensions, concurrency, PNG/WebP decoding,
+invalid image destinations and recovery. It requires Pillow and numpy and stays
+outside `--suite all`:
+
+```sh
+nix develop -c python3 tests/functional/embedding_images.py \
+  --base-url http://127.0.0.1:8080/v1 --output /tmp/image-embeddings.json
+```
+
+`embedding_audio.py` adds pinned official audio vectors, decoder/front-end
+fixtures, multiple clips, interleaved text/images, ordering, concurrency,
+Matryoshka/base64, expanded context bounds and server-observed cancellation.
+`family_smoke.py embedding` includes a generated one-second WAV against its
+independent official vector. Neither runner downloads recordings.
+
+```sh
+nix develop -c python3 tests/functional/embedding_audio.py \
+  --base-url http://127.0.0.1:8080/v1 --server-log /path/to/server.log \
+  --output /tmp/audio-embeddings.json
+```

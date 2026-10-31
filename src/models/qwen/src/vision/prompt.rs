@@ -200,8 +200,8 @@ pub fn prepare(
             .ok_or_else(|| Error::logic("image rendering lost a part"))?;
         append(&mut prompt, cursor, offset)?;
         let pixels = match image_cache {
-            Some(cache) => cache.get(&image.bytes)?,
-            None => Arc::new(resize_image(&decode_image(&image.bytes)?)?),
+            Some(cache) => cache.get(&image.bytes, image.detail)?,
+            None => Arc::new(resize_image(&decode_image(&image.bytes)?, image.detail)?),
         };
         let grid = ImageGrid {
             offset: prompt.tokens.len() as u32,

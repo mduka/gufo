@@ -1119,18 +1119,34 @@ fn dspark(b: &Backend) {
     );
     let mut index = Out::new(b, 8 * 4);
     let mut key = Out::new(b, 8 * 8);
-    let row = input_f32(b, u64::from(VOCAB));
-    b.dspark_markov_argmax(
+    let rows = input_f32(b, 8 * u64::from(VOCAB));
+    b.dspark_markov_chain(
         &mut index.t_mut(),
         &mut key.t_mut(),
-        &row,
+        &rows,
         s,
         s,
         VOCAB,
         rank,
         VOCAB - 1,
+        8,
     )
     .unwrap();
+    assert!(
+        b.dspark_markov_chain(
+            &mut index.t_mut(),
+            &mut key.t_mut(),
+            &rows,
+            s,
+            s,
+            VOCAB,
+            rank,
+            0,
+            9
+        )
+        .is_err(),
+        "a chain past eight rows is refused"
+    );
     b.dspark_markov_argmax_batch(
         &mut index.t_mut(),
         &mut key.t_mut(),

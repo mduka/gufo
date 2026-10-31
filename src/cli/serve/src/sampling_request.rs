@@ -59,7 +59,7 @@ where
 
 /// [`read_integer`] that also leaves `output` unchanged for null when
 /// `nullable`.
-fn read_integer_or_null<T>(
+pub(crate) fn read_integer_or_null<T>(
     body: &Value,
     field: &str,
     minimum: i64,
@@ -94,6 +94,144 @@ where
     Ok(())
 }
 
+/// The llama.cpp sampler fields gufo does not implement
+/// (`kLlamaSamplerFields`).
+const LLAMA_SAMPLER_FIELDS: [&str; 15] = [
+    "mirostat",
+    "mirostat_tau",
+    "mirostat_eta",
+    "typical_p",
+    "tfs_z",
+    "dynatemp_range",
+    "dynatemp_exponent",
+    "top_n_sigma",
+    "xtc_probability",
+    "xtc_threshold",
+    "dry_multiplier",
+    "dry_base",
+    "dry_allowed_length",
+    "dry_penalty_last_n",
+    "dry_sequence_breakers",
+];
+
+fn invalid_sampling(field: &str, what: &str) -> SamplingRequestError {
+    SamplingRequestError {
+        message: format!("'{field}' must be {what}"),
+        code: "invalid_sampling".into(),
+    }
+}
+
+/// A present, non-null number; null counts as absent. The first malformed
+/// field is kept in `error`.
+fn sampler_number(
+    body: &Value,
+    field: &str,
+    error: &mut Option<SamplingRequestError>,
+) -> Option<f64> {
+    let value = body.find(field).filter(|value| !value.is_null())?;
+    if !value.is_number() || !value.as_double(0.0).is_finite() {
+        error.get_or_insert_with(|| invalid_sampling(field, "a finite number"));
+        return None;
+    }
+    Some(value.as_double(0.0))
+}
+
+/// [`sampler_number`] that must also be a window length in
+/// `[0, 2147483647]`.
+fn sampler_window(
+    body: &Value,
+    field: &str,
+    error: &mut Option<SamplingRequestError>,
+) -> Option<f64> {
+    let value = sampler_number(body, field, error);
+    if let Some(value) = value
+        && (value.floor() != value || value < 0.0 || value > f64::from(i32::MAX))
+    {
+        error.get_or_insert_with(|| invalid_sampling(field, "an integer between 0 and 2147483647"));
+    }
+    value
+}
+
+/// llama.cpp sampler fields that gufo does not implement
+/// (`CheckNeutralLlamaSamplers`). A field that is absent, null, or set to a
+/// value that leaves llama.cpp's sampler chain unchanged is ignored, so
+/// clients that always send their sampler settings (Open WebUI 0.12 sends
+/// mirostat 0) still work. A value that would activate one of these
+/// samplers is rejected rather than sampling another distribution. Neutral
+/// values follow llama.cpp: the server's clamps and each sampler's early
+/// return.
+fn check_neutral_llama_samplers(body: &Value) -> Result<(), SamplingRequestError> {
+    let unsupported = |field: &str| SamplingRequestError {
+        message: format!("request field '{field}' is not supported with a value that enables it"),
+        code: "unsupported_sampling".into(),
+    };
+    let mut error = None;
+    let mirostat = sampler_number(body, "mirostat", &mut error);
+    sampler_number(body, "mirostat_tau", &mut error);
+    sampler_number(body, "mirostat_eta", &mut error);
+    let typical_p = sampler_number(body, "typical_p", &mut error);
+    sampler_number(body, "tfs_z", &mut error);
+    let dynatemp_range = sampler_number(body, "dynatemp_range", &mut error);
+    sampler_number(body, "dynatemp_exponent", &mut error);
+    let top_n_sigma = sampler_number(body, "top_n_sigma", &mut error);
+    let xtc_probability = sampler_number(body, "xtc_probability", &mut error);
+    let xtc_threshold = sampler_number(body, "xtc_threshold", &mut error);
+    let dry_multiplier = sampler_number(body, "dry_multiplier", &mut error);
+    sampler_number(body, "dry_base", &mut error);
+    sampler_window(body, "dry_allowed_length", &mut error);
+    let dry_penalty_last_n = sampler_window(body, "dry_penalty_last_n", &mut error);
+    if error.is_none()
+        && let Some(breakers) = body
+            .find("dry_sequence_breakers")
+            .filter(|breakers| !breakers.is_null())
+        && !(breakers.is_array()
+            && !breakers.is_empty()
+            && breakers.items().iter().all(Value::is_string))
+    {
+        error = Some(invalid_sampling(
+            "dry_sequence_breakers",
+            "a nonempty array of strings",
+        ));
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    // mirostat_tau/eta only matter with mirostat 1 or 2, dynatemp_exponent
+    // only with a positive dynatemp_range, and llama.cpp no longer has TFS.
+    if mirostat.is_some_and(|value| value > 0.0) {
+        return Err(unsupported("mirostat"));
+    }
+    if typical_p.is_some_and(|value| value < 1.0) {
+        return Err(unsupported("typical_p"));
+    }
+    if dynatemp_range.is_some_and(|value| value > 0.0) {
+        return Err(unsupported("dynatemp_range"));
+    }
+    if top_n_sigma.is_some_and(|value| value > 0.0) {
+        return Err(unsupported("top_n_sigma"));
+    }
+    // XTC acts only when the clamped probability is positive and the clamped
+    // threshold is at most 0.5 (llama.cpp defaults: 0.0 and 0.1).
+    if xtc_probability.unwrap_or(0.0).clamp(0.0, 1.0) > 0.0
+        && xtc_threshold.unwrap_or(0.1).clamp(0.0, 1.0) <= 0.5
+    {
+        return Err(unsupported(if xtc_probability.is_some() {
+            "xtc_probability"
+        } else {
+            "xtc_threshold"
+        }));
+    }
+    // DRY acts only with a nonzero multiplier and a nonzero window
+    // (common.h defaults 0.0 and 64; the server limits the window to
+    // [0, INT32_MAX]). The sampler skips dry_base < 1, but the server
+    // replaces such a base with its default first, so dry_base never
+    // disables DRY.
+    if dry_multiplier.unwrap_or(0.0) != 0.0 && dry_penalty_last_n.unwrap_or(64.0) != 0.0 {
+        return Err(unsupported("dry_multiplier"));
+    }
+    Ok(())
+}
+
 /// All shared sampling controls, `defaults` for omitted fields.
 pub fn parse_sampling_config(
     body: &Value,
@@ -112,21 +250,9 @@ pub fn parse_sampling_config(
             || field == "draft"
             || field == "speculative";
         if draft_control
-            || matches!(
-                field.as_str(),
-                "samplers"
-                    | "typical_p"
-                    | "tfs_z"
-                    | "mirostat"
-                    | "mirostat_eta"
-                    | "mirostat_tau"
-                    | "dynatemp_range"
-                    | "dynatemp_exponent"
-                    | "top_n_sigma"
-                    | "logit_bias"
-            )
-            || field.starts_with("xtc_")
-            || field.starts_with("dry_")
+            || matches!(field.as_str(), "samplers" | "logit_bias")
+            || ((field.starts_with("xtc_") || field.starts_with("dry_"))
+                && !LLAMA_SAMPLER_FIELDS.contains(&field.as_str()))
         {
             return Err(SamplingRequestError {
                 message: format!("request field '{field}' is not supported"),
@@ -134,6 +260,7 @@ pub fn parse_sampling_config(
             });
         }
     }
+    check_neutral_llama_samplers(body)?;
     // The public API's ranges, checked on the JSON number before it narrows
     // to `f32` (1.00000001 must not round into top-p's range); native
     // sampler controls may be broader. llama-server clamps instead.

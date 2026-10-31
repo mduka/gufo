@@ -12,7 +12,7 @@ use gufo_core::gguf::{Gguf, read_header};
 use gufo_core::gguf_identity;
 use gufo_core::json;
 use gufo_core::json_constraint::{ConstraintVocabulary, Piece, ToolFormat};
-use gufo_core::sampling::{SamplerState, SamplingConfig};
+use gufo_core::sampling::{SamplerState, SamplingConfig, TokenId, TokenLogprobs, collect_logprobs};
 use gufo_core::text::{
     self, CancellationCheck, ChatRequest, ChatRole, Error, InitialOutputState, NoPromptContext,
     Result, TextDecodeSelection, TextDecodeStep, TextExecutionPlan, TextModelRunner,
@@ -262,11 +262,26 @@ impl DeepSeekRunner {
         Ok(&snapshot.bytes)
     }
 
-    /// The emitted tokens of a DSpark cycle up to the first stop token.
-    fn step(&self, emitted: &[i32], stop_at_eos: bool) -> TextDecodeStep {
+    /// The emitted tokens of a DSpark cycle up to the first stop token, with
+    /// the log probabilities the cycle's hook observed, one per token, when
+    /// the request asks for them.
+    fn step(
+        &self,
+        emitted: &[i32],
+        stop_at_eos: bool,
+        logprobs: Option<&[TokenLogprobs]>,
+    ) -> Result<TextDecodeStep> {
         let mut step = TextDecodeStep::default();
-        for &token in emitted {
+        for (index, &token) in emitted.iter().enumerate() {
+            let logprobs = logprobs
+                .map(|values| {
+                    values.get(index).cloned().ok_or_else(|| {
+                        engine_error("DeepSeek DSpark cycle lost a token's logprobs".into())
+                    })
+                })
+                .transpose()?;
             if stop_at_eos && self.is_stop(token) {
+                step.terminal_logprobs = logprobs;
                 step.stop = true;
                 break;
             }
@@ -274,12 +289,23 @@ impl DeepSeekRunner {
                 stop: false,
                 token: token as Token,
                 piece: self.piece(token),
+                logprobs,
             });
         }
-        step
+        Ok(step)
     }
 
     /// The conversation of a request (`RenderAndTokenize`).
+    /// The conversation through DeepSeek's template, as generation
+    /// tokenizes it (`ConvertChat` and `RenderChat`).
+    fn render(request: &ChatRequest) -> Result<String> {
+        let (messages, tools) = Self::conversation(request)?;
+        let mut options = chat_template::resolve_chat_options(&request.reasoning);
+        options.tools_present =
+            !request.tools.is_empty() && request.tool_choice != ToolChoice::None;
+        Ok(chat_template::render_chat(&messages, &tools, &options))
+    }
+
     fn conversation(request: &ChatRequest) -> Result<(Vec<ChatMessage>, Vec<ChatTool>)> {
         let messages = request
             .messages
@@ -342,11 +368,13 @@ impl DeepSeekRunner {
         decodes: &mut [TextRunnerDecode<'_, DeepSeekState, SamplerState>],
     ) -> Result<Option<Vec<TextDecodeStep>>> {
         // Greedy and sampled requests share one cohort; requests without a
-        // bridge keep the greedy verifier.
+        // bridge keep the greedy verifier. Requested logprobs need the
+        // bridge to observe every draw.
         let mut bridges: Vec<Option<DsparkSampler>> = decodes
             .iter()
             .map(|d| {
-                (!d.sampler.config().can_use_unmodified_argmax())
+                let config = d.sampler.config();
+                (!config.can_use_unmodified_argmax() || config.logprobs.is_some())
                     .then(|| DsparkSampler::new(d.sampler))
             })
             .collect();
@@ -393,11 +421,15 @@ impl DeepSeekRunner {
                         "DeepSeek DSpark batch produced no tokens".into(),
                     ));
                 }
-                if let Some(bridge) = bridge {
+                if let Some(bridge) = &bridge {
                     d.sampler.set_rng_state(bridge.rng_state());
                 }
                 d.state.position = d.state.session.position();
-                let mut step = self.step(&emitted, d.state.stop_at_eos);
+                let logprobs = bridge
+                    .as_ref()
+                    .filter(|_| d.sampler.config().logprobs.is_some())
+                    .map(DsparkSampler::logprobs);
+                let mut step = self.step(&emitted, d.state.stop_at_eos, logprobs)?;
                 if width > 1 {
                     step.execution_plan = TextExecutionPlan::batched(width);
                 }
@@ -458,14 +490,11 @@ impl TextModelRunner for DeepSeekRunner {
             .collect()
     }
 
+    /// Raw prompts map control-token spellings to their special tokens, as
+    /// the chat template's render does and as llama-server's `/completion`
+    /// does; control text such as `</think>` therefore needs no override of
+    /// `tokenize_control`.
     fn tokenize(&self, text: &str) -> Result<Vec<Token>> {
-        let mut tokens = Vec::new();
-        self.vocab.tokenize(text.as_bytes(), &mut tokens);
-        runner_tokens(&tokens)
-    }
-
-    /// The template's special tokens by ID, such as `</think>`.
-    fn tokenize_control(&self, text: &str) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
         self.vocab
             .tokenize_rendered_chat(text.as_bytes(), &mut tokens);
@@ -473,11 +502,7 @@ impl TextModelRunner for DeepSeekRunner {
     }
 
     fn render_and_tokenize(&self, request: &ChatRequest) -> Result<Option<Vec<Token>>> {
-        let (messages, tools) = Self::conversation(request)?;
-        let mut options = chat_template::resolve_chat_options(&request.reasoning);
-        options.tools_present =
-            !request.tools.is_empty() && request.tool_choice != ToolChoice::None;
-        let rendered = chat_template::render_chat(&messages, &tools, &options);
+        let rendered = Self::render(request)?;
         let mut tokens = Vec::new();
         self.vocab
             .tokenize_rendered_chat(rendered.as_bytes(), &mut tokens);
@@ -485,6 +510,10 @@ impl TextModelRunner for DeepSeekRunner {
             return Ok(None);
         }
         runner_tokens(&tokens).map(Some)
+    }
+
+    fn render_prompt(&self, request: &ChatRequest) -> Result<Option<String>> {
+        Self::render(request).map(Some)
     }
 
     fn prepare_prompt(
@@ -588,6 +617,7 @@ impl TextModelRunner for DeepSeekRunner {
             stop: state.stop_at_eos && self.is_stop(token),
             token: token as Token,
             piece: self.piece(token),
+            logprobs: collect_logprobs(logits, token as TokenId, sampler.config().logprobs)?,
         }))
     }
 
@@ -646,24 +676,24 @@ impl TextModelRunner for DeepSeekRunner {
         }
         // A sampled DSpark cycle may have drawn the next token already.
         let mut token = state.session.take_pending_dspark_token();
-        if token < 0 {
+        let mut logprobs = None;
+        if token < 0 || sampler.config().logprobs.is_some() {
             let logits = state.session.logits().ok_or_else(|| {
                 engine_error(
                     "DeepSeek token selection failed: session has no valid checkpoint".into(),
                 )
             })?;
-            token = sampler.sample(logits)? as i32;
+            if token < 0 {
+                token = sampler.sample(logits)? as i32;
+            }
+            logprobs = collect_logprobs(logits, token as TokenId, sampler.config().logprobs)?;
         }
-        if state.stop_at_eos && self.is_stop(token) {
-            return Ok(TextDecodeSelection {
-                stop: true,
-                ..TextDecodeSelection::default()
-            });
-        }
+        let stop = state.stop_at_eos && self.is_stop(token);
         Ok(TextDecodeSelection {
-            stop: false,
+            stop,
             token: token as Token,
-            piece: self.piece(token),
+            piece: if stop { Vec::new() } else { self.piece(token) },
+            logprobs,
         })
     }
 

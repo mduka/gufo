@@ -1,9 +1,10 @@
 //! Device weights of the text model, a port of `QwenModelWeights::LoadFromGguf`
 //! (`weights.cpp`) and `QwenGpuModel::CreateFromGguf` (`hip/model_loader.cpp`).
 //!
-//! Like the C++ loader, the whole GGUF file is copied into anonymous huge
-//! pages and registered with HIP (`Placement::HostCopy`); tensors are offsets
-//! into that copy and the kernels read them through the mapping.
+//! Like the C++ loader, the whole GGUF file is copied into device memory when
+//! the heap has room above its dispatch reserve, else into anonymous huge
+//! pages registered with HIP (`Placement::DeviceImage`); tensors are offsets
+//! into that copy.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -272,7 +273,7 @@ impl Weights {
         let mut b = Binder {
             gguf: &gguf,
             file: &file,
-            loader: WeightLoader::new(stream, Placement::HostCopy),
+            loader: WeightLoader::new(stream, Placement::DeviceImage),
         };
         let c = &config;
         let (hidden, vocab) = (c.hidden_size, c.vocab_size);

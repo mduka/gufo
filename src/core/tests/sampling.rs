@@ -5,9 +5,11 @@
 
 use std::sync::Arc;
 
+use gufo_core::json_constraint::{ConstraintVocabulary, JsonConstraint, Piece, TokenConstraint};
 use gufo_core::sampling::{
     LogitCandidate, Probability, ReasoningBudget, SamplerState, SamplingConfig,
-    SamplingDistribution, TokenId, build_distribution, next_random, sample_logits, uniform,
+    SamplingDistribution, TokenId, build_distribution, collect_logprobs, next_random,
+    sample_logits, uniform,
 };
 use gufo_core::text::ErrorKind;
 
@@ -1352,4 +1354,130 @@ fn compact_target_contract() {
             "compact target refuses unsupported selection semantics"
         );
     }
+}
+
+/// Raw target log probabilities: a stable full-vocabulary log-softmax,
+/// independent of the sampling transformations and the grammar, and an
+/// observation that changes neither selection nor RNG (`TestRawLogprobs`).
+#[test]
+fn raw_logprobs_ignore_sampling_transformations() {
+    let logits = [1000.0f32, 999.0, 998.0, -1000.0];
+    let denominator = (1.0 + (-1.0f64).exp() + (-2.0f64).exp()).ln();
+    let result = collect_logprobs(&logits, 3, Some(2)).unwrap().unwrap();
+    assert!(
+        (result.selected.logprob - (-2000.0 - denominator)).abs() < 1e-12,
+        "stable log-softmax retains very unlikely selected tokens"
+    );
+    assert!(
+        result.top.len() == 2 && result.top[0].token == 0 && result.top[1].token == 1,
+        "alternatives come from the complete raw vocabulary"
+    );
+    assert!(
+        collect_logprobs(&[], 999, None).unwrap().is_none(),
+        "disabled collection does no work"
+    );
+    assert!(
+        collect_logprobs(&logits, 0, Some(0))
+            .unwrap()
+            .unwrap()
+            .top
+            .is_empty(),
+        "zero requests selected token only"
+    );
+    let tied = collect_logprobs(&[0.0, 0.0, 0.0], 2, Some(20))
+        .unwrap()
+        .unwrap();
+    assert!(
+        tied.top.len() == 3
+            && tied.top[0].token == 0
+            && (tied.selected.logprob + 3.0f64.ln()).abs() < 1e-12,
+        "ties have deterministic token order and exact normalization"
+    );
+    let twenty = collect_logprobs(&[0.0; 32], 31, Some(20)).unwrap().unwrap();
+    assert!(
+        twenty.top.len() == 20 && twenty.top[19].token == 19 && twenty.selected.token == 31,
+        "twenty alternatives retain an independently selected token"
+    );
+
+    let pieces: [&[u8]; 4] = [b"prose", b"{", b"}", b""];
+    let vocabulary = Arc::new(
+        ConstraintVocabulary::new(pieces.len() as u32, |i| {
+            Ok(Piece {
+                text: pieces[i as usize].to_vec(),
+                stop: i == 3,
+            })
+        })
+        .unwrap(),
+    );
+    let constrained = SamplingConfig {
+        constraint: Some(Arc::new(TokenConstraint::new(
+            JsonConstraint::object().unwrap(),
+            vocabulary,
+        ))),
+        logprobs: Some(2),
+        ..SamplingConfig::default()
+    };
+    let mut grammar = SamplerState::new(constrained.clone(), &[]).unwrap();
+    let selected = grammar.sample(&logits).unwrap();
+    let raw = collect_logprobs(&logits, selected, constrained.logprobs)
+        .unwrap()
+        .unwrap();
+    assert!(
+        selected == 1
+            && raw.top[0].token == 0
+            && (raw.selected.logprob + 1.0 + denominator).abs() < 1e-12,
+        "grammar masks change selection but not raw probabilities"
+    );
+
+    for temperature in [0.0f32, 0.7] {
+        let mut config = SamplingConfig {
+            temperature,
+            top_k: 2,
+            presence_penalty: 0.5,
+            seed: 42,
+            ..SamplingConfig::default()
+        };
+        let mut plain = SamplerState::new(config.clone(), &[]).unwrap();
+        config.logprobs = Some(2);
+        let mut observed = SamplerState::new(config.clone(), &[]).unwrap();
+        for _ in 0..16 {
+            let (a, b) = (
+                plain.sample(&logits).unwrap(),
+                observed.sample(&logits).unwrap(),
+            );
+            let probabilities = collect_logprobs(&logits, b, config.logprobs)
+                .unwrap()
+                .unwrap();
+            assert!(
+                a == b && plain.rng_state() == observed.rng_state(),
+                "observation preserves selection and RNG"
+            );
+            assert!(
+                (probabilities.top[0].logprob + denominator).abs() < 1e-12,
+                "raw logprobs ignore temperature, truncation and penalties"
+            );
+            plain.accept(a).unwrap();
+            observed.accept(b).unwrap();
+        }
+    }
+    for invalid in [f32::INFINITY, f32::NAN, f32::NEG_INFINITY] {
+        let failure = collect_logprobs(&[invalid], 0, Some(0)).unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            ErrorKind::Runtime,
+            "invalid raw distributions fail explicitly"
+        );
+    }
+    assert_eq!(
+        collect_logprobs(&logits, 0, Some(21)).unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert!(
+        SamplingConfig {
+            logprobs: Some(21),
+            ..SamplingConfig::default()
+        }
+        .validate()
+        .is_err()
+    );
 }

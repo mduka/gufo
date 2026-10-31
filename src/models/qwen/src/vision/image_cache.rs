@@ -8,14 +8,14 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use gufo_core::image::{Image, decode_image};
-use gufo_core::text::Result;
+use gufo_core::text::{ImageDetail, Result};
 
 use super::prompt::PREPROCESSING;
 use super::resize_image;
 
 /// Backend-owned CPU preprocessing reuse, independent of continuation state.
-/// Only the encoded bytes and the fixed resize policy decide the RGB pixels;
-/// the encoder identity still joins each prompt's continuation identity. The
+/// Only the encoded bytes and the image detail decide the RGB pixels; the
+/// encoder identity still joins each prompt's continuation identity. The
 /// budget counts retained RGB and encoded bytes; entries are bounded too, as
 /// every resized image holds at least 65,536 pixels. Eviction drops only the
 /// cache's reference: prompts in flight keep their immutable pixels.
@@ -37,6 +37,7 @@ pub struct ImageCacheStats {
 
 struct Entry {
     key: u64,
+    detail: ImageDetail,
     /// Exact comparison makes hash collisions harmless; counting these bytes
     /// bounds reuse for poorly compressible uploads too.
     encoded: Arc<Vec<u8>>,
@@ -66,13 +67,15 @@ impl ImageCache {
         }
     }
 
-    /// The resized RGB image of `encoded`, decoded at most once while cached.
-    pub fn get(&self, encoded: &Arc<Vec<u8>>) -> Result<Arc<Image>> {
+    /// The resized RGB image of `encoded` at `detail`, decoded at most once
+    /// while cached.
+    pub fn get(&self, encoded: &Arc<Vec<u8>>, detail: ImageDetail) -> Result<Arc<Image>> {
         let mut hasher = DefaultHasher::new();
         PREPROCESSING.hash(&mut hasher);
         encoded.as_slice().hash(&mut hasher);
         let key = hasher.finish();
-        let matches = |entry: &Entry| entry.key == key && entry.encoded == *encoded;
+        let matches =
+            |entry: &Entry| entry.key == key && entry.detail == detail && entry.encoded == *encoded;
         {
             let mut inner = self.lock();
             if let Some(image) = inner.promote(matches) {
@@ -83,7 +86,7 @@ impl ImageCache {
         }
         // Decode outside the lock so a new upload cannot block earlier hits;
         // a concurrent miss may duplicate the work, one result is kept.
-        let image = Arc::new(resize_image(&decode_image(encoded)?)?);
+        let image = Arc::new(resize_image(&decode_image(encoded)?, detail)?);
         let pixels = image.pixels.capacity();
         if pixels > self.capacity_bytes || encoded.capacity() > self.capacity_bytes - pixels {
             return Ok(image);
@@ -103,6 +106,7 @@ impl ImageCache {
         }
         inner.entries.push_front(Entry {
             key,
+            detail,
             encoded: encoded.clone(),
             image: image.clone(),
         });
@@ -138,17 +142,25 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ImageDetail::{Auto, Low};
 
     /// A 64x64 PNG of one colour, `shade` in every channel.
-    #[allow(clippy::unwrap_used)]
     fn png(shade: u8) -> Arc<Vec<u8>> {
+        png_sized(shade, 64, 64)
+    }
+
+    /// A `width` x `height` PNG of one colour.
+    #[allow(clippy::unwrap_used)]
+    fn png_sized(shade: u8, width: u32, height: u32) -> Arc<Vec<u8>> {
         let mut bytes = Vec::new();
         {
-            let mut encoder = png::Encoder::new(&mut bytes, 64, 64);
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
             encoder.set_color(png::ColorType::Rgb);
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().unwrap();
-            writer.write_image_data(&vec![shade; 64 * 64 * 3]).unwrap();
+            writer
+                .write_image_data(&vec![shade; width as usize * height as usize * 3])
+                .unwrap();
         }
         Arc::new(bytes)
     }
@@ -160,11 +172,14 @@ mod tests {
     fn reuses_resized_images_within_the_budget() {
         let (red, blue) = (png(200), png(30));
         let cache = ImageCache::default();
-        let first = cache.get(&red).unwrap();
-        let again = cache.get(&Arc::new(red.as_ref().clone())).unwrap();
+        let first = cache.get(&red, Auto).unwrap();
+        let again = cache.get(&Arc::new(red.as_ref().clone()), Auto).unwrap();
         assert!(Arc::ptr_eq(&first, &again), "equal bytes decoded twice");
-        assert_eq!(*first, resize_image(&decode_image(&red).unwrap()).unwrap());
-        let other = cache.get(&blue).unwrap();
+        assert_eq!(
+            *first,
+            resize_image(&decode_image(&red).unwrap(), Auto).unwrap()
+        );
+        let other = cache.get(&blue, Auto).unwrap();
         assert!(!Arc::ptr_eq(&first, &other), "other bytes shared an entry");
         let stats = cache.stats();
         assert_eq!((stats.entries, stats.hits, stats.misses), (2, 1, 2));
@@ -172,13 +187,32 @@ mod tests {
         // Room for one entry: the next image evicts the older one.
         let one = first.pixels.capacity() + red.capacity();
         let small = ImageCache::new(one + one / 2);
-        small.get(&red).unwrap();
-        small.get(&blue).unwrap();
+        small.get(&red, Auto).unwrap();
+        small.get(&blue, Auto).unwrap();
         let stats = small.stats();
         assert_eq!((stats.entries, stats.evictions), (1, 1));
         // An image larger than the budget is returned, not kept.
         let none = ImageCache::new(16);
-        none.get(&red).unwrap();
+        none.get(&red, Auto).unwrap();
         assert_eq!(none.stats().entries, 0);
+    }
+
+    /// The detail is part of the key: one image at both details is two
+    /// entries, each hit again (upstream `TestDetailKeysCache`).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn details_key_the_cache() {
+        let large = png_sized(7, 1024, 768);
+        let cache = ImageCache::default();
+        let low = cache.get(&large, Low).unwrap();
+        let automatic = cache.get(&large, Auto).unwrap();
+        assert_eq!((automatic.width, automatic.height), (1024, 768));
+        assert_eq!((low.width, low.height), (512, 384));
+        let stats = cache.stats();
+        assert_eq!((stats.entries, stats.misses), (2, 2));
+        assert!(Arc::ptr_eq(&cache.get(&large, Low).unwrap(), &low));
+        assert!(Arc::ptr_eq(&cache.get(&large, Auto).unwrap(), &automatic));
+        let stats = cache.stats();
+        assert_eq!((stats.entries, stats.hits), (2, 2));
     }
 }

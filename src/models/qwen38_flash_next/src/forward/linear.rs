@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// Orders `stream` after `event` when dropped while one is set (`ZJoin`).
+struct ZJoin<'a> {
+    stream: &'a gufo_hip::Stream,
+    event: Option<&'a gufo_hip::Event>,
+}
+
+impl Drop for ZJoin<'_> {
+    fn drop(&mut self) {
+        if let Some(event) = self.event {
+            let _ = self.stream.wait_event(event);
+        }
+    }
+}
+
 impl Pass<'_> {
     /// Gated DeltaNet for one linear layer over `mixed` into `block_out`
     /// (`LinearAttention`).
@@ -27,6 +41,13 @@ impl Pass<'_> {
         let mut z_stride = c.ssm_value_dim();
         let mut convolved = false;
         let checkpoint_tokens = self.checkpoint.as_ref().map_or(0, |c| c.tokens);
+        // Until the gated DeltaNet queues its wait for the Z rows, every exit
+        // orders the main stream after them: the side stream still writes
+        // them (`ZJoin`).
+        let mut z_join = ZJoin {
+            stream,
+            event: None,
+        };
         if let Some(ssm_in) = &l.ssm_in {
             // Wide prefill convolves q|k|v in the projection's LDS tile; the
             // raw boundary rows stay available for the rolling history.
@@ -47,6 +68,11 @@ impl Pass<'_> {
                     .s
                     .phase
                     .views([], [self.s.qkvz.at(r * w.qkvz), self.s.conv_scratch.at(0)]);
+                // The Z rows feed only the output norm: the side stream
+                // computes them beside the convolution boundary, the
+                // alpha/beta GEMM and the recurrence; the epilogue waits for
+                // them before it reads z. A capture keeps them on `stream`.
+                let side = (!stream.is_recording()).then_some(self.ctx.side);
                 let result = k::dense_f16_ssm_gemm(
                     stream,
                     ssm_in.view(),
@@ -61,9 +87,18 @@ impl Pass<'_> {
                     channels,
                     c.ssm_conv_kernel,
                     checkpoint_tokens,
+                    side.map(|side| &side.stream),
+                    side.map(|side| &side.start),
                 )
                 .map_err(launch_error("fused SSM projection"))?;
                 convolved = result == gufo_hip::Launch::Launched;
+                if convolved && let Some(side) = side {
+                    if let Err(error) = side.stream.record(&side.done) {
+                        let _ = side.stream.synchronize();
+                        return Err(format!("side stream join: {error}").into());
+                    }
+                    z_join.event = Some(&side.done);
+                }
             }
             if !projections_ready && !convolved {
                 self.ctx.dense(
@@ -227,6 +262,7 @@ impl Pass<'_> {
                 capture_state,
                 capture_history,
                 checkpoint_tokens,
+                z_join.event,
             )
         } else if half_output {
             k::gated_delta_net_half(
@@ -262,6 +298,7 @@ impl Pass<'_> {
                 capture_state,
                 capture_history,
                 checkpoint_tokens,
+                z_join.event,
             )
         } else if tiled {
             k::gated_delta_net_q8(
@@ -297,6 +334,7 @@ impl Pass<'_> {
                 capture_state,
                 capture_history,
                 checkpoint_tokens,
+                z_join.event,
             )
         } else if rows {
             let (slot, rows_q8) = self.ctx.claim_q8(n, l.out.cols);
@@ -335,6 +373,7 @@ impl Pass<'_> {
                 capture_state,
                 capture_history,
                 checkpoint_tokens,
+                z_join.event,
             )
         } else {
             k::gated_delta_net(
@@ -370,9 +409,12 @@ impl Pass<'_> {
                 capture_state,
                 capture_history,
                 checkpoint_tokens,
+                z_join.event,
             )
         };
         launched(result, "gated DeltaNet failed")?;
+        // The gated DeltaNet waited for the Z rows.
+        z_join.event = None;
         if !project_output {
             return Ok(());
         }

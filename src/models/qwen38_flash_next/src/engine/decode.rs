@@ -76,10 +76,15 @@ impl Model {
         let anchor = sampler
             .sample_with_argmax(&s.logits, hint)
             .map_err(|e| e.to_string())? as i32;
+        let anchor_logprobs =
+            sampling::collect_logprobs(&s.logits, anchor as TokenId, sampler.config().logprobs)
+                .map_err(|e| e.to_string())?;
         if stop_at_eos && self.is_stop_token(anchor) {
+            result.terminal_logprobs = anchor_logprobs;
             result.stop = true;
             return Ok(());
         }
+        result.logprobs.extend(anchor_logprobs);
         if !s.mtp_enabled() || width < 2 {
             if s.mtp_enabled() && !defer_head {
                 self.draft_catch_up(s, anchor, false, None, false)?;
@@ -335,6 +340,7 @@ impl Model {
         }
         let mut keep = 1u32;
         let mut correction = None;
+        let mut stop_token = None;
         let mut cpu_rows = false;
         // Downloads rows `first..k` once, for exact selection on the host.
         let max_rows = self.executor.options().max_speculative as usize * vocab;
@@ -381,6 +387,7 @@ impl Model {
                     continue;
                 }
                 if is_stop(prediction.index) {
+                    stop_token = Some(prediction.index);
                     result.stop = true;
                     break;
                 }
@@ -410,6 +417,7 @@ impl Model {
                 };
                 let token = verified.token as i32;
                 if is_stop(token) {
+                    stop_token = Some(token);
                     result.stop = true;
                     break;
                 }
@@ -425,9 +433,33 @@ impl Model {
             let decision = policy::verify_draft(logits, chain[keep as usize], sampler, is_stop)?;
             if decision != DraftDecision::Accept {
                 result.stop = decision == DraftDecision::Stop;
+                if result.stop && sampler.config().logprobs.is_some() {
+                    let mut copy = sampler.clone();
+                    stop_token = Some(copy.sample(logits).map_err(|e| e.to_string())? as i32);
+                }
                 break;
             }
             keep += 1;
+        }
+        if let count @ Some(_) = sampler.config().logprobs {
+            let rows = (keep - 1) as usize + usize::from(stop_token.is_some());
+            let mut raw = vec![0.0f32; rows * vocab];
+            if rows > 0 {
+                self.executor.read_verification_rows(0, &mut raw)?;
+            }
+            for i in 1..keep as usize {
+                let row = &raw[(i - 1) * vocab..i * vocab];
+                result.logprobs.extend(
+                    sampling::collect_logprobs(row, chain[i] as TokenId, count)
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            if let Some(token) = stop_token {
+                let at = (keep - 1) as usize * vocab;
+                result.terminal_logprobs =
+                    sampling::collect_logprobs(&raw[at..at + vocab], token as TokenId, count)
+                        .map_err(|e| e.to_string())?;
+            }
         }
         let logits = if pending.gpu_verification && !cpu_rows {
             Some(&mut s.logits[..])

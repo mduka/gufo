@@ -59,7 +59,17 @@ fn complete(
     config: &SamplingConfig,
 ) -> GenerationResult {
     backend
-        .complete(prompt, max_tokens, config, None, None, "quality", &[], true)
+        .complete(
+            prompt,
+            max_tokens,
+            config,
+            None,
+            None,
+            "quality",
+            &[],
+            true,
+            true,
+        )
         .unwrap()
 }
 

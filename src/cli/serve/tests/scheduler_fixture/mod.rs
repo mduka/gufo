@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use gufo_core::sampling::SamplingConfig;
+use gufo_core::sampling::{SamplingConfig, TokenLogprob, TokenLogprobs};
 use gufo_core::text::{
     ChatRequest, DeviceStatus, Error, GenerationErrorCode, NoPromptContext, Result, Sampler,
     TextDecodeSelection, TextDecodeStep, TextExecutionPlan, TextModelRunner, TextPrefillStep,
@@ -239,7 +239,10 @@ impl TextRunnerSnapshot for SnapshotState {
 }
 
 #[derive(Clone)]
-pub struct FakeSampler;
+pub struct FakeSampler {
+    /// The request's `logprobs`: selections then carry a fixed record.
+    logprobs: Option<u32>,
+}
 
 impl Sampler for FakeSampler {
     fn accept(&mut self, _token: Token) {}
@@ -335,8 +338,10 @@ impl TextModelRunner for FakeRunner {
         })
     }
 
-    fn create_sampler(&self, _config: &SamplingConfig, _prompt: &[Token]) -> Result<FakeSampler> {
-        Ok(FakeSampler)
+    fn create_sampler(&self, config: &SamplingConfig, _prompt: &[Token]) -> Result<FakeSampler> {
+        Ok(FakeSampler {
+            logprobs: config.logprobs,
+        })
     }
 
     fn prepare_batch_execution(&self, _state: &mut FakeState) -> Result<()> {
@@ -395,15 +400,23 @@ impl TextModelRunner for FakeRunner {
     fn select_next(
         &self,
         state: &mut FakeState,
-        _sampler: &mut FakeSampler,
+        sampler: &mut FakeSampler,
     ) -> Result<TextDecodeSelection> {
         let frontier = state
             .frontier
             .ok_or_else(|| Error::logic("scheduler fake has no frontier"))?;
+        let logprobs = sampler.logprobs.map(|_| TokenLogprobs {
+            selected: TokenLogprob {
+                token: frontier,
+                logprob: -0.25,
+            },
+            top: Vec::new(),
+        });
         let config = &self.control.config;
-        if config
+        let stop = config
             .stop_after
-            .is_some_and(|count| state.decode_count >= count)
+            .is_some_and(|count| state.decode_count >= count);
+        if stop
             || (state.stop_at_eos
                 && config
                     .eos_after
@@ -413,6 +426,7 @@ impl TextModelRunner for FakeRunner {
                 stop: true,
                 token: 0,
                 piece: Vec::new(),
+                logprobs: logprobs.filter(|_| stop),
             });
         }
         let pieces = &self.control.config.output_pieces;
@@ -423,11 +437,13 @@ impl TextModelRunner for FakeRunner {
                     stop: false,
                     token: frontier,
                     piece: piece.as_bytes().to_vec(),
+                    logprobs,
                 },
                 None => TextDecodeSelection {
                     stop: true,
                     token: 0,
                     piece: Vec::new(),
+                    logprobs: None,
                 },
             });
         }
@@ -435,6 +451,7 @@ impl TextModelRunner for FakeRunner {
             stop: false,
             token: frontier,
             piece: frontier.to_string().into_bytes(),
+            logprobs,
         })
     }
 
@@ -555,6 +572,7 @@ impl TextModelRunner for FakeRunner {
             let selection = self.select_next(state, sampler)?;
             if selection.stop {
                 step.stop = true;
+                step.terminal_logprobs = selection.logprobs;
                 break;
             }
             self.advance(state, selection.token)?;

@@ -6,7 +6,9 @@
 
 use std::marker::PhantomData;
 
-use gufo_hip::{Bf16, DeviceBuffer, DeviceCopy, DeviceSlice, DeviceTensor, Stream};
+use gufo_hip::{
+    Bf16, DeviceBuffer, DeviceCopy, DeviceSlice, DeviceTensor, Placement, Stream, WeightLoader,
+};
 
 use crate::bf16::bf16_to_f32;
 use crate::checkpoint::{Checkpoint, DType, Region, Tensor};
@@ -45,8 +47,11 @@ pub struct DeviceRegion {
 }
 
 impl DeviceRegion {
-    /// Copies `region` (`TryCopy`): prefault the mapping, allocate
-    /// `size + shift` bytes, copy the range `shift` bytes in.
+    /// Copies `region` (`TryCopy`): `size + shift` bytes read from the file
+    /// (upstream's `WeightUpload`, direct I/O where the filesystem allows
+    /// it), so the copy never populates the mapping, with the region
+    /// starting `shift` bytes in. The `shift` bytes before it are file bytes
+    /// no view reads.
     pub fn upload(
         stream: &Stream,
         checkpoint: &Checkpoint,
@@ -54,22 +59,17 @@ impl DeviceRegion {
     ) -> Result<Self, String> {
         const LOAD_ALIGNMENT: usize = 16;
         let shift = (LOAD_ALIGNMENT - region.payload_alignment % LOAD_ALIGNMENT) % LOAD_ALIGNMENT;
-        let file = checkpoint.file(region.file);
-        let range = region.begin..region.begin + region.size;
-        // Faulting the pages in first is only a speed-up, as in C++.
-        let _ = file.prefault(range.clone());
-        let mut buffer = stream
-            .alloc_persistent::<u8>(region.size + shift)
-            .map_err(|e| format!("cannot make Qwen3-TTS safetensors GPU-visible: {e}"))?;
-        stream
-            .upload(
-                &file.bytes()[range],
-                buffer.slice_mut(shift..shift + region.size),
-            )
-            .map_err(|e| format!("cannot make Qwen3-TTS safetensors GPU-visible: {e}"))?;
-        let buffer = buffer
-            .freeze(stream)
-            .map_err(|e| format!("cannot make Qwen3-TTS safetensors GPU-visible: {e}"))?;
+        let failed =
+            |e: gufo_hip::HipError| format!("cannot make Qwen3-TTS safetensors GPU-visible: {e}");
+        let begin = region
+            .begin
+            .checked_sub(shift)
+            .ok_or("Qwen3-TTS weight region starts before its alignment shift")?;
+        let mut loader = WeightLoader::new(stream, Placement::DirectCopy);
+        let pending = loader
+            .add::<u8>(checkpoint.file(region.file), begin, region.size + shift)
+            .map_err(failed)?;
+        let buffer = loader.finish().map_err(failed)?.get(pending);
         Ok(Self {
             buffer,
             file: region.file,

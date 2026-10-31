@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gufo_hip::blas::BlasLt;
-use gufo_hip::{DeviceTensor, LaunchError, Stream};
+use gufo_hip::{DeviceTensor, Event, LaunchError, Stream};
 use gufo_qwen::vision::{Encoder, Prompt};
 use gufo_qwen38_flash_next_kernels as k;
 
@@ -74,15 +74,27 @@ pub struct Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // The stream goes with the executor (`~Executor`).
+        // The streams go with the executor (`~Executor`).
         let _ = k::mmq_release_stream(&self.stream);
+        let _ = k::mmq_release_stream(&self.core.side.stream);
     }
+}
+
+/// The second stream of the overlapped prefill passes, with its fork and
+/// join events (`side_stream_`, `side_start_`, `side_done_`).
+pub(crate) struct Side {
+    pub stream: Stream,
+    pub start: Event,
+    pub done: Event,
 }
 
 /// Everything but the stream, so a graph body can use it while the graph
 /// cache holds the stream.
 pub(crate) struct Core {
     pub model: Arc<DeviceModel>,
+    /// Runs the Z rows of the fused SSM projection and the shared expert of
+    /// wide batches beside the main stream.
+    pub side: Side,
     pub ngram: Option<Arc<NgramTable>>,
     pub options: Options,
     pub blaslt: BlasLt,
@@ -283,6 +295,11 @@ impl Executor {
             pool,
             saver,
             core: Core {
+                side: Side {
+                    stream: Stream::new().map_err(|e| format!("side stream: {e}"))?,
+                    start: Event::new().map_err(|e| format!("side stream fork event: {e}"))?,
+                    done: Event::new().map_err(|e| format!("side stream join event: {e}"))?,
+                },
                 model,
                 ngram,
                 options,
@@ -1057,6 +1074,7 @@ impl Core {
         Pass {
             ctx: Ctx {
                 stream,
+                side: &self.side,
                 model: &self.model,
                 blaslt: &mut self.blaslt,
                 stage: &mut self.stage,

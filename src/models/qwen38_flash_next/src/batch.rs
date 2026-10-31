@@ -461,7 +461,7 @@ impl Pass<'_> {
             self.ctx.stage.half_src = None;
             self.ctx.route.xn_half = false;
             self.ctx.route.moe_pending = false;
-            let result = self.moe_experts(m, DECODE_ROWS.min(rows - r), None);
+            let result = self.moe_experts(m, DECODE_ROWS.min(rows - r), None, None);
             self.row = 0;
             result?;
             r += DECODE_ROWS;

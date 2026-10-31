@@ -191,6 +191,48 @@ impl Backend {
         }
     }
 
+    /// `n_tokens` positions from `pos0` into the state
+    /// (`ds4_gpu_compressor_store_batch_tensor`); the span must not cross a
+    /// ratio window, whose end pools the state.
+    pub fn compressor_store_batch(
+        &self,
+        kv: &impl Input,
+        sc: &impl Input,
+        state_kv: &mut impl Output,
+        state_score: &mut impl Output,
+        ape: Weight,
+        head_dim: u32,
+        ratio: u32,
+        pos0: u32,
+        n_tokens: u32,
+    ) -> Result<()> {
+        const OP: &str = "compressor store batch";
+        ensure(OP, head_dim != 0 && (1..=128).contains(&ratio))?;
+        let coff = if ratio == 4 { 2 } else { 1 };
+        ensure(
+            OP,
+            head_dim.checked_mul(coff).is_some()
+                && n_tokens != 0
+                && n_tokens <= ratio - pos0 % ratio,
+        )?;
+        launched(
+            OP,
+            generated::compressor_store(
+                self.stream(),
+                typed(OP, kv.input())?,
+                typed(OP, sc.input())?,
+                typed_mut(OP, state_kv.output())?,
+                typed_mut(OP, state_score.output())?,
+                self.ape(OP, ape, ratio, coff * head_dim)?,
+                coff,
+                head_dim,
+                ratio,
+                pos0,
+                n_tokens,
+            ),
+        )
+    }
+
     /// One position's KV and score into the state (unless
     /// `state_already_stored`), and at the end of each ratio window the
     /// compressed row `comp_row`.

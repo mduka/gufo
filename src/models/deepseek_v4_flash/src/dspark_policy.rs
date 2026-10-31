@@ -154,6 +154,22 @@ impl RequestState {
     }
 }
 
+/// `ds4_dspark_serial_backoff`: whether one request alone stops drafting.
+/// A C1 draft, verification and commit cost about 125 + 21 per drafted
+/// token in hundredths of one target step (145/165/185/210/230 measured at
+/// d0/d16K for tails 1..5); the cycles must emit enough tokens, the target
+/// anchor included, to repay them. Eight cycles keep a productive request
+/// from being suspended after one poor four-cycle window; a clearly
+/// unprofitable cold start still stops at four.
+pub fn serial_backoff(steps: u64, drafted: u64, accepted: u64) -> bool {
+    if steps < 4 || drafted == 0 {
+        return false;
+    }
+    let cost = 125 * steps + 21 * drafted;
+    let emitted = steps + accepted;
+    cost > emitted * if steps < 8 { 125 } else { 110 }
+}
+
 /// `ds4_dspark_cycle_cost`: a speculative cycle's cost with `tail` drafted
 /// tokens at context `depth` among `concurrency` requests, in hundredths of
 /// an ordinary batch decode step, calibrated offline on gfx1151 (see
@@ -257,7 +273,36 @@ impl ConfidencePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfidencePolicy;
+    use super::{ConfidencePolicy, serial_backoff};
+
+    /// `CheckSerialBackoff` of the C++ `sampling_test`.
+    #[test]
+    fn serial_backoff_repays_the_cycles_with_their_anchors() {
+        assert!(
+            !serial_backoff(3, 3, 0),
+            "cold policy gathers at least four probes"
+        );
+        assert!(
+            serial_backoff(4, 4, 0),
+            "four rejected short drafts trigger bounded backoff"
+        );
+        assert!(
+            !serial_backoff(4, 10, 4) && !serial_backoff(8, 20, 8),
+            "target anchors keep useful short drafts above break-even"
+        );
+        assert!(
+            !serial_backoff(4, 8, 2),
+            "one marginal four-cycle window waits for more evidence"
+        );
+        assert!(
+            serial_backoff(8, 16, 3),
+            "sustained unprofitable drafting backs off"
+        );
+        assert!(
+            !serial_backoff(8, 40, 40),
+            "full-width acceptance remains profitable"
+        );
+    }
 
     const CONCURRENCIES: [usize; 4] = [1, 2, 4, 8];
 

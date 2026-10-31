@@ -122,6 +122,7 @@ fn run(
         capture_state,
         capture_history,
         tokens,
+        None,
     )
     .unwrap();
     assert_eq!(launched, Launch::Launched);

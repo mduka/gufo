@@ -144,3 +144,41 @@ fn four_token_q4_k_projections_match_decode() {
     }
     exact(&stream, GgmlType::Q4K, 3, 17408, 5120);
 }
+
+/// Rows that would otherwise split run in one masked sixteen-row group; the
+/// guard rows check that no padded token is stored (the masked cases of
+/// `TestSmallBatchExactness`).
+#[test]
+fn nine_to_fifteen_k_quant_rows_run_one_masked_group() {
+    let stream = Stream::new().unwrap();
+    let (q4, q5, q6, iq4) = (GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K, GgmlType::Iq4Xs);
+    for batch in [9, 12, 13, 15, 25] {
+        exact(&stream, q5, batch, 5120, 6144);
+    }
+    for batch in [9, 12, 13] {
+        exact(&stream, q6, batch, 5120, 6144);
+    }
+    for (format, batch, rows, columns) in [
+        (q6, 11, 5120, 17408),
+        (q6, 10, 34816, 5120),
+        (q6, 9, 17408, 5120),
+        // No masked Q6_K kernel covers this shape; the split route still runs.
+        (q6, 13, 10240, 5120),
+        (q4, 9, 10240, 5120),
+        (q4, 11, 10240, 5120),
+        (q4, 41, 10240, 5120),
+        (q4, 14, 12288, 5120),
+        (q4, 13, 5120, 6144),
+        (q4, 13, 17408, 5120),
+        (q5, 11, 10240, 5120),
+        (q5, 9, 17408, 5120),
+        (q5, 15, 17408, 5120),
+        (iq4, 10, 17408, 5120),
+        (iq4, 13, 17408, 5120),
+        (iq4, 11, 6144, 5120),
+        (iq4, 14, 6144, 5120),
+        (iq4, 10, 5120, 6144),
+    ] {
+        exact(&stream, format, batch, rows, columns);
+    }
+}

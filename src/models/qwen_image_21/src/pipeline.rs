@@ -897,12 +897,14 @@ fn denoise(
         cx.observe(&format!("dit.{step}.block.{layer}"), &x)?;
     }
     let scale = cx.linear(&activated, "transformer.norm_out.linear")?;
+    cx.observe(&format!("dit.{step}.output_scale"), &scale)?;
     {
         // The C++ call evaluates the factors before the slice.
         let scale_factors = cx.rt.modulation_factors(&scale, false)?;
         let tail = x.slice(prefix, latent.rows)?;
         x = cx.rt.normalize_modulate(&tail, &scale_factors, 0, 0)?;
     }
+    cx.observe(&format!("dit.{step}.output_norm"), &x)?;
     x = cx.linear(&x, "transformer.proj_out")?;
     cx.observe(&format!("dit.{step}.output"), &x)?;
     Ok(x)

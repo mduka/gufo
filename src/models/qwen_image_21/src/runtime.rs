@@ -248,9 +248,12 @@ pub trait Observer {
     fn write(&mut self, name: &str, values: &[f32], rows: usize, cols: usize);
 }
 
-/// `DenseShape`: the projection shapes of the dense WMMA kernels.
+/// `DenseShape`: the projection shapes of the dense WMMA kernels, the final
+/// 64-channel image projection included (its accumulation order then does
+/// not follow BLAS database updates).
 fn dense_shape(channels: usize, inner: usize) -> bool {
-    (channels == 4096 && (inner == 4096 || inner == 12288)) || (channels == 12288 && inner == 4096)
+    (channels == 4096 && (inner == 4096 || inner == 12288))
+        || ((channels == 64 || channels == 12288) && inner == 4096)
 }
 
 /// `Convolve3Shape`: the channel counts of the implicit 3x3 convolution.

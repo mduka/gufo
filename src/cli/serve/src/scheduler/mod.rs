@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use gufo_core::sampling::SamplingConfig;
+use gufo_core::sampling::{SamplingConfig, TokenLogprobs};
 use gufo_core::text::{
     CancellationCheck, DEVICE_LOST_MESSAGE, DeviceStatus, Error, GenerationErrorCode,
     PromptContext, Result, SCHEDULER_FAILED_MESSAGE, TextDecodeSelection, TextDecodeStep,
@@ -31,10 +31,12 @@ use gufo_core::text::{
 
 use crate::backend::{
     FinishReason, GenerationResult, PromptProgress, SessionState, StreamCallbacks, TokenCallback,
+    TokenPiece,
 };
 use crate::continuation_cache::InputIdentity;
 use crate::gpu_share::GpuShare;
 use crate::logging::{self, LogLevel};
+use crate::logprobs::{DecodedLogprobs, LogprobDecoder};
 use crate::metrics;
 use crate::pool::{AcquireOptions, PoolRequest, SHARED_PREFIX_MIN_TOKENS, TextRunnerPool};
 use crate::publication_wait::{PendingPublication, PublicationWaitEstimate};
@@ -179,6 +181,8 @@ pub struct RequestMetadata<C> {
     pub request_start: Instant,
     pub prompt_context: Option<Arc<C>>,
     pub cache_prompt: bool,
+    /// False keeps this request's checkpoints out of the disk cache.
+    pub cache_persist: bool,
     pub cache_prefix_tokens: usize,
     /// Output sequences that end the request; they require exact
     /// incremental text.
@@ -198,6 +202,7 @@ impl<C> Default for RequestMetadata<C> {
             request_start: Instant::now(),
             prompt_context: None,
             cache_prompt: true,
+            cache_persist: true,
             cache_prefix_tokens: 0,
             stop_sequences: Vec::new(),
             stop_at_eos: true,
@@ -206,11 +211,21 @@ impl<C> Default for RequestMetadata<C> {
     }
 }
 
+/// A published piece and the log probabilities of its token.
+struct OutputPiece {
+    text: Vec<u8>,
+    logprobs: Option<DecodedLogprobs>,
+}
+
 /// The queue cost of a streamed piece: a token without text still takes a
 /// slot, so it costs one byte, or a slow consumer could let any number of
-/// them pile up.
-fn queued_piece_cost(piece: &[u8]) -> usize {
-    piece.len().max(1)
+/// them pile up. Log probabilities count their storage.
+fn queued_piece_cost(piece: &OutputPiece) -> usize {
+    piece.text.len().max(1)
+        + piece
+            .logprobs
+            .as_ref()
+            .map_or(0, DecodedLogprobs::storage_bytes)
 }
 
 /// The server-wide bound on output pieces not yet taken by their waiters.
@@ -225,7 +240,7 @@ struct Output {
     admitted: bool,
     /// The newest unread prompt progress; a slow waiter holds at most one.
     progress: Option<PromptProgress>,
-    pieces: VecDeque<Vec<u8>>,
+    pieces: VecDeque<OutputPiece>,
     buffered_bytes: usize,
     max_buffered_bytes: usize,
     result: Option<GenerationResult>,
@@ -292,6 +307,7 @@ struct Work<R: TextModelRunner> {
     prompt: Vec<Token>,
     prompt_context: Option<Arc<R::PromptContext>>,
     cache_prompt: bool,
+    cache_persist: bool,
     cache_prefix_tokens: usize,
     stop_at_eos: bool,
     token_limit: usize,
@@ -309,6 +325,7 @@ struct Work<R: TextModelRunner> {
     preview_stops: bool,
     generated_output_bytes: usize,
     stop_filter: StopSequenceFilter,
+    logprob_decoder: LogprobDecoder,
     last_decode_progress_tokens: usize,
     last_decode_progress_ms: f64,
     /// Admission waits at most once for a resident request to publish the

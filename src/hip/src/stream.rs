@@ -7,8 +7,8 @@ use std::sync::{Arc, Once, OnceLock};
 
 use crate::error::{ErrorKind, HipError, LaunchError, check};
 use crate::memory::{
-    DeviceBuffer, DeviceCopy, DeviceIndexPair, DeviceIndices, DeviceSlice, DeviceSliceMut,
-    IndexSpec, PinnedBuffer,
+    Allocation, DeviceBuffer, DeviceCopy, DeviceIndexPair, DeviceIndices, DeviceSlice,
+    DeviceSliceMut, IndexSpec, PinnedBuffer,
 };
 use crate::record::{Arg, Recorder};
 use crate::sys;
@@ -22,6 +22,16 @@ pub fn runtime_version() -> Result<i32, HipError> {
     let status = unsafe { sys::hipRuntimeGetVersion(&mut version) };
     check(status, "hipRuntimeGetVersion")?;
     Ok(version)
+}
+
+/// Device heap kept free for driver command submission (`kDispatchReserve`
+/// of `src/core/hip/heap_placement.hpp`).
+pub const DISPATCH_RESERVE: u64 = 4 << 30;
+
+/// True when `bytes` can be taken from `free` and still leave
+/// [`DISPATCH_RESERVE`] (`HeapFitsAboveReserve`).
+pub fn heap_fits_above_reserve(free: u64, bytes: u64) -> bool {
+    bytes <= free && free - bytes >= DISPATCH_RESERVE
 }
 
 /// Free and total bytes of the current device (`hipMemGetInfo`).
@@ -354,6 +364,47 @@ impl Stream {
         // SAFETY: both handles are live.
         let status = unsafe { sys::hipEventRecord(event.raw, self.inner.raw) };
         self.observe(check(status, "hipEventRecord"))
+    }
+
+    /// Orders the work enqueued from now on after the last recording of
+    /// `event` (`hipStreamWaitEvent`).
+    pub fn wait_event(&self, event: &Event) -> Result<(), HipError> {
+        self.ensure_healthy()?;
+        self.deny_while_recording("hipStreamWaitEvent")?;
+        // SAFETY: both handles are live.
+        let status = unsafe { sys::hipStreamWaitEvent(self.inner.raw, event.raw, 0) };
+        self.observe(check(status, "hipStreamWaitEvent"))
+    }
+
+    /// Starts work on `side` beside this stream: `side` runs after the work
+    /// enqueued here so far (`start`), and kernels on it may use buffers of
+    /// this stream that the fork hands over to it ([`Fork::hand_over`]) or
+    /// lends it for reading ([`Fork::lend`]). Until the fork ends, launches
+    /// and copies take every view of a handed-over buffer for one of `side`
+    /// and a buffer lent for reading as immutable, and the fork keeps that
+    /// memory allocated. Ending the fork (dropping or [`Fork::join`]) orders
+    /// this stream after the work enqueued on `side` meanwhile (`done`).
+    /// Refused while either stream records a graph.
+    pub fn fork<'f>(
+        &'f self,
+        side: &'f Stream,
+        start: &'f Event,
+        done: &'f Event,
+    ) -> Result<Fork<'f>, HipError> {
+        if self.id() == side.id() {
+            return Err(HipError::refused("a stream cannot fork onto itself"));
+        }
+        side.ensure_healthy()?;
+        side.deny_while_recording("stream fork")?;
+        self.record(start)?;
+        side.wait_event(start)?;
+        Ok(Fork {
+            parent: self,
+            side,
+            done,
+            lent: RefCell::new(Vec::new()),
+            ended: Cell::new(false),
+        })
     }
 
     /// Copies pageable host memory to the device and waits, so `host` may be
@@ -1424,7 +1475,100 @@ pub struct Event {
 // SAFETY: HIP event handles may be used from any thread.
 unsafe impl Send for Event {}
 
+/// Work on a second stream beside a parent ([`Stream::fork`]).
+pub struct Fork<'f> {
+    parent: &'f Stream,
+    side: &'f Stream,
+    done: &'f Event,
+    /// What the fork hands over or lends: kept allocated until the parent
+    /// waited for the side.
+    lent: RefCell<Vec<Arc<Allocation>>>,
+    ended: Cell<bool>,
+}
+
+impl<'f> Fork<'f> {
+    /// The stream to launch the forked work on.
+    pub fn side(&self) -> &'f Stream {
+        self.side
+    }
+
+    /// Hands `memory`, a buffer of the parent, over to the side stream:
+    /// until the fork ends, every view of it is one of the side, which may
+    /// read and write it while the parent cannot touch it.
+    pub fn hand_over(&self, memory: &Arc<Allocation>) -> Result<(), HipError> {
+        if memory.home_stream() != Some(self.parent.id()) {
+            return Err(HipError::refused(
+                "only buffers of the forking stream can be handed over",
+            ));
+        }
+        if !memory.hand_over(self.side.id()) {
+            return Err(HipError::refused("hand-over of a buffer that is lent"));
+        }
+        self.lent.borrow_mut().push(Arc::clone(memory));
+        Ok(())
+    }
+
+    /// Lends `memory`, a buffer of the parent, to the side stream for
+    /// reading: until the fork ends, every stream may read it and none write
+    /// it. Immutable memory is readable on every stream as it is.
+    pub fn lend(&self, memory: &Arc<Allocation>) -> Result<(), HipError> {
+        match memory.home_stream() {
+            None => return Ok(()),
+            Some(home) if home == self.parent.id() => {}
+            Some(_) => {
+                return Err(HipError::refused(
+                    "only buffers of the forking stream can be lent",
+                ));
+            }
+        }
+        if !memory.lend_reads() {
+            return Err(HipError::refused("lending of a handed-over buffer"));
+        }
+        self.lent.borrow_mut().push(Arc::clone(memory));
+        Ok(())
+    }
+
+    /// Ends the fork: the parent runs after the side's work so far, then
+    /// handed-over and lent buffers are the parent's again.
+    pub fn join(self) -> Result<(), HipError> {
+        self.end()
+    }
+
+    fn end(&self) -> Result<(), HipError> {
+        if self.ended.replace(true) {
+            return Ok(());
+        }
+        let joined = self
+            .side
+            .record(self.done)
+            .and_then(|()| self.parent.wait_event(self.done));
+        let lent = std::mem::take(&mut *self.lent.borrow_mut());
+        // Nothing to join: wait for the whole side stream instead. If that
+        // fails too, the side may still use the memory: it stays claimed and
+        // allocated.
+        if joined.is_err() && self.side.synchronize().is_err() {
+            std::mem::forget(lent);
+            return joined;
+        }
+        for memory in lent {
+            memory.give_back();
+        }
+        joined
+    }
+}
+
+impl Drop for Fork<'_> {
+    fn drop(&mut self) {
+        let _ = self.end();
+    }
+}
+
 impl Event {
+    /// The raw handle, for C++ launchers that order a stream themselves.
+    pub fn as_raw(&self) -> sys::HipEvent {
+        self.raw
+    }
+
     /// Completion-only event (no timestamp; cheaper to record).
     pub fn new() -> Result<Self, HipError> {
         Self::with_flags(sys::HIP_EVENT_DISABLE_TIMING)

@@ -80,18 +80,56 @@ impl Default for TextRunnerDiskCacheOptions {
 }
 
 /// The RAM snapshot cache (`TextRunnerRamCacheOptions`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextRunnerRamCacheOptions {
     /// Zero selects min(the model's snapshot budget, 32 GiB) after session
     /// allocation; an explicit limit may exceed that budget up to the
     /// model's ceiling, which keeps 4 GiB of host RAM free.
     pub capacity_bytes: usize,
+    /// False keeps no RAM checkpoints and reserves no RAM-cache backing, and
+    /// `capacity_bytes` is ignored. Sessions still reuse their own live
+    /// state.
+    pub enabled: bool,
+}
+
+impl Default for TextRunnerRamCacheOptions {
+    fn default() -> Self {
+        Self {
+            capacity_bytes: 0,
+            enabled: true,
+        }
+    }
 }
 
 impl TextRunnerRamCacheOptions {
     pub const AUTOMATIC_MAX_BYTES: usize = 32 << 30;
     /// Checkpoint records, independent of the execution states.
     pub const MAX_ENTRIES: usize = 128;
+}
+
+/// A `--cache-ram-bytes` value (`ParseRamCacheOption`): `off`, or a byte
+/// count where 0 selects the automatic budget.
+pub fn parse_ram_cache_option(
+    text: &str,
+) -> std::result::Result<TextRunnerRamCacheOptions, String> {
+    if text == "off" {
+        return Ok(TextRunnerRamCacheOptions {
+            enabled: false,
+            ..TextRunnerRamCacheOptions::default()
+        });
+    }
+    // Digits only, as `std::from_chars` reads them: no sign or space.
+    match text.parse::<usize>() {
+        Ok(bytes) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
+            Ok(TextRunnerRamCacheOptions {
+                capacity_bytes: bytes,
+                ..TextRunnerRamCacheOptions::default()
+            })
+        }
+        _ => Err(format!(
+            "--cache-ram-bytes must be off or a byte count (0 = auto), not '{text}'"
+        )),
+    }
 }
 
 /// What a finished request published.
@@ -121,6 +159,10 @@ pub struct AcquireOptions<C> {
     pub cache_prefix_tokens: usize,
     /// False (`ignore_eos`) generates through the model's stop tokens.
     pub stop_at_eos: bool,
+    /// False (`cache_persist: false`) keeps this request's checkpoints out of
+    /// the disk cache; it may still restore existing disk checkpoints and
+    /// use the RAM cache.
+    pub persist: bool,
 }
 
 impl<C> Default for AcquireOptions<C> {
@@ -132,6 +174,7 @@ impl<C> Default for AcquireOptions<C> {
             reuse_prompt: true,
             cache_prefix_tokens: 0,
             stop_at_eos: true,
+            persist: true,
         }
     }
 }
@@ -340,7 +383,14 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
         };
         let capabilities = validated.descriptor.capabilities;
         let limits = Arc::new(SnapshotLimits::default());
-        let support = if capabilities.snapshot && capabilities.fork {
+        // Off holds live session state only, as for a runner that cannot
+        // snapshot. With a disk cache, restores stay for disk checkpoints,
+        // as upstream's component cache keeps disk captures when off, but
+        // the RAM budget is zero: every checkpoint goes to disk alone.
+        let support = if capabilities.snapshot
+            && capabilities.fork
+            && (ram_cache.enabled || disk_cache.is_some())
+        {
             let restore_validated = validated.clone();
             let capacity_runner = validated.runner.clone();
             let capacity_limits = limits.clone();
@@ -352,6 +402,10 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
                     },
                 )),
                 capacity_bytes: Some(Box::new(move || {
+                    // Off computes no budget, so it never reads the claim.
+                    if !ram_cache.enabled {
+                        return 0;
+                    }
                     let claim = capacity_runner.resource_claim();
                     let automatic = claim.retained_snapshot_capacity_bytes.unwrap_or(0);
                     let automatic_bytes =
@@ -373,6 +427,7 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
                     }
                 })),
                 on_event: Some(Box::new(emit_snapshot_event)),
+                retain: ram_cache.enabled,
             }
         } else {
             SnapshotSupport::default()
@@ -391,11 +446,16 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
                 "cache",
                 &format!(
                     "event=snapshot_cache_configured sessions={state_count} snapshot_entries={} \
-                     capacity_bytes={} automatic_bytes={} max_bytes={}",
-                    cache.entry_capacity(),
+                     capacity_bytes={} automatic_bytes={} max_bytes={} ram_cache={}",
+                    if ram_cache.enabled {
+                        cache.entry_capacity()
+                    } else {
+                        0
+                    },
                     cache.snapshot_capacity_bytes(),
                     limits.automatic_bytes.load(Ordering::Relaxed),
-                    limits.max_bytes.load(Ordering::Relaxed)
+                    limits.max_bytes.load(Ordering::Relaxed),
+                    if ram_cache.enabled { "on" } else { "off" }
                 ),
             );
         }

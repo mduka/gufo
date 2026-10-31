@@ -47,13 +47,16 @@ use crate::generation_metrics::{
 use crate::image_api::{ImageService, handle_image_api_request};
 use crate::image_url::ImageReadBudget;
 use crate::logging::{self, LogLevel};
+use crate::logprobs::{
+    completion_logprobs, parse_logprobs, parse_responses_logprobs, unicode_length,
+};
 use crate::metrics::{prometheus_text, record_server_metrics};
 use crate::openai_chat::{
-    ApiCompat, ResponsesReasoningTarget, handle_openai_chat, parse_anthropic_image,
-    parse_anthropic_tool_controls, parse_anthropic_tool_message, parse_openai_response_format,
-    parse_openai_response_message, parse_reasoning_budget, parse_reasoning_effort_name,
-    parse_reasoning_options, parse_response_function_call, parse_response_function_output,
-    parse_response_tool_controls, sse,
+    ApiCompat, ResponsesReasoningTarget, handle_apply_template, handle_openai_chat,
+    parse_anthropic_image, parse_anthropic_tool_controls, parse_anthropic_tool_message,
+    parse_openai_response_format, parse_openai_response_message, parse_reasoning_budget,
+    parse_reasoning_effort_name, parse_reasoning_options, parse_response_function_call,
+    parse_response_function_output, parse_response_tool_controls, sse,
 };
 use crate::sampling_request::{parse_sampling_config, read_integer};
 use crate::stop_sequences::{StopSequenceFormat, parse_stop_sequences};
@@ -308,6 +311,10 @@ struct Worker {
     /// A clone of the connection for shutdown; the connection thread drops
     /// it when done, so the socket closes when the response ends.
     stream: Arc<Mutex<Option<TcpStream>>>,
+    /// Set after the final response is written. The server reads nothing
+    /// more, so the connection only logs and closes and no longer counts
+    /// toward the limit.
+    response_sent: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     thread: JoinHandle<()>,
 }
@@ -482,6 +489,7 @@ impl HttpServer {
         self.add_fn("POST", "/rerank", not_implemented);
         self.add_fn("POST", "/infill", not_implemented);
         self.add_fn("POST", "/completion", llama_completion);
+        self.add_fn("POST", "/apply-template", handle_apply_template);
         self.add_fn("GET", "/props", llama_props);
         self.add_fn("GET", "/slots", llama_slots);
         self.add_fn("GET", "/v1/slots", llama_slots);
@@ -609,8 +617,12 @@ impl HttpServer {
 
     fn dispatch(&self, mut stream: TcpStream) {
         let mut workers = lock(&self.shared.workers);
+        let serving = workers
+            .iter()
+            .filter(|existing| !existing.response_sent.load(Ordering::Acquire))
+            .count();
         let overloaded = self.shared.stopped.load(Ordering::Acquire)
-            || workers.len() >= self.shared.options.max_connections;
+            || serving >= self.shared.options.max_connections;
         let clone = if overloaded {
             None
         } else {
@@ -630,20 +642,23 @@ impl HttpServer {
             return;
         };
         let handle = Arc::new(Mutex::new(Some(clone)));
+        let response_sent = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let shared = self.shared.clone();
         let thread_handle = handle.clone();
+        let thread_response_sent = response_sent.clone();
         let thread_done = done.clone();
         let spawned = std::thread::Builder::new()
             .name("gufo-http".into())
             .spawn(move || {
-                handle_connection(&shared, stream);
+                handle_connection(&shared, stream, &thread_response_sent);
                 lock(&thread_handle).take();
                 thread_done.store(true, Ordering::Release);
             });
         if let Ok(thread) = spawned {
             workers.push(Worker {
                 stream: handle,
+                response_sent,
                 done,
                 thread,
             });

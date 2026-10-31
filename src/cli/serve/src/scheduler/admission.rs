@@ -326,6 +326,7 @@ impl<R: TextModelRunner> Worker<R> {
                 is_cancelled: Some(check),
                 context: work.prompt_context.take(),
                 reuse_prompt: work.cache_prompt,
+                persist: work.cache_persist,
                 cache_prefix_tokens: work.cache_prefix_tokens,
                 stop_at_eos: work.stop_at_eos,
             },

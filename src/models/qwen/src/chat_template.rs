@@ -125,6 +125,19 @@ pub fn request_tools(request: &ChatRequest) -> &[ChatTool] {
     }
 }
 
+/// The prompt text of a serving request before tokenization
+/// (`RenderQwenPrompt` in `src/cli/serve/inference_backend.cpp`). An image
+/// renders as its one placeholder, not the visual tokens prompt preparation
+/// expands it into. Template errors are request errors, as in preparation.
+pub fn render_request(request: &ChatRequest, max_context: u32) -> Result<String, String> {
+    render(
+        &request.messages,
+        request_tools(request),
+        &request_options(request, max_context),
+    )
+    .map(|rendered| rendered.text)
+}
+
 /// The suffix that opens a new assistant turn, outside the stable
 /// conversation.
 pub fn generation_prompt(enable_thinking: bool) -> &'static str {

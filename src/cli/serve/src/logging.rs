@@ -64,8 +64,14 @@ pub fn enabled(level: LogLevel) -> bool {
     level >= LEVEL_OVERRIDE.with(Cell::get).unwrap_or_else(self::level)
 }
 
-/// Lines logged by any thread while `capture_all` runs.
-static GLOBAL_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
+/// Where every thread's lines go instead of stderr while [`capture_all`] or
+/// [`intercept_all`] runs.
+enum GlobalSink {
+    Capture(String),
+    Hook(Box<dyn Fn(&str) + Send + Sync>),
+}
+
+static GLOBAL_SINK: Mutex<Option<GlobalSink>> = Mutex::new(None);
 
 fn log_mutex() -> &'static Mutex<()> {
     static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -124,17 +130,23 @@ pub fn log(level: LogLevel, component: &str, message: &str) {
     if captured.is_some() {
         return;
     }
-    if let Some(lines) = GLOBAL_CAPTURE
+    if let Some(sink) = GLOBAL_SINK
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
     {
-        let _ = writeln!(
-            lines,
+        let line = format!(
             "[{tag}] [{}] {}",
             safe_line(component, 64),
             safe_line(message, 8192)
         );
+        match sink {
+            GlobalSink::Capture(lines) => {
+                lines.push_str(&line);
+                lines.push('\n');
+            }
+            GlobalSink::Hook(hook) => hook(&line),
+        }
         return;
     }
     let mut line = timestamp();
@@ -255,14 +267,25 @@ pub fn capture_at<T>(level: LogLevel, f: impl FnOnce() -> T) -> (T, String) {
 /// Runs `f` and returns what every thread logged meanwhile. Meant for a
 /// test binary of its own, since concurrent tests' lines are captured too.
 pub fn capture_all<T>(f: impl FnOnce() -> T) -> (T, String) {
-    *GLOBAL_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::new());
+    *GLOBAL_SINK.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(GlobalSink::Capture(String::new()));
     let value = f();
-    let lines = GLOBAL_CAPTURE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_default();
+    let lines = match GLOBAL_SINK.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(GlobalSink::Capture(lines)) => lines,
+        _ => String::new(),
+    };
     (value, lines)
+}
+
+/// Runs `f` with every line any thread logs handed to `hook` instead of
+/// stderr (the C++ tests' `std::clog.rdbuf`). `hook` runs under the
+/// logger's lock, so a hook that blocks holds back every other line. Meant
+/// for a test binary of its own, like [`capture_all`].
+pub fn intercept_all<T>(hook: impl Fn(&str) + Send + Sync + 'static, f: impl FnOnce() -> T) -> T {
+    *GLOBAL_SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(GlobalSink::Hook(Box::new(hook)));
+    let value = f();
+    GLOBAL_SINK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    value
 }
 
 #[cfg(test)]

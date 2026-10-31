@@ -13,6 +13,8 @@ pub(super) struct ResponsesOutput<'w> {
     pub(super) response: Value,
     pub(super) item: Value,
     pub(super) text: String,
+    /// The log probabilities of the open `output_text` part's tokens.
+    pub(super) logprobs: Value,
     /// The open function call item, or null.
     pub(super) tool: Value,
     pub(super) tool_arguments: String,
@@ -27,6 +29,8 @@ pub(super) struct ResponsesOutput<'w> {
     /// A streamed call that never completed, cut by a stop or the limit.
     pub(super) unfinished_tool: bool,
     pub(super) target: ResponsesReasoningTarget,
+    /// Echoed in the final response, as the applied `cache_persist`.
+    pub(super) cache_persist: bool,
 }
 
 impl<'w> ResponsesOutput<'w> {
@@ -84,6 +88,7 @@ impl<'w> ResponsesOutput<'w> {
             response,
             item: Value::Null,
             text: String::new(),
+            logprobs: Value::array(),
             tool: Value::Null,
             tool_arguments: String::new(),
             held: String::new(),
@@ -94,6 +99,7 @@ impl<'w> ResponsesOutput<'w> {
             connected: true,
             unfinished_tool: false,
             target,
+            cache_persist: chat.cache_persist,
         }
     }
 
@@ -160,15 +166,15 @@ impl<'w> ResponsesOutput<'w> {
     }
 
     /// The open part's text event: `delta` or `done` with `text` under
-    /// `key`.
-    pub(super) fn text_event(&self, kind: &str, key: &str, text: &str) -> Value {
+    /// `key`, an answer's with the log probabilities of its tokens.
+    pub(super) fn text_event(&self, kind: &str, key: &str, text: &str, logprobs: &Value) -> Value {
         if self.reasoning {
             self.part_event(&self.target.text_event(kind))
                 .with(key, text)
         } else {
             self.part_event(&format!("response.output_text.{kind}"))
                 .with(key, text)
-                .with("logprobs", Value::array())
+                .with("logprobs", responses_stream_logprobs(logprobs))
         }
     }
 
@@ -185,7 +191,7 @@ impl<'w> ResponsesOutput<'w> {
             Value::object()
                 .with("type", "output_text")
                 .with("annotations", Value::array())
-                .with("logprobs", Value::array())
+                .with("logprobs", self.logprobs.clone())
                 .with("text", self.text.as_str())
         }
     }
@@ -195,7 +201,7 @@ impl<'w> ResponsesOutput<'w> {
             return self.connected;
         }
         self.held.clear();
-        let done = self.text_event("done", "text", &self.text);
+        let done = self.text_event("done", "text", &self.text, &self.logprobs);
         if !self.emit(done) {
             return false;
         }
@@ -257,6 +263,16 @@ impl CompatibilityOutput for ResponsesOutput<'_> {
     }
 
     fn append(&mut self, piece: &str, reasoning: bool) -> bool {
+        self.append_logprobs(piece, reasoning, Value::array())
+    }
+
+    fn set_logprobs(&mut self, count: Option<u32>) {
+        if let Some(count) = count {
+            self.response.set("top_logprobs", count);
+        }
+    }
+
+    fn append_logprobs(&mut self, piece: &str, reasoning: bool, logprobs: Value) -> bool {
         let joined;
         let mut text = piece;
         if reasoning {
@@ -287,6 +303,7 @@ impl CompatibilityOutput for ResponsesOutput<'_> {
             self.reasoning = reasoning;
             self.active = true;
             self.text.clear();
+            self.logprobs = Value::array();
             let id = random_id(if reasoning { "rs_" } else { "msg_" }, 12);
             self.item = if self.in_summary() {
                 // Upstream's item: the summary alone.
@@ -322,7 +339,12 @@ impl CompatibilityOutput for ResponsesOutput<'_> {
             }
         }
         self.text.push_str(text);
-        let delta = self.text_event("delta", "delta", text);
+        if !reasoning {
+            for entry in logprobs.items() {
+                self.logprobs.push(entry.clone());
+            }
+        }
+        let delta = self.text_event("delta", "delta", text, &logprobs);
         self.emit(delta)
     }
 
@@ -415,6 +437,7 @@ impl CompatibilityOutput for ResponsesOutput<'_> {
                 ),
         );
         self.response.set("timings", generation_timings(result));
+        self.response.set("cache_persist", self.cache_persist);
         self.lifecycle(if incomplete {
             "response.incomplete"
         } else {

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use gufo_core::gguf::Gguf;
 use gufo_core::qwen_tokenizer::QwenTokenizer;
 use gufo_core::text::{
-    ChatMessage, ChatRequest, ChatRole, ChatTool, ImagePart, ReasoningEffort, ReasoningOptions,
-    ToolArgument, ToolCall,
+    ChatMessage, ChatRequest, ChatRole, ChatTool, ImageDetail, ImagePart, ReasoningEffort,
+    ReasoningOptions, ToolArgument, ToolCall,
 };
 use gufo_qwen::chat_template::{
     self, ChatTemplate, ChatTemplateOptions, OFFICIAL_TEMPLATE_SHA256, Profile,
@@ -321,6 +321,7 @@ fn image_part(offset: usize) -> ImagePart {
     ImagePart {
         offset,
         bytes: Arc::new(vec![0]),
+        detail: Default::default(),
     }
 }
 
@@ -617,6 +618,77 @@ const FIXTURE_PNG: &[u8] =
     \x35\xa0\x5d\x08\xbb\x01\x98\x4a\x4b\x8b\x55\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\
     \x82";
 
+/// A `width` x `height` PNG of one colour.
+fn png(shade: u8, width: u32, height: u32) -> Arc<Vec<u8>> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![shade; width as usize * height as usize * 3])
+            .unwrap();
+    }
+    Arc::new(bytes)
+}
+
+/// `low` prepares a smaller grid than `auto` for a large image, with the
+/// image cache or without it, and the same prompt for an image below the
+/// bound (`TestDetailPrompts`).
+#[test]
+fn low_detail_prompts_bound_large_images() {
+    let mut tokens: Vec<Vec<u8>> = (0..=255u8)
+        .map(|b| byte_level(b).to_string().into_bytes())
+        .collect();
+    for special in [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+    ] {
+        tokens.push(special.as_bytes().to_vec());
+    }
+    let bytes = gguf_image(&[], &[("tokenizer.ggml.tokens", tokens)]);
+    let tokenizer = QwenTokenizer::from_gguf(&Gguf::parse(&bytes).unwrap()).unwrap();
+    let options = ChatTemplateOptions {
+        enable_thinking: false,
+        ..ChatTemplateOptions::default()
+    };
+    let cache = vision::ImageCache::default();
+    let prepare = |image: &Arc<Vec<u8>>, detail, cache| {
+        let mut user = message(ChatRole::User, "look");
+        user.images.push(ImagePart {
+            offset: 4,
+            bytes: Arc::clone(image),
+            detail,
+        });
+        vision::prepare(&tokenizer, &[user], &[], &options, "encoder", 8192, cache).unwrap()
+    };
+    let large = png(7, 1024, 768);
+    let low = prepare(&large, ImageDetail::Low, Some(&cache));
+    let automatic = prepare(&large, ImageDetail::Auto, Some(&cache));
+    assert_eq!(prepare(&large, ImageDetail::Low, None), low);
+    assert_eq!(prepare(&large, ImageDetail::Auto, None), automatic);
+    let (low_grid, auto_grid) = (low.images[0].grid, automatic.images[0].grid);
+    assert_ne!(low_grid, auto_grid);
+    assert!(
+        low_grid.height <= 16 && low_grid.width <= 16,
+        "{low_grid:?}"
+    );
+    assert!(low.tokens.len() < automatic.tokens.len());
+    assert_ne!(low.cache_identity, automatic.cache_identity);
+    // Images below the low limit resize the same for both details, so their
+    // prompts share one identity.
+    let small = png(9, 320, 240);
+    assert_eq!(
+        prepare(&small, ImageDetail::Low, Some(&cache)),
+        prepare(&small, ImageDetail::Auto, Some(&cache))
+    );
+}
+
 /// With reasoning dropped (`preserve_thinking=false`), a new user turn
 /// removes the reasoning of the preceding tool cycle: the stable prefix ends
 /// before that cycle's first assistant, after every image, and survives the
@@ -647,6 +719,7 @@ fn tool_reasoning_checkpoint_survives_the_next_user_turn() {
                         user.images.push(ImagePart {
                             offset: 0,
                             bytes: Arc::new(FIXTURE_PNG.to_vec()),
+                            detail: Default::default(),
                         });
                     }
                     let mut assistant = with_thought(ChatRole::Assistant, "", thought);

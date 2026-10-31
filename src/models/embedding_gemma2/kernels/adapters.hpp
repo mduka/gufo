@@ -26,7 +26,7 @@ void LaunchQkvNormRopeFlat(const float* qkv, const void* query_norm_bf16,
 
 /// LaunchAttention with the layout as three scalars.
 [[nodiscard]] bool LaunchAttentionFlat(
-    const void* query_bf16, const void* key_bf16, const void* value_bf16,
+    const void* query_bf16, const void* key_bf16, const void* value_t_bf16,
     void* context_bf16, const std::uint32_t* sequence_begin,
     const std::uint32_t* sequence_end, std::size_t tokens,
     std::uint32_t num_heads, std::uint32_t num_key_value_heads,

@@ -56,7 +56,7 @@ void NarrowToHalf(const float* x, __half* out, std::size_t count,
     std::uint32_t k_heads, std::uint32_t v_heads, std::uint32_t kernel,
     bool row_split, bool convolved, float eps, std::uint32_t out_half_stride,
     float* checkpoint_state, float* checkpoint_history,
-    std::uint32_t checkpoint_tokens, hipStream_t stream);
+    std::uint32_t checkpoint_tokens, hipEvent_t z_ready, hipStream_t stream);
 
 /// HcMixEpilogue that also writes `mixed` as the tier's Q8_1 rows; false,
 /// launching nothing, unless they are unpadded (hidden % 512 == 0).

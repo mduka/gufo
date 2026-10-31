@@ -82,8 +82,8 @@ pub struct Transcriber {
     frontend_gate: CancellableGate,
     device_gate: CancellableGate,
     device: Mutex<Device>,
-    /// The mapped shards stay mapped like the C++ runtime's: unmapping the
-    /// prefaulted checkpoint would add ~50 ms to every load.
+    /// The shards stay mapped like the C++ runtime's, their resident pages
+    /// released once the weights are on the device.
     _checkpoint: Checkpoint,
 }
 
@@ -150,7 +150,7 @@ impl Transcriber {
     /// Loads the checkpoint in `model_root` for prompts plus generated tokens
     /// of up to `capacity` tokens per chunk.
     pub fn load(model_root: &Path, capacity: usize) -> Result<Self, String> {
-        Self::load_with(model_root, capacity, Placement::CachedCopy)
+        Self::load_with(model_root, capacity, Placement::DirectCopy)
     }
 
     pub fn load_with(
@@ -171,6 +171,14 @@ impl Transcriber {
             let stream = Stream::new().map_err(|e| format!("Qwen3-ASR stream: {e}"))?;
             let checkpoint = Checkpoint::open(model_root, &SHARDS)?;
             let weights = Weights::load(&stream, &checkpoint, &config, placement)?;
+            // Complete the derived weight work before dropping the host pages;
+            // a mapping the device reads (`Placement::Map`) keeps them.
+            stream
+                .synchronize()
+                .map_err(|e| format!("hipStreamSynchronize Qwen3-ASR weights: {e}"))?;
+            for file in checkpoint.files() {
+                file.release_pages();
+            }
             let encoder = AudioEncoder::new(&stream)?;
             let decoder = TextDecoder::new(&stream, &config.text, capacity)?;
             let tokenizer = tokenizer

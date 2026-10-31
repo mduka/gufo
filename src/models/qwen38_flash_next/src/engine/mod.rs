@@ -98,6 +98,8 @@ pub struct Model {
     /// The special tokens above the draft prefix, ascending, when MTP drafts
     /// may use the small head ([`crate::draft_vocab`]).
     draft_specials: Option<Vec<i32>>,
+    /// See [`Model::expanded_q8_0_tensors`].
+    expanded_q8_0: usize,
 }
 
 /// Draft cycles and their acceptance (`SpeculativeStats`).
@@ -114,10 +116,15 @@ pub struct SpeculativeStats {
 }
 
 /// Tokens of one decode step and whether it stopped.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DecodeResult {
     pub tokens: Vec<i32>,
     pub stop: bool,
+    /// The raw target log probabilities of each committed token, for a
+    /// request that asks for them.
+    pub logprobs: Vec<sampling::TokenLogprobs>,
+    /// Those of the stop token that ended the step.
+    pub terminal_logprobs: Option<sampling::TokenLogprobs>,
 }
 
 /// One conversation's context: its tokens, the last token's logits and the
@@ -226,12 +233,13 @@ struct PendingDecode {
 }
 
 /// The longest visible context of the fused WMMA attention kernel for this
-/// geometry, 0 for another one (`WmmaCausalAttentionContextLimit`).
+/// geometry, 0 for another one (`WmmaCausalAttentionContextLimit`): a compact
+/// list entry keeps the block index below its membership bits.
 fn wmma_context_limit(c: &Config) -> u32 {
-    const MAX_MASK_WORDS: u32 = 2048;
+    const MEMBER_SHIFT: u32 = 28;
     const RATIO: u32 = 4;
     if (c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio) == (24, 2, 256, RATIO) {
-        MAX_MASK_WORDS * RATIO * 32
+        (1 << MEMBER_SHIFT) * RATIO
     } else {
         0
     }
@@ -299,6 +307,11 @@ impl Model {
             }
             None => None,
         };
+        let expanded_q8_0 = tensors
+            .layers
+            .iter()
+            .map(|l| l.expanded_q8_0_tensors())
+            .sum();
         let mapped = open_all(&files.paths)?;
         let stream = Stream::new().map_err(|e| format!("hipStreamCreate: {e}"))?;
         let device = match &mtp {
@@ -356,7 +369,16 @@ impl Model {
             batch_policy: BatchController::default(),
             vision,
             draft_specials,
+            expanded_q8_0,
         })
+    }
+
+    /// Trunk tensors the official GGUF keeps in F32 but this artifact stores
+    /// as Q8_0 ([`crate::weights::LayerRefs::expanded_q8_0_tensors`]). The
+    /// official MTP sidecar ships its inject as Q8_0, so the draft block is
+    /// not counted.
+    pub fn expanded_q8_0_tensors(&self) -> usize {
+        self.expanded_q8_0
     }
 
     /// The vision encoder, when a sidecar was found.

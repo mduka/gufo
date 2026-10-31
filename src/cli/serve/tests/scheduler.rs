@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use gufo_core::sampling::SamplingConfig;
 use gufo_core::text::{ErrorKind, GenerationErrorCode, Token};
-use gufo_serve::backend::{FinishReason, GenerationResult, PromptProgress, StreamCallbacks};
+use gufo_serve::backend::{
+    FinishReason, GenerationResult, PromptProgress, StreamCallbacks, TokenPiece,
+};
 use gufo_serve::logging::{self, LogLevel};
 use gufo_serve::pool::TextRunnerPool;
 use gufo_serve::scheduler::{
@@ -676,7 +678,7 @@ fn slow_consumer_output_is_bounded_and_reclaimed() {
             let callback_state = callback_state.clone();
             let control = control.clone();
             scope.spawn(move || {
-                let mut callback = |_: &[u8]| {
+                let mut callback = |_: &TokenPiece<'_>| {
                     let (lock, condition) = &*callback_state;
                     let mut state = lock.lock().expect("callback");
                     state.0 = true;
@@ -761,14 +763,14 @@ fn mid_generation_admission_and_isolated_trajectories() {
     control.release_advance();
     let mut pieces_a = Vec::new();
     let result_a = request_a
-        .wait(Some(&mut |piece: &[u8]| {
+        .wait(Some(&mut |piece: &TokenPiece<'_>| {
             pieces_a.push(piece.to_vec());
             true
         }))
         .expect("wait");
     let mut pieces_b = Vec::new();
     let result_b = request_b
-        .wait(Some(&mut |piece: &[u8]| {
+        .wait(Some(&mut |piece: &TokenPiece<'_>| {
             pieces_b.push(piece.to_vec());
             true
         }))
@@ -927,7 +929,7 @@ fn decode_cancellation_and_state_reclamation() {
     let mut cancelled = submit_streaming(&scheduler, &[5, 50], 5);
     let mut delivered = 0;
     let result = cancelled
-        .wait(Some(&mut |_: &[u8]| {
+        .wait(Some(&mut |_: &TokenPiece<'_>| {
             delivered += 1;
             control.release_advance();
             false
@@ -981,11 +983,27 @@ fn submit_with_stops(
     max_tokens: usize,
     stops: &[&str],
 ) -> SchedulerRequest {
+    submit_with_stops_sampling(
+        scheduler,
+        prompt,
+        max_tokens,
+        stops,
+        &SamplingConfig::with_temperature(0.0),
+    )
+}
+
+fn submit_with_stops_sampling(
+    scheduler: &Scheduler,
+    prompt: &[Token],
+    max_tokens: usize,
+    stops: &[&str],
+    sampling: &SamplingConfig,
+) -> SchedulerRequest {
     scheduler
         .submit(
             prompt.to_vec(),
             max_tokens,
-            &SamplingConfig::with_temperature(0.0),
+            sampling,
             None,
             true,
             RequestMetadata {
@@ -1000,7 +1018,7 @@ fn submit_with_stops(
 fn wait_streamed(request: &mut SchedulerRequest) -> (GenerationResult, Vec<u8>) {
     let mut streamed = Vec::new();
     let result = request
-        .wait(Some(&mut |piece: &[u8]| {
+        .wait(Some(&mut |piece: &TokenPiece<'_>| {
             streamed.extend_from_slice(piece);
             true
         }))
@@ -1026,11 +1044,28 @@ fn stop_sequences_preserve_executed_state() {
                     ..Config::default()
                 });
                 let scheduler = scheduler(&control, 1);
-                let (result, streamed) =
-                    wait_streamed(&mut submit_with_stops(&scheduler, &[1, 10], 8, &["<STOP>"]));
+                let sampling = SamplingConfig {
+                    logprobs: Some(2),
+                    ..SamplingConfig::with_temperature(0.0)
+                };
+                let mut streamed = Vec::new();
+                let mut logprob_tokens = 0;
+                let result =
+                    submit_with_stops_sampling(&scheduler, &[1, 10], 8, &["<STOP>"], &sampling)
+                        .wait(Some(&mut |piece: &TokenPiece<'_>| {
+                            streamed.extend_from_slice(piece);
+                            logprob_tokens += usize::from(piece.logprobs.is_some());
+                            true
+                        }))
+                        .expect("wait");
                 assert!(
                     result.finish_reason == FinishReason::StopSequence && !result.cancelled,
                     "stop sequence is a successful completion"
+                );
+                assert!(
+                    logprob_tokens == result.tokens.len()
+                        && result.logprobs.len() == result.tokens.len(),
+                    "stop filtering retains selected metadata and discards the speculative tail"
                 );
                 let text: &[u8] = if first { b"" } else { b"ab" };
                 assert!(
@@ -1044,7 +1079,13 @@ fn stop_sequences_preserve_executed_state() {
                 );
                 // Repeating the prompt must not resume from an incorrectly
                 // labelled frontier, also after a preview or speculative tail.
-                let replay = wait(&mut submit_with_stops(&scheduler, &[1, 10], 8, &["<STOP>"]));
+                let replay = wait(&mut submit_with_stops_sampling(
+                    &scheduler,
+                    &[1, 10],
+                    8,
+                    &["<STOP>"],
+                    &sampling,
+                ));
                 assert!(
                     replay.tokens == result.tokens && replay.text == result.text,
                     "a stopped request leaves a safe reusable prompt cache"
@@ -1279,7 +1320,7 @@ fn empty_token_is_published() {
     let scheduler = scheduler(&control, 1);
     let mut events = 0;
     let result = submit_streaming(&scheduler, &[1], 1)
-        .wait(Some(&mut |piece: &[u8]| {
+        .wait(Some(&mut |piece: &TokenPiece<'_>| {
             assert!(piece.is_empty(), "an empty token has no text bytes");
             events += 1;
             true
@@ -1293,6 +1334,137 @@ fn empty_token_is_published() {
         result.max_buffered_output_bytes >= 1,
         "an empty streamed piece still charges the output budget"
     );
+}
+
+/// Every selected token, preview and stop token included, carries its log
+/// probabilities exactly once, streamed and buffered alike; requests without
+/// them retain none, and the records count toward the buffered output
+/// bound but not toward the text byte limit (`TestTokenLogprobs`).
+#[test]
+fn token_logprobs() {
+    let logprobs = SamplingConfig {
+        logprobs: Some(2),
+        ..SamplingConfig::default()
+    };
+    let submit_logprobs = |scheduler: &Scheduler, prompt: &[Token], max_tokens, stream| {
+        scheduler
+            .submit(
+                prompt.to_vec(),
+                max_tokens,
+                &logprobs,
+                None,
+                stream,
+                RequestMetadata::default(),
+            )
+            .expect("submit")
+    };
+    for multi in [false, true] {
+        for preview in [false, true] {
+            let control = FakeControl::new(Config {
+                multi_token_decode: multi,
+                preview_first_token: preview,
+                stop_after: Some(3),
+                ..Config::default()
+            });
+            let scheduler = scheduler(&control, 2);
+            let mut request = submit_logprobs(&scheduler, &[1, 10, 11], 8, true);
+            let mut peer = submit(&scheduler, &[2, 20, 21], 2);
+            let mut observed = Vec::new();
+            let result = request
+                .wait(Some(&mut |piece: &TokenPiece<'_>| {
+                    let values = piece
+                        .logprobs
+                        .expect("every selected token carries metadata");
+                    observed.push(values.entries[0].id);
+                    true
+                }))
+                .expect("wait");
+            assert!(
+                result.tokens == expected_tokens(1, 3) && observed == expected_tokens(1, 4),
+                "preview and speculative blocks publish each token and EOS exactly once"
+            );
+            assert_eq!(
+                result.logprobs.len(),
+                observed.len(),
+                "stream and buffered records agree"
+            );
+            assert!(
+                wait(&mut peer).logprobs.is_empty(),
+                "concurrent disabled requests retain no metadata"
+            );
+            let resumed = wait(&mut submit_logprobs(&scheduler, &[1, 10, 11], 2, false));
+            assert_eq!(
+                resumed.logprobs.len(),
+                2,
+                "a reused session owns fresh logprob state"
+            );
+            let mut delivered = 0;
+            let cancelled = submit_logprobs(&scheduler, &[3, 30, 31], 8, true)
+                .wait(Some(&mut |piece: &TokenPiece<'_>| {
+                    assert!(
+                        piece.logprobs.is_some(),
+                        "cancelled stream retains delivered metadata"
+                    );
+                    delivered += 1;
+                    false
+                }))
+                .expect("wait");
+            assert!(
+                cancelled.cancelled && delivered == 1,
+                "cancellation stops metadata delivery with text"
+            );
+            let after_cancel = wait(&mut submit_logprobs(&scheduler, &[4, 40, 41], 2, false));
+            assert!(
+                after_cancel.logprobs.len() == 2
+                    && after_cancel.logprobs[0].entries[0].id == expected_tokens(4, 1)[0],
+                "reclaimed sessions do not leak cancelled metadata"
+            );
+        }
+    }
+    for stream in [false, true] {
+        let control = FakeControl::new(Config::default());
+        let policy = if stream {
+            TextSchedulerPolicy {
+                max_buffered_output_bytes_per_request: 32,
+                max_buffered_output_bytes_total: 32,
+                ..TextSchedulerPolicy::default()
+            }
+        } else {
+            TextSchedulerPolicy {
+                max_output_bytes_per_request: 32,
+                ..TextSchedulerPolicy::default()
+            }
+        };
+        let scheduler = make_scheduler(&control, 1, TextPrefillPolicy::default(), policy);
+        let sampling = SamplingConfig {
+            logprobs: Some(0),
+            ..SamplingConfig::default()
+        };
+        let outcome = scheduler
+            .submit(
+                vec![1, 10],
+                2,
+                &sampling,
+                None,
+                stream,
+                RequestMetadata::default(),
+            )
+            .expect("submit")
+            .wait(None);
+        if stream {
+            assert_eq!(
+                outcome.err().and_then(|e| generation_code(&e)),
+                Some(GenerationErrorCode::OutputBackpressure),
+                "metadata counts toward backpressure limits"
+            );
+        } else {
+            assert_eq!(
+                outcome.expect("wait").logprobs.len(),
+                2,
+                "metadata does not count toward the text byte limit"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1345,7 +1517,7 @@ fn first_token_precedes_snapshot_and_preserves_budget() {
                 let first_token = first_token.clone();
                 scope.spawn(move || {
                     request
-                        .wait(Some(&mut |_: &[u8]| {
+                        .wait(Some(&mut |_: &TokenPiece<'_>| {
                             first_token.release();
                             true
                         }))
@@ -1875,7 +2047,7 @@ fn prompt_progress_precedes_streamed_tokens() {
         let mut request = submit_with_progress(&scheduler, prompt, 2, stream, report_progress);
         request
             .wait_streaming(StreamCallbacks {
-                on_token: Some(&mut |_: &[u8]| {
+                on_token: Some(&mut |_: &TokenPiece<'_>| {
                     tokens.set(tokens.get() + 1);
                     true
                 }),
@@ -2304,7 +2476,7 @@ fn stream_start_precedes_prefill() {
                 let (starts, tokens) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
                 let result = request
                     .wait_streaming(StreamCallbacks {
-                        on_token: Some(&mut |_: &[u8]| {
+                        on_token: Some(&mut |_: &TokenPiece<'_>| {
                             tokens.set(tokens.get() + 1);
                             true
                         }),
@@ -2456,7 +2628,7 @@ fn abandoned_completed_streams_release_their_output() {
             "dropping completed output leaves the active request usable"
         );
         let mut output = Vec::new();
-        let mut callback = |piece: &[u8]| {
+        let mut callback = |piece: &TokenPiece<'_>| {
             output.extend_from_slice(piece);
             true
         };
@@ -2492,7 +2664,7 @@ fn completed_streams_outlive_their_scheduler() {
         }
         if consume {
             let mut output = Vec::new();
-            let mut callback = |piece: &[u8]| {
+            let mut callback = |piece: &TokenPiece<'_>| {
                 output.extend_from_slice(piece);
                 true
             };

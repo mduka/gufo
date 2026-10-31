@@ -169,8 +169,9 @@ Use `gufo serve embedding --model DIR` to serve the EmbeddingGemma 2 text embedd
 
 - `model` (`-m`) is the EmbeddingGemma 2 model directory
 - `servedModelName` is the model ID that clients send and `/v1/models` reports, `embeddinggemma-2` by default
+- `defaultPromptName` names a prompt from the checkpoint's `config_sentence_transformers.json` that prefixes text inputs of requests without `prompt_name`; image-only and audio-only inputs stay unprefixed; none by default
 
-The command takes the shared server options but not `--sessions` or `--context`, because requests take turns on one GPU encoder and the model fixes the context window.  The [server guide](SERVER.md#embeddings) lists the request fields, the limits, and the task prefixes the model expects.
+The command takes the shared server options but not `--sessions` or `--context`, because concurrent text requests share device batches on one encoder and the model fixes the context window.  The [server guide](SERVER.md#embeddings) lists the request fields, the limits, and the task prefixes the model expects.
 
 ```sh
 gufo serve --port 8080 embedding --model ./models/embeddinggemma-2
@@ -185,11 +186,16 @@ These apply to every modality, before or after the subcommand:
   port will not answer. Use `--host ::` to listen on IPv6 and IPv4 together.
 - `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
   sessions means more requests can compute at once, at the cost of memory
-  per session. This option applies to LLM serving; image and speech servers
-  use their own bounded queues. The embedding server gives concurrent requests
-  device turns in arrival order and is bounded by `--max-connections`.
+  per session. This option applies to LLM serving; image and speech servers use
+  their own bounded queues. The embedding server packs waiting text requests
+  into shared device batches and runs each request with images in its own
+  batch. `--max-connections` bounds the waiting requests.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:
-  clients beyond the limit queue or are refused instead of piling up.
+  clients beyond the limit queue or are refused instead of piling up. A
+  connection stops counting once its response is fully written, so a client
+  that reads its reply and reconnects immediately is not refused while the
+  server is still closing the old connection. Connections that are only
+  closing can briefly add to the count of open sockets.
 - `maxRequestBytes` — maximum request body size. In practice: matters mostly
   for ASR, since requests carry whole audio files (the audio benchmark used
   32 MiB).

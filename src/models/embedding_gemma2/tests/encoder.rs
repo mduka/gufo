@@ -1,6 +1,6 @@
 //! The GPU encoder against the f32 CPU reference on fixed token sequences;
 //! packing sequences into one batch must not change any embedding beyond
-//! rounding, and concurrent calls take device turns one batch at a time:
+//! rounding, and concurrent calls share device batches in arrival order:
 //! cargo test --profile gpu-test -p gufo-embedding-gemma2 --features gpu,models --test encoder
 
 #![cfg(all(feature = "gpu", feature = "models"))]
@@ -8,13 +8,13 @@
 
 mod common;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::cosine;
 use common::reference::CpuEncoder;
-use gufo_embedding_gemma2::EncoderRuntime;
-use gufo_embedding_gemma2::loader::load_model_directory;
+use gufo_embedding_gemma2::loader::{Towers, load_model_directory};
+use gufo_embedding_gemma2::{CancelCheck, EncoderRuntime};
 
 /// `<bos>`, ids from 1,000 to 100,999 and `<eos>`, deterministic per seed.
 fn random_tokens(length: usize, seed: u64) -> Vec<u32> {
@@ -32,9 +32,9 @@ fn random_tokens(length: usize, seed: u64) -> Vec<u32> {
 
 /// A long call holds the device for one batch at a time. A short call that
 /// arrives during the first batch runs before the second, and neither result
-/// changes. The cancellation hook runs at the start of each turn, so it
-/// records the order of turns.
-fn check_turns(runtime: &EncoderRuntime) {
+/// changes. The cancellation poll runs before each batch that would take the
+/// call's sequences, so it records the order of batches.
+fn check_turns(runtime: &Arc<EncoderRuntime>) {
     let long_call = vec![
         random_tokens(8000, 11),
         random_tokens(8000, 12),
@@ -44,10 +44,12 @@ fn check_turns(runtime: &EncoderRuntime) {
     let long_alone = runtime.embed(&long_call, None).unwrap();
     let short_alone = runtime.embed(&short_call, None).unwrap();
 
-    let order = Mutex::new(String::new());
-    let short_result = Mutex::new(None);
-    std::thread::scope(|scope| {
-        let on_long_turn = || {
+    let order = Arc::new(Mutex::new(String::new()));
+    let short_thread = Arc::new(Mutex::new(None));
+    let on_long_turn: CancelCheck = {
+        let (order, short_thread, runtime) = (order.clone(), short_thread.clone(), runtime.clone());
+        let short_call = short_call.clone();
+        Arc::new(move || {
             {
                 let mut order = order.lock().unwrap();
                 order.push('L');
@@ -55,37 +57,40 @@ fn check_turns(runtime: &EncoderRuntime) {
                     return false;
                 }
             }
-            scope.spawn(|| {
-                let on_short_turn = || {
+            let (order, runtime, short_call) = (order.clone(), runtime.clone(), short_call.clone());
+            *short_thread.lock().unwrap() = Some(std::thread::spawn(move || {
+                let on_short_turn: CancelCheck = Arc::new(move || {
                     order.lock().unwrap().push('S');
                     false
-                };
-                *short_result.lock().unwrap() =
-                    Some(runtime.embed(&short_call, Some(&on_short_turn)));
-            });
-            // The short call queues for a turn while this batch holds one.
+                });
+                runtime.embed(&short_call, Some(on_short_turn))
+            }));
+            // The short call queues while this batch holds the device.
             std::thread::sleep(Duration::from_millis(200));
             false
-        };
-        let long_result = runtime.embed(&long_call, Some(&on_long_turn)).unwrap();
-        for (result, alone) in long_result.iter().zip(&long_alone) {
-            assert!(
-                cosine(result, alone) > 0.9999,
-                "interleaving must not change a long-call embedding"
-            );
-        }
-    });
-    let order = order.into_inner().unwrap();
+        })
+    };
+    let long_result = runtime.embed(&long_call, Some(on_long_turn)).unwrap();
+    for (result, alone) in long_result.iter().zip(&long_alone) {
+        assert!(
+            cosine(result, alone) > 0.9999,
+            "interleaving must not change a long-call embedding"
+        );
+    }
+    let short_result = short_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the short call ran")
+        .join()
+        .unwrap()
+        .expect("the concurrent short call succeeds");
+    let order = order.lock().unwrap().clone();
     println!("turn order {order}");
     assert_eq!(
         order, "LSLL",
         "a short call runs between the batches of a long one"
     );
-    let short_result = short_result
-        .into_inner()
-        .unwrap()
-        .expect("the short call ran")
-        .expect("the concurrent short call succeeds");
     assert!(
         cosine(&short_result[0], &short_alone[0]) > 0.9999,
         "interleaving must not change a short-call embedding"
@@ -95,7 +100,7 @@ fn check_turns(runtime: &EncoderRuntime) {
 #[test]
 fn gpu_embeddings_match_the_cpu_reference_and_take_turns() {
     let root = common::checkpoint("model.safetensors");
-    let runtime = EncoderRuntime::create(&root).unwrap_or_else(|e| panic!("{e}"));
+    let runtime = Arc::new(EncoderRuntime::create(&root).unwrap_or_else(|e| panic!("{e}")));
     let sequences = vec![
         random_tokens(9, 1),
         random_tokens(24, 2),
@@ -105,7 +110,7 @@ fn gpu_embeddings_match_the_cpu_reference_and_take_turns() {
     let batched = runtime.embed(&sequences, None).unwrap();
     assert_eq!(batched.len(), sequences.len(), "one embedding per sequence");
 
-    let loaded = load_model_directory(&root).unwrap();
+    let loaded = load_model_directory(&root, Towers::default()).unwrap();
     let cpu = CpuEncoder::new(&loaded.config.text, &loaded.store);
     for (i, sequence) in sequences.iter().enumerate() {
         assert_eq!(batched[i].len(), 768, "embedding width");
@@ -141,9 +146,9 @@ fn gpu_embeddings_match_the_cpu_reference_and_take_turns() {
         runtime.embed(&[vec![2, 262_144]], None).is_err(),
         "out-of-range token is rejected"
     );
-    let cancelled = || true;
+    let cancelled: CancelCheck = Arc::new(|| true);
     assert_eq!(
-        runtime.embed(&sequences, Some(&cancelled)).err().unwrap(),
+        runtime.embed(&sequences, Some(cancelled)).err().unwrap(),
         gufo_embedding_gemma2::encoder::CANCELLED_MESSAGE,
         "a cancelled call fails before its first batch"
     );

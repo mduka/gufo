@@ -31,8 +31,13 @@ fn make_service(ready: bool) -> Arc<EmbeddingService> {
         validate_model: !ready,
         model_validator: Some(Box::new(|root| root.join("config.json").is_file())),
         model_id: "embedding-test".into(),
-        runner: Some(Box::new(|texts, batch, _| {
-            for text in texts {
+        runner: Some(Box::new(|inputs, _, batch, _| {
+            for input in inputs {
+                let text: String = input
+                    .content
+                    .iter()
+                    .map(|part| part.value.as_str())
+                    .collect();
                 batch.embeddings.push(vec![1.0, 0.0]);
                 batch.token_counts.push(text.len() + 2);
             }
@@ -97,8 +102,12 @@ impl EmbeddingServer {
     }
 
     fn post(&self, body: &str, extra_headers: &str) -> String {
+        self.post_to("/v1/embeddings", body, extra_headers)
+    }
+
+    fn post_to(&self, path: &str, body: &str, extra_headers: &str) -> String {
         self.send(&format!(
-            "POST /v1/embeddings HTTP/1.1\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
             body.len()
         ))
     }
@@ -135,6 +144,15 @@ fn an_embedding_only_server_serves_lists_and_reports_ready() {
     assert!(
         response.contains(r#""model":"embedding-test""#),
         "{response}"
+    );
+    // llama.cpp's native route shares the service and the API key (#813).
+    let native_request = r#"{"model":"embedding-test","content":[{"prompt_string":"hi"}]}"#;
+    expect_status(&server.post_to("/embeddings", native_request, ""), 401);
+    let native = server.post_to("/embeddings", native_request, auth);
+    expect_status(&native, 200);
+    assert!(
+        native.contains("\r\n\r\n[{\"index\":0,\"embedding\":[[1,0]]}]"),
+        "{native}"
     );
     let missing_model = server.post(r#"{"model":"other","input":"hi"}"#, auth);
     expect_status(&missing_model, 404);
@@ -173,6 +191,7 @@ fn without_an_embedding_service_the_route_is_absent_or_the_text_stub() {
     // A server with no text backend does not serve the route.
     let server = EmbeddingServer::new(None, HttpServerOptions::default());
     expect_status(&server.post(REQUEST, ""), 404);
+    expect_status(&server.post_to("/embeddings", REQUEST, ""), 404);
     // One with a backend keeps its stub.
     let text = RunningServer::new(HttpServerOptions::default());
     let response = text.post("/v1/embeddings", r#"{"input":"hi"}"#);
@@ -189,7 +208,7 @@ fn a_lost_device_answers_503_runs_the_hook_once_and_fails_health() {
         model_root: "/nonexistent/embeddinggemma".into(),
         validate_model: false,
         model_id: "embedding-test".into(),
-        runner: Some(Box::new(|_, _, _| EmbeddingStatus::DeviceLost)),
+        runner: Some(Box::new(|_, _, _, _| EmbeddingStatus::DeviceLost)),
         ..EmbeddingServiceOptions::default()
     }));
     let hook_calls = Arc::new(AtomicUsize::new(0));

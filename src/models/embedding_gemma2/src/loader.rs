@@ -104,9 +104,16 @@ pub struct ExpectedTensor {
     pub shape: Vec<u64>,
 }
 
-/// Indexes the text-backbone tensors of one safetensors file. Tensors that
-/// belong to the other towers are skipped without validation.
-fn load_safetensors(path: &Path) -> Result<TensorStore, String> {
+/// The towers a load includes besides the text backbone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Towers {
+    pub vision: bool,
+    pub audio: bool,
+}
+
+/// Indexes the requested backbones of one safetensors file. Unused towers
+/// are skipped without validation.
+fn load_safetensors(path: &Path, towers: Towers) -> Result<TensorStore, String> {
     let cannot_map = || format!("cannot map {}", path.display());
     let file = MappedFile::open(path).map_err(|_| cannot_map())?;
     let bytes = file.bytes();
@@ -129,7 +136,12 @@ fn load_safetensors(path: &Path) -> Result<TensorStore, String> {
     let available = (bytes.len() - payload_offset) as u64;
     let mut tensors = HashMap::new();
     for (name, specification) in header.members() {
-        if name == "__metadata__" || !name.starts_with(TEXT_TENSOR_PREFIX) {
+        let included = name.starts_with(TEXT_TENSOR_PREFIX)
+            || (towers.vision
+                && (name.starts_with("vision_tower.") || name.starts_with("embed_vision.")))
+            || (towers.audio
+                && (name.starts_with("audio_tower.") || name.starts_with("embed_audio.")));
+        if name == "__metadata__" || !included {
             continue;
         }
         if !specification.is_object() {
@@ -250,9 +262,124 @@ pub fn expected_text_tensors(config: &TextConfig) -> Vec<ExpectedTensor> {
     tensors
 }
 
+fn expected(name: String, shape: &[u64]) -> ExpectedTensor {
+    ExpectedTensor {
+        name,
+        shape: shape.to_vec(),
+    }
+}
+
+/// The vision tower and its projection (`ExpectedVisionTensors`).
+pub fn expected_vision_tensors() -> Vec<ExpectedTensor> {
+    let mut tensors = vec![
+        expected(
+            "vision_tower.patch_embedder.input_proj.weight".into(),
+            &[768, 768],
+        ),
+        expected(
+            "vision_tower.patch_embedder.position_embedding_table".into(),
+            &[2, 10240, 768],
+        ),
+        expected(
+            "embed_vision.embedding_projection.weight".into(),
+            &[512, 768],
+        ),
+    ];
+    for i in 0..16 {
+        let p = format!("vision_tower.encoder.layers.{i}.");
+        for name in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+        ] {
+            tensors.push(expected(format!("{p}{name}"), &[768]));
+        }
+        for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            tensors.push(expected(
+                format!("{p}self_attn.{name}.linear.weight"),
+                &[768, 768],
+            ));
+        }
+        for name in ["q_norm.weight", "k_norm.weight"] {
+            tensors.push(expected(format!("{p}self_attn.{name}"), &[64]));
+        }
+        for name in ["gate_proj", "up_proj"] {
+            tensors.push(expected(
+                format!("{p}mlp.{name}.linear.weight"),
+                &[3072, 768],
+            ));
+        }
+        tensors.push(expected(
+            format!("{p}mlp.down_proj.linear.weight"),
+            &[768, 3072],
+        ));
+    }
+    tensors
+}
+
+/// The audio tower and its projection (`ExpectedAudioTensors`).
+pub fn expected_audio_tensors() -> Vec<ExpectedTensor> {
+    let s = "audio_tower.subsample_conv_projection.";
+    let mut tensors = vec![
+        expected(format!("{s}layer0.conv.weight"), &[128, 1, 3, 3]),
+        expected(format!("{s}layer0.norm.weight"), &[128]),
+        expected(format!("{s}layer1.conv.weight"), &[32, 128, 3, 3]),
+        expected(format!("{s}layer1.norm.weight"), &[32]),
+        expected(format!("{s}input_proj_linear.weight"), &[1024, 1024]),
+        expected("audio_tower.output_proj.weight".into(), &[1536, 1024]),
+        expected("audio_tower.output_proj.bias".into(), &[1536]),
+        expected(
+            "embed_audio.embedding_projection.weight".into(),
+            &[512, 1536],
+        ),
+    ];
+    for i in 0..12 {
+        let p = format!("audio_tower.layers.{i}.");
+        let linear = |tensors: &mut Vec<ExpectedTensor>, name: &str, out: u64, input: u64| {
+            tensors.push(expected(format!("{p}{name}.linear.weight"), &[out, input]));
+            for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                tensors.push(expected(format!("{p}{name}.{bound}"), &[]));
+            }
+        };
+        for ff in ["feed_forward1.", "feed_forward2."] {
+            linear(&mut tensors, &format!("{ff}ffw_layer_1"), 4096, 1024);
+            linear(&mut tensors, &format!("{ff}ffw_layer_2"), 1024, 4096);
+            for norm in ["pre_layer_norm.weight", "post_layer_norm.weight"] {
+                tensors.push(expected(format!("{p}{ff}{norm}"), &[1024]));
+            }
+        }
+        for proj in ["q_proj", "k_proj", "v_proj", "post"] {
+            linear(&mut tensors, &format!("self_attn.{proj}"), 1024, 1024);
+        }
+        tensors.push(expected(
+            format!("{p}self_attn.relative_k_proj.weight"),
+            &[1024, 1024],
+        ));
+        tensors.push(expected(format!("{p}self_attn.per_dim_scale"), &[128]));
+        linear(&mut tensors, "lconv1d.linear_start", 2048, 1024);
+        linear(&mut tensors, "lconv1d.linear_end", 1024, 1024);
+        tensors.push(expected(
+            format!("{p}lconv1d.depthwise_conv1d.weight"),
+            &[1024, 1, 5],
+        ));
+        for norm in [
+            "lconv1d.pre_layer_norm.weight",
+            "lconv1d.conv_norm.weight",
+            "norm_pre_attn.weight",
+            "norm_post_attn.weight",
+            "norm_out.weight",
+        ] {
+            tensors.push(expected(format!("{p}{norm}"), &[1024]));
+        }
+    }
+    tensors
+}
+
 /// `LoadModelDirectory`: maps `<model_dir>/model.safetensors`, indexes the
-/// text-backbone tensors and checks each against the configuration.
-pub fn load_model_directory(model_dir: &Path) -> Result<LoadedModel, String> {
+/// text backbone and the requested towers, and checks each tensor against
+/// the configuration. Audio tensors are skipped unless requested.
+pub fn load_model_directory(model_dir: &Path, towers: Towers) -> Result<LoadedModel, String> {
     let config = ModelConfig::load(model_dir).ok_or_else(|| {
         format!(
             "embedding_gemma2: cannot parse {}/config.json",
@@ -264,9 +391,22 @@ pub fn load_model_directory(model_dir: &Path) -> Result<LoadedModel, String> {
             "embedding_gemma2: expected the google/embeddinggemma-2 BF16 configuration".into(),
         );
     }
-    let store = load_safetensors(&model_dir.join("model.safetensors"))
+    let store = load_safetensors(&model_dir.join("model.safetensors"), towers)
         .map_err(|error| format!("embedding_gemma2: {error}"))?;
-    for expected in expected_text_tensors(&config.text) {
+    let mut expected_tensors = expected_text_tensors(&config.text);
+    if towers.vision {
+        if !config.supported_vision {
+            return Err("embedding_gemma2: unsupported vision configuration".into());
+        }
+        expected_tensors.extend(expected_vision_tensors());
+    }
+    if towers.audio {
+        if !config.supported_audio {
+            return Err("embedding_gemma2: unsupported audio configuration".into());
+        }
+        expected_tensors.extend(expected_audio_tensors());
+    }
+    for expected in expected_tensors {
         let tensor = store
             .find(&expected.name)
             .ok_or_else(|| format!("embedding_gemma2: missing tensor {}", expected.name))?;

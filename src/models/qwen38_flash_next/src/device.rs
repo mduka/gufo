@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use gufo_formats::GgmlType;
 use gufo_hip::{
-    DeviceTensor, F16, LoadedWeights, MappedFile, Pending, Placement, QuantSlice, QuantTensor,
-    Stream, WeightLoader,
+    DeviceSlice, DeviceTensor, F16, LoadedWeights, MappedFile, Pending, Placement, QuantSlice,
+    QuantTensor, Stream, WeightLoader,
 };
 use gufo_qwen38_flash_next_kernels as k;
 
@@ -341,6 +341,10 @@ enum Queued {
     Vector(Pending<f32>),
     /// F32 stacks narrowed to F16 after loading.
     Narrow(Pending<f32>, u64, u64),
+    /// Q8_0 stacks expanded to F32, then narrowed to F16 after loading.
+    NarrowQ8(Pending<u8>, u64, u64),
+    /// Q8_0 matrices expanded to F32 after loading.
+    Expand(Pending<u8>, u64, u64, u64),
     /// `nextn.eh_proj`, split into its two halves after loading.
     Split(Pending<u8>, TensorRef),
 }
@@ -519,27 +523,45 @@ impl<'s> Uploader<'s> {
                 Queued::Narrow(pending, rows, cols) => {
                     let source = sources.get(pending);
                     let count = (rows * cols) as usize;
-                    let mut half = self
+                    matrix = Some(self.narrow(source.slice(0..count), rows, cols)?);
+                }
+                Queued::NarrowQ8(pending, rows, cols) => {
+                    let source = sources.get(pending);
+                    let count = (rows * cols) as usize;
+                    // Freed once narrowed, like the C++ conversion source.
+                    let mut values = self.stream.alloc_persistent::<f32>(count).map_err(error)?;
+                    k::expand_q8_0(
+                        self.stream,
+                        source.slice(0..count / 32 * 34),
+                        values.as_mut_slice(),
+                        count,
+                    )
+                    .map_err(|e| format!("weight conversion failed: {e}"))?;
+                    matrix = Some(self.narrow(values.as_slice(), rows, cols)?);
+                }
+                Queued::Expand(pending, rows, cols, experts) => {
+                    let source = sources.get(pending);
+                    let count = (rows * cols * experts) as usize;
+                    let mut values = self
                         .stream
-                        .alloc_persistent::<u8>(count * 2 + TAIL)
+                        .alloc_persistent::<u8>(count * 4 + TAIL)
                         .map_err(error)?;
-                    let target = half
-                        .slice_mut(0..count * 2)
-                        .cast::<F16>()
-                        .ok_or("misaligned F16 stack")?;
-                    k::narrow_f16(self.stream, source.slice(0..count), target, count)
+                    let target = values
+                        .slice_mut(0..count * 4)
+                        .cast::<f32>()
+                        .ok_or("misaligned F32 weights")?;
+                    k::expand_q8_0(self.stream, source.slice(0..count / 32 * 34), target, count)
                         .map_err(|e| format!("weight conversion failed: {e}"))?;
                     self.stream
-                        .fill_bytes(half.slice_mut(count * 2..count * 2 + TAIL), 0)
+                        .fill_bytes(values.slice_mut(count * 4..count * 4 + TAIL), 0)
                         .map_err(error)?;
-                    let tensor = half.freeze(self.stream).map_err(error)?;
-                    self.resident_bytes += count * 2 + TAIL;
-                    self.max_half_cols = self.max_half_cols.max(cols as usize);
+                    let tensor = values.freeze(self.stream).map_err(error)?;
+                    self.resident_bytes += count * 4 + TAIL;
                     matrix = Some(Matrix::quant(
-                        QuantTensor::new(tensor, GgmlType::F16),
+                        QuantTensor::new(tensor, GgmlType::F32),
                         rows,
                         cols,
-                        1,
+                        experts,
                     ));
                 }
                 Queued::Split(pending, t) => {
@@ -593,6 +615,40 @@ impl<'s> Uploader<'s> {
         // waited for it before their arenas can go.
         drop((loaded, sources));
         Ok(out)
+    }
+
+    /// The F16 copy of an F32 stack of `rows` x `cols`, which the wide-batch
+    /// GEMM tier runs at speed.
+    fn narrow(
+        &mut self,
+        source: DeviceSlice<'_, f32>,
+        rows: u64,
+        cols: u64,
+    ) -> Result<Matrix, String> {
+        let error = |e: gufo_hip::HipError| format!("weight conversion failed: {e}");
+        let count = (rows * cols) as usize;
+        let mut half = self
+            .stream
+            .alloc_persistent::<u8>(count * 2 + TAIL)
+            .map_err(error)?;
+        let target = half
+            .slice_mut(0..count * 2)
+            .cast::<F16>()
+            .ok_or("misaligned F16 stack")?;
+        k::narrow_f16(self.stream, source, target, count)
+            .map_err(|e| format!("weight conversion failed: {e}"))?;
+        self.stream
+            .fill_bytes(half.slice_mut(count * 2..count * 2 + TAIL), 0)
+            .map_err(error)?;
+        let tensor = half.freeze(self.stream).map_err(error)?;
+        self.resident_bytes += count * 2 + TAIL;
+        self.max_half_cols = self.max_half_cols.max(cols as usize);
+        Ok(Matrix::quant(
+            QuantTensor::new(tensor, GgmlType::F16),
+            rows,
+            cols,
+            1,
+        ))
     }
 }
 
@@ -780,6 +836,29 @@ impl Group<'_, '_> {
         ))))
     }
 
+    /// A narrow projection the quantized tier does not cover (the
+    /// hyper-connection inject) as F32. A Q8_0 tensor is loaded as is and
+    /// expanded after loading, so it runs the F32 kernels with its
+    /// dequantized values instead of quantizing their activations.
+    fn matrix_f32(&mut self, t: &TensorRef) -> Result<Slot, String> {
+        if t.ty != GgmlType::Q8_0 {
+            return self.matrix(t);
+        }
+        let file = Arc::clone(self.file(t)?);
+        let pending = self
+            .sources
+            .add_parts::<u8>(&[(&file, t.offset, t.bytes)], 0)
+            .map_err(|e| Self::fail(t, e))?;
+        // The C++ upload copies the Q8_0 tensor first, which sizes the decode
+        // staging for its width too.
+        if t.experts == 1 {
+            self.up.max_q8_cols = self.up.max_q8_cols.max(t.cols as usize);
+        }
+        Ok(Slot(
+            self.push(Queued::Expand(pending, t.rows, t.cols, t.experts)),
+        ))
+    }
+
     /// An F32 vector (norms, biases, convolution taps).
     fn vector(&mut self, t: &TensorRef) -> Result<VectorSlot, String> {
         let file = Arc::clone(self.file(t)?);
@@ -793,8 +872,10 @@ impl Group<'_, '_> {
     }
 
     /// Matrices of one type and width stacked along rows: Q8_0 into one
-    /// decode GEMV, F32 (router, alpha/beta) narrowed to F16 afterwards.
-    fn stack(&mut self, parts: &[&TensorRef]) -> Result<Slot, String> {
+    /// decode GEMV, unless `expand_q8` asks for the F32 stack's F16 route
+    /// over its dequantized values; F32 (router, alpha/beta) narrowed to F16
+    /// afterwards.
+    fn stack(&mut self, parts: &[&TensorRef], expand_q8: bool) -> Result<Slot, String> {
         let first = parts[0];
         let ty = first.ty;
         if parts.iter().any(|t| t.ty != ty || t.cols != first.cols)
@@ -814,6 +895,11 @@ impl Group<'_, '_> {
         let rows: u64 = parts.iter().map(|t| t.rows).sum();
         let bytes: usize = parts.iter().map(|t| t.bytes).sum();
         let fail = |e| format!("upload failed for {}: {e}", first.name);
+        if ty == GgmlType::Q8_0 && expand_q8 {
+            // The Q8_0 source lives only until it is expanded and narrowed.
+            let pending = self.sources.add_parts::<u8>(&ranges, 0).map_err(fail)?;
+            return Ok(Slot(self.push(Queued::NarrowQ8(pending, rows, first.cols))));
+        }
         if ty == GgmlType::Q8_0 {
             let pending = self.loader.add_parts::<u8>(&ranges, TAIL).map_err(fail)?;
             self.up.resident_bytes += bytes + TAIL;
@@ -841,7 +927,7 @@ impl Group<'_, '_> {
             norm: self.vector(&m.norm)?,
             down: self.matrix(&m.down)?,
             up: self.matrix(&m.up)?,
-            inject: m.inject.as_ref().map(|t| self.matrix(t)).transpose()?,
+            inject: m.inject.as_ref().map(|t| self.matrix_f32(t)).transpose()?,
         })
     }
 
@@ -858,7 +944,7 @@ impl Group<'_, '_> {
         let block = match &l.mixer {
             MixerKind::Linear(s) => {
                 let (ssm_in, qkv, gate) = if stackable(&[&s.qkv, &s.gate]) {
-                    (Some(self.stack(&[&s.qkv, &s.gate])?), None, None)
+                    (Some(self.stack(&[&s.qkv, &s.gate], false)?), None, None)
                 } else {
                     (
                         None,
@@ -871,7 +957,7 @@ impl Group<'_, '_> {
                     qkv,
                     gate,
                     conv1d: self.vector(&s.conv1d)?,
-                    alpha_beta: self.stack(&[&s.alpha, &s.beta])?,
+                    alpha_beta: self.stack(&[&s.alpha, &s.beta], true)?,
                     dt: self.vector(&s.dt)?,
                     a: self.vector(&s.a)?,
                     norm: self.vector(&s.norm)?,
@@ -880,7 +966,12 @@ impl Group<'_, '_> {
             }
             MixerKind::Attention(a) => {
                 let (qkv, q, k, v) = if stackable(&[&a.q, &a.k, &a.v]) {
-                    (Some(self.stack(&[&a.q, &a.k, &a.v])?), None, None, None)
+                    (
+                        Some(self.stack(&[&a.q, &a.k, &a.v], false)?),
+                        None,
+                        None,
+                        None,
+                    )
                 } else {
                     (
                         None,
@@ -917,7 +1008,7 @@ impl Group<'_, '_> {
         };
         let m = &l.moe;
         let moe = MoeSlots {
-            router: self.stack(&[&m.router, &m.shexp_gate_inp])?,
+            router: self.stack(&[&m.router, &m.shexp_gate_inp], false)?,
             gate_exps: self.matrix(&m.gate_exps)?,
             up_exps: self.matrix(&m.up_exps)?,
             down_exps: self.matrix(&m.down_exps)?,

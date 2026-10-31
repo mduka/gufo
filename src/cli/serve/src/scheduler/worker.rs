@@ -342,7 +342,7 @@ impl<R: TextModelRunner> Worker<R> {
         if work.stop_filter.enabled() {
             let tail = work.stop_filter.finish();
             work.result.text.extend_from_slice(&tail);
-            if !tail.is_empty() && !work.shared.publish_piece(tail) {
+            if !tail.is_empty() && !work.shared.publish_piece(tail, None) {
                 return Err(Error::generation(
                     GenerationErrorCode::OutputBackpressure,
                     "text generation buffered output limit exceeded",

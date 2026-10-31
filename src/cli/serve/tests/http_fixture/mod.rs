@@ -18,10 +18,11 @@ use gufo_core::text::{
 use gufo_serve::backend::InitialOutputState;
 use gufo_serve::backend::{
     FinishReason, GenerationRequest, GenerationResult, PromptProgress, SamplingDefaults,
-    SessionState, StreamCallbacks, TextGenerationBackend, TokenCallback, ToolFormat,
+    SessionState, StreamCallbacks, TextGenerationBackend, TokenCallback, TokenPiece, ToolFormat,
 };
 use gufo_serve::http::server::{HttpServer, HttpServices};
 use gufo_serve::http::{HttpResponse, HttpServerOptions, StreamLog};
+use gufo_serve::logprobs::{DecodedLogprob, DecodedLogprobs};
 
 use crate::common::Semaphore;
 
@@ -36,6 +37,13 @@ pub struct Call {
 }
 
 pub struct FakeBackend {
+    /// The served names, the primary first.
+    pub names: Mutex<Vec<String>>,
+    /// What `render_chat_prompt` returns, or the template error it raises.
+    pub rendered_prompt: Mutex<Option<String>>,
+    pub render_error: Mutex<Option<String>>,
+    /// The request `render_chat_prompt` saw last.
+    pub rendered_chat: Mutex<ChatRequest>,
     pub calls: AtomicI32,
     pub failure: AtomicI32,
     pub wait_for_disconnect: AtomicBool,
@@ -49,6 +57,7 @@ pub struct FakeBackend {
     pub last_ignore_eos: AtomicBool,
     /// `cache_prompt` of the last raw completion.
     pub last_cache_prompt: AtomicBool,
+    pub last_cache_persist: AtomicBool,
     pub sessions: Mutex<Vec<SessionState>>,
     /// Prompt progress that started requests report before generating.
     pub progress: Mutex<Vec<PromptProgress>>,
@@ -90,6 +99,7 @@ impl FakeBackend {
             defaults: Mutex::new(SamplingDefaults::default()),
             last_ignore_eos: AtomicBool::new(false),
             last_cache_prompt: AtomicBool::new(true),
+            last_cache_persist: AtomicBool::new(true),
             sessions: Mutex::new(Vec::new()),
             progress: Mutex::new(Vec::new()),
             image_support: AtomicBool::new(false),
@@ -107,6 +117,10 @@ impl FakeBackend {
             last: Mutex::new(Call::default()),
             output: Mutex::new(b"ok".to_vec()),
             initial: Mutex::new(InitialOutputState::Auto),
+            names: Mutex::new(vec!["test".into()]),
+            rendered_prompt: Mutex::new(None),
+            render_error: Mutex::new(None),
+            rendered_chat: Mutex::new(ChatRequest::default()),
         }
     }
 
@@ -211,6 +225,10 @@ impl TextGenerationBackend for FakeBackend {
         "test".into()
     }
 
+    fn model_ids(&self) -> Vec<String> {
+        self.names.lock().expect("names").clone()
+    }
+
     fn ready(&self) -> bool {
         true
     }
@@ -226,6 +244,14 @@ impl TextGenerationBackend for FakeBackend {
 
     fn reasoning_defaults(&self) -> ReasoningOptions {
         *self.reasoning.lock().expect("reasoning")
+    }
+
+    fn render_chat_prompt(&self, request: &ChatRequest) -> Result<Option<String>> {
+        *self.rendered_chat.lock().expect("rendered") = request.clone();
+        if let Some(message) = self.render_error.lock().expect("error").clone() {
+            return Err(Error::invalid(message));
+        }
+        Ok(self.rendered_prompt.lock().expect("prompt").clone())
     }
 
     fn max_context(&self) -> u32 {
@@ -279,6 +305,7 @@ impl TextGenerationBackend for FakeBackend {
         stop_sequences: &[String],
         _: bool,
         cache_prompt: bool,
+        cache_persist: bool,
     ) -> Result<Option<Box<dyn GenerationRequest>>> {
         self.last_ignore_eos.store(ignore_eos, Ordering::SeqCst);
         let (prompt, sampling) = (prompt.to_owned(), sampling.clone());
@@ -294,6 +321,7 @@ impl TextGenerationBackend for FakeBackend {
                     &client_id,
                     &stop_sequences,
                     cache_prompt,
+                    cache_persist,
                 )
             }),
             None,
@@ -328,13 +356,16 @@ impl TextGenerationBackend for FakeBackend {
         max_tokens: usize,
         sampling: &SamplingConfig,
         is_cancelled: Option<&CancellationCheck>,
-        on_token: Option<&mut dyn FnMut(&[u8]) -> bool>,
+        on_token: Option<&mut dyn FnMut(&TokenPiece<'_>) -> bool>,
         client_id: &str,
         stop_sequences: &[String],
         cache_prompt: bool,
+        cache_persist: bool,
     ) -> Result<GenerationResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.last_cache_prompt.store(cache_prompt, Ordering::SeqCst);
+        self.last_cache_persist
+            .store(cache_persist, Ordering::SeqCst);
         match self.failure.load(Ordering::SeqCst) {
             1 => return Err(Error::length("context exceeded")),
             2 => return Err(Error::invalid("invalid prompt")),
@@ -405,15 +436,34 @@ impl TextGenerationBackend for FakeBackend {
         if !pieces.is_empty() {
             result.text = pieces.concat();
         }
+        if let Some(count) = sampling.logprobs {
+            let mut probabilities = DecodedLogprobs::default();
+            probabilities.entries.push(DecodedLogprob {
+                id: 3,
+                token: String::from_utf8_lossy(&result.text).into_owned(),
+                logprob: -3.0,
+            });
+            if count > 0 {
+                probabilities.entries.push(DecodedLogprob {
+                    id: 1,
+                    token: "alternative".into(),
+                    logprob: -0.5,
+                });
+            }
+            result.logprobs.push(probabilities);
+        }
         if let Some(on_token) = on_token
             && failure != 8
         {
             std::thread::sleep(*self.token_delay.lock().expect("delay"));
             if pieces.is_empty() {
-                let _ = on_token(&result.text);
+                let _ = on_token(&TokenPiece::with_logprobs(
+                    &result.text,
+                    result.logprobs.first(),
+                ));
             }
             for piece in &pieces {
-                if !on_token(piece) {
+                if !on_token(&TokenPiece::new(piece)) {
                     break;
                 }
             }
@@ -437,7 +487,7 @@ impl TextGenerationBackend for FakeBackend {
         max_tokens: usize,
         sampling: &SamplingConfig,
         is_cancelled: Option<&CancellationCheck>,
-        on_token: Option<&mut dyn FnMut(&[u8]) -> bool>,
+        on_token: Option<&mut dyn FnMut(&TokenPiece<'_>) -> bool>,
     ) -> Result<GenerationResult> {
         let result = self.complete(
             "",
@@ -448,6 +498,7 @@ impl TextGenerationBackend for FakeBackend {
             &request.client_id,
             &request.stop_sequences,
             request.cache_prompt,
+            request.cache_persist,
         )?;
         self.last.lock().expect("last").chat = request.clone();
         Ok(result)

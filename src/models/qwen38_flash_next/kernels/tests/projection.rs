@@ -2,7 +2,8 @@
 //! 2- to N-row launch equals its single-row result bit for bit, the matrix
 //! tiles of wide shapes included, and nothing is written past the output
 //! (`CheckDecodeGrouping` of the C++
-//! `tests/models/qwen38_flash_next/projection_ops_test.cpp`):
+//! `tests/models/qwen38_flash_next/projection_ops_test.cpp`); Q8_0 weights
+//! expanded to F32 equal their codes (`CheckExpandQ8_0`):
 //! cargo test -p gufo-qwen38-flash-next-kernels --features gpu --test projection
 
 #![cfg(feature = "gpu")]
@@ -144,4 +145,50 @@ fn batched_rows_keep_their_vector_arithmetic() {
     ] {
         check_decode_grouping(m, k);
     }
+}
+
+/// Q8_0 inject and alpha/beta weights are expanded to F32 at load: every
+/// value equals its block scale times its code, and nothing past `count` is
+/// written (`CheckExpandQ8_0`).
+fn check_expand_q8_0(m: usize, k: usize, seed: u32) {
+    let stream = Stream::new().unwrap();
+    let host_w = weights(m, k, seed);
+    let count = m * k;
+    let mut w = stream.alloc::<u8>(host_w.len()).unwrap();
+    stream.upload(&host_w, w.as_mut_slice()).unwrap();
+    let mut out = stream.alloc::<f32>(count + 64).unwrap();
+    stream.fill_bytes(out.as_mut_slice(), 0x7F).unwrap();
+    k::expand_q8_0(
+        &stream,
+        w.slice(0..count / 32 * 34),
+        out.slice_mut(0..count),
+        count,
+    )
+    .unwrap();
+    let mut back = vec![0f32; count + 64];
+    stream.download(out.as_slice(), &mut back).unwrap();
+    for (block, values) in host_w[..count / 32 * 34]
+        .chunks(34)
+        .zip(back[..count].chunks(32))
+    {
+        let bits = u16::from_le_bytes([block[0], block[1]]);
+        let e = i32::from((bits >> 10) & 0x1f) - 15;
+        let scale = (1.0 + f32::from(bits & 0x3ff) / 1024.0) * 2f32.powi(e);
+        for (&q, &value) in block[2..].iter().zip(values) {
+            let want = scale * f32::from(q as i8);
+            assert_eq!(value.to_bits(), want.to_bits(), "{m} x {k}");
+        }
+    }
+    assert!(
+        back[count..].iter().all(|v| v.to_bits() == 0x7F7F_7F7F),
+        "Q8_0 expansion wrote past its count"
+    );
+}
+
+#[test]
+fn q8_0_weights_expand_to_their_codes() {
+    // The hc_*_inject [4][10240] and stacked ssm_alpha/beta [96][2560]
+    // shapes.
+    check_expand_q8_0(4, 10240, 0xE8A4D1);
+    check_expand_q8_0(96, 2560, 0xE8A4D2);
 }

@@ -54,6 +54,8 @@ def main() -> None:
                         help="clean antirez/ds4 checkout at the pinned reference revision")
     parser.add_argument("--prefill-only", action="store_true",
                         help="reference: compare post-prefill logits, skipping continuations")
+    parser.add_argument("--narrow", action="store_true",
+                        help="reference: use 32-token calls at the 4K/12K regression points")
     parser.add_argument("--ar-log", type=Path)
     parser.add_argument("--dspark-log", type=Path)
     parser.add_argument("--repetitions", type=int, default=2)
@@ -74,6 +76,8 @@ def main() -> None:
         parser.error("the reference suite runs its Python tools in nix develop")
     if args.prefill_only and args.suite != "reference":
         parser.error("--prefill-only requires the reference suite")
+    if args.narrow and args.suite != "reference":
+        parser.error("--narrow requires the reference suite")
     if args.suite == "benchmark":
         if not args.ar_log or not args.dspark_log or not args.output:
             parser.error("benchmark requires --ar-log, --dspark-log and --output")
@@ -125,7 +129,8 @@ def main() -> None:
     if reference:
         from reference import run
         run(Path(environment["GUFO_DEEPSEEK_V4_FLASH_MODEL"]),
-            args.output.resolve(), args.upstream.resolve(), environment, args.prefill_only)
+            args.output.resolve(), args.upstream.resolve(), environment,
+            args.prefill_only, args.narrow)
 
 
 if __name__ == "__main__":

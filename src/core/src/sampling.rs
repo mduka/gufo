@@ -13,6 +13,10 @@ use crate::text::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct SamplingConfig {
+    /// Observational raw target log probabilities of this many top
+    /// candidates (0..=20) besides the selected token; `None` collects
+    /// none.
+    pub logprobs: Option<u32>,
     pub temperature: f32,
     pub top_k: i32,
     pub top_p: f32,
@@ -49,7 +53,8 @@ pub struct ReasoningBudget {
 /// Equal controls, the same bound grammar and the same reasoning budget.
 impl PartialEq for SamplingConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.temperature == other.temperature
+        self.logprobs == other.logprobs
+            && self.temperature == other.temperature
             && self.top_k == other.top_k
             && self.top_p == other.top_p
             && self.min_p == other.min_p
@@ -71,6 +76,7 @@ impl PartialEq for SamplingConfig {
 impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
+            logprobs: None,
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
@@ -196,6 +202,8 @@ pub fn resolve_text_sampling(
         if set { value } else { preset }
     }
     SamplingConfig {
+        // Like every control without a preset, log probabilities start off.
+        logprobs: None,
         temperature: pick(
             supplied.temperature,
             configured.temperature,
@@ -243,6 +251,9 @@ impl SamplingConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.logprobs.is_some_and(|count| count > MAX_LOGPROBS) {
+            return Err(Error::invalid("logprobs must be between 0 and 20"));
+        }
         if self
             .constraint
             .as_ref()
@@ -309,6 +320,86 @@ impl SamplingConfig {
 
 /// Token IDs of a logit row (`sampling::TokenId`).
 pub type TokenId = u32;
+
+/// The most top candidates a request may ask log probabilities for.
+pub const MAX_LOGPROBS: u32 = 20;
+
+/// A token's log probability (`TokenLogprob`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TokenLogprob {
+    pub token: TokenId,
+    pub logprob: f64,
+}
+
+/// The selected token's log probability and the top candidates'
+/// (`TokenLogprobs`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TokenLogprobs {
+    pub selected: TokenLogprob,
+    pub top: Vec<TokenLogprob>,
+}
+
+/// Full-vocabulary log-softmax of the raw target `logits`, before any
+/// sampling transformation (`CollectLogprobs`): `selected`'s value and the
+/// `count` best candidates (higher logit first, then lower ID); `None`
+/// without a count.
+pub fn collect_logprobs(
+    logits: &[f32],
+    selected: TokenId,
+    count: Option<u32>,
+) -> Result<Option<TokenLogprobs>> {
+    let Some(count) = count else {
+        return Ok(None);
+    };
+    if count > MAX_LOGPROBS || selected as usize >= logits.len() {
+        return Err(Error::invalid("invalid logprob selection"));
+    }
+    let mut maximum = f64::NEG_INFINITY;
+    for &value in logits {
+        if value.is_nan() || value == f32::INFINITY {
+            return Err(Error::runtime("non-finite target logits"));
+        }
+        maximum = maximum.max(f64::from(value));
+    }
+    if !maximum.is_finite() {
+        return Err(Error::runtime("target logits contain no finite values"));
+    }
+    let mut sum = 0.0f64;
+    for &value in logits {
+        sum += (f64::from(value) - maximum).exp();
+    }
+    let log_sum = sum.ln();
+    let entry = |token: TokenId| TokenLogprob {
+        token,
+        logprob: (f64::from(logits[token as usize]) - maximum) - log_sum,
+    };
+    let mut result = TokenLogprobs {
+        selected: entry(selected),
+        top: Vec::new(),
+    };
+    if count > 0 {
+        // `std::partial_sort` under a strict total order: the same prefix.
+        let better = |a: &TokenId, b: &TokenId| {
+            let (left, right) = (logits[*a as usize], logits[*b as usize]);
+            if left == right {
+                a.cmp(b)
+            } else if left > right {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        };
+        let mut ids: Vec<TokenId> = (0..logits.len() as TokenId).collect();
+        let size = (count as usize).min(ids.len());
+        if size < ids.len() {
+            ids.select_nth_unstable_by(size, better);
+        }
+        ids.truncate(size);
+        ids.sort_unstable_by(better);
+        result.top = ids.into_iter().map(entry).collect();
+    }
+    Ok(Some(result))
+}
 
 /// Per-token penalty counts: the repetition window flag and the count over
 /// the whole generated response (`TokenPenalty`).

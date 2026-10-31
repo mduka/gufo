@@ -606,6 +606,19 @@ params = [
 probes = [{ count = 1000 }]
 
 [[launcher]]
+name = "expand_q8_0"
+cpp = "ExpandQ8_0"
+returns = "void"
+doc = "F32 values of `count` Q8_0 weights, each code times its block's scale: Q8_0 inject and alpha/beta weights run their F32 routes."
+params = [
+  { name = "q8", kind = "in", elem = "bytes", len = "count / 32 * 34" },
+  { name = "out", kind = "out", elem = "f32", len = "count" },
+  { name = "count", kind = "scalar", type = "usize" },
+]
+requires = ["count % 32 == 0"]
+probes = [{ count = 40960 }, { count = 32 }]
+
+[[launcher]]
 name = "narrow_bf16"
 cpp = "NarrowActivations"
 returns = "void"
@@ -827,7 +840,7 @@ probes = [
 name = "dense_f16_ssm_gemm"
 cpp = "DenseF16SsmGemm"
 returns = "supported"
-doc = "The Q8_0 SSM projection [16384 x 2560] fused with the four-tap convolution of its first `channels` rows (at least 1024 tokens); qkvz keeps every Z row and the QKV rows at tile boundaries and, for a nonzero checkpoint_tokens, the three before that token."
+doc = "The Q8_0 SSM projection [16384 x 2560] fused with the four-tap convolution of its first `channels` rows (at least 1024 tokens); qkvz keeps every Z row and the QKV rows at tile boundaries and, for a nonzero checkpoint_tokens, the three before that token. With `z_stream`, the launcher records `z_start` after the QKV tiles and queues the Z tiles on `z_stream`: the Z rows of qkvz are complete only after an event the caller records there, which their reader waits for (`z_ready` of the gated DeltaNet)."
 params = [
   { name = "w", kind = "quant", rows = "m", cols = "k", formats = ["Q8_0"] },
   { name = "x", kind = "in", elem = "f16", len = "n_tokens * k" },
@@ -842,6 +855,8 @@ params = [
   { name = "kernel", kind = "scalar", type = "u32" },
   { name = "stream", kind = "stream" },
   { name = "checkpoint_tokens", kind = "scalar", type = "u32" },
+  { name = "z_stream", kind = "side_stream" },
+  { name = "z_start", kind = "event" },
 ]
 requires = ["kernel >= 1", "checkpoint_tokens <= n_tokens"]
 probes = [
@@ -1201,6 +1216,7 @@ params = [
   { name = "checkpoint_state", kind = "out", elem = "f32", len = "v_heads * 128 * 128", optional = true },
   { name = "checkpoint_history", kind = "out", elem = "f32", len = "(kernel - 1) * (2 * k_heads * 128 + v_heads * 128)", optional = true },
   { name = "checkpoint_tokens", kind = "scalar", type = "u32" },
+  { name = "z_ready", kind = "event" },
 ]
 # The row-split recurrence keeps its scales in qn and its decays in kn.
 requires = ["n_tokens >= 1", "checkpoint_tokens <= n_tokens", "kernel >= 1", "k_heads >= 1", "2 * v_heads <= k_heads * 128"]
@@ -1254,6 +1270,7 @@ params = [
   { name = "checkpoint_state", kind = "out", elem = "f32", len = "v_heads * 128 * 128", optional = true },
   { name = "checkpoint_history", kind = "out", elem = "f32", len = "(kernel - 1) * (2 * k_heads * 128 + v_heads * 128)", optional = true },
   { name = "checkpoint_tokens", kind = "scalar", type = "u32" },
+  { name = "z_ready", kind = "event" },
 ]
 # The row-split recurrence keeps its scales in qn and its decays in kn.
 requires = ["n_tokens >= 1", "checkpoint_tokens <= n_tokens", "kernel >= 1", "k_heads >= 1", "2 * v_heads <= k_heads * 128"]
@@ -1305,6 +1322,7 @@ params = [
   { name = "checkpoint_state", kind = "out", elem = "f32", len = "v_heads * 128 * 128", optional = true },
   { name = "checkpoint_history", kind = "out", elem = "f32", len = "(kernel - 1) * (2 * k_heads * 128 + v_heads * 128)", optional = true },
   { name = "checkpoint_tokens", kind = "scalar", type = "u32" },
+  { name = "z_ready", kind = "event" },
 ]
 requires = ["n_tokens >= 1", "checkpoint_tokens <= n_tokens", "kernel >= 1", "k_heads >= 1", "2 * v_heads <= k_heads * 128"]
 probes = [
@@ -1354,6 +1372,7 @@ params = [
   { name = "checkpoint_state", kind = "out", elem = "f32", len = "v_heads * 128 * 128", optional = true },
   { name = "checkpoint_history", kind = "out", elem = "f32", len = "(kernel - 1) * (2 * k_heads * 128 + v_heads * 128)", optional = true },
   { name = "checkpoint_tokens", kind = "scalar", type = "u32" },
+  { name = "z_ready", kind = "event" },
 ]
 requires = ["n_tokens >= 1", "checkpoint_tokens <= n_tokens", "kernel >= 1", "k_heads >= 1", "2 * v_heads <= k_heads * 128"]
 probes = [
@@ -1402,6 +1421,7 @@ params = [
   { name = "checkpoint_state", kind = "out", elem = "f32", len = "v_heads * 128 * 128", optional = true },
   { name = "checkpoint_history", kind = "out", elem = "f32", len = "(kernel - 1) * (2 * k_heads * 128 + v_heads * 128)", optional = true },
   { name = "checkpoint_tokens", kind = "scalar", type = "u32" },
+  { name = "z_ready", kind = "event" },
 ]
 requires = ["n_tokens >= 1", "checkpoint_tokens <= n_tokens", "kernel >= 1", "k_heads >= 1", "2 * v_heads <= k_heads * 128", "out_half_stride >= v_heads * 128"]
 probes = [
@@ -1780,7 +1800,7 @@ probes = [
 name = "wmma_causal_attention_sparse"
 cpp = "WmmaCausalAttention"
 returns = "supported"
-doc = "wmma_causal_attention in the sparse window: earlier blocks only where the query's mask bit is set (at most 2,048 mask words)."
+doc = "wmma_causal_attention in the sparse window: earlier blocks only where the query's mask bit is set (a live extent of at most 2^28 blocks, `WmmaCausalAttentionContextLimit`)."
 params = [
   { name = "q", kind = "in", elem = "f32", len = "n_tokens * heads * d" },
   { name = "gate", kind = "in", elem = "f32", len = "n_tokens * heads * d" },
@@ -1803,6 +1823,7 @@ requires = ["start_pos + n_tokens <= max_context", "ratio >= 1", "(start_pos + n
 probes = [
   { n_tokens = 40, start_pos = 300, mask_words = 3, heads = 24, kv_heads = 2, d = 256, ratio = 4, last_only = false, max_context = 340 },
   { n_tokens = 9, start_pos = 70000, mask_words = 548, heads = 24, kv_heads = 2, d = 256, ratio = 4, last_only = true, max_context = 70009 },
+  { n_tokens = 4, start_pos = 262141, mask_words = 2053, heads = 24, kv_heads = 2, d = 256, ratio = 4, last_only = false, max_context = 262145 },
 ]
 
 

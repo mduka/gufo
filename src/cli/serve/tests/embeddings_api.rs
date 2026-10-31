@@ -9,9 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gufo_core::json::{self, Value};
+use gufo_core::text::CancellationCheck;
 use gufo_serve::embedding_service::{
-    EmbeddingBatch, EmbeddingEngine, EmbeddingRunner, EmbeddingService, EmbeddingServiceOptions,
-    EmbeddingStatus,
+    EmbeddingBatch, EmbeddingEngine, EmbeddingInput, EmbeddingPartType, EmbeddingRequestOptions,
+    EmbeddingRunner, EmbeddingService, EmbeddingServiceOptions, EmbeddingStatus, EngineMedia,
+    EngineSequence, MAX_INPUT_TOKENS, load_sentence_transformer_prompts, truncate_keeping_images,
 };
 use gufo_serve::embeddings_api::{handle_embeddings_api_request, is_embeddings_api_path};
 use gufo_serve::http::{HttpRequest, HttpResponse};
@@ -49,19 +51,37 @@ fn fake_tokens(text: &str) -> usize {
 struct FakeRunner {
     calls: AtomicI32,
     last_texts: Mutex<Vec<String>>,
+    last_truncate: AtomicBool,
+}
+
+/// The text of an input: its parts joined, as the service tokenizes them.
+fn joined(input: &EmbeddingInput) -> String {
+    input
+        .content
+        .iter()
+        .map(|part| part.value.as_str())
+        .collect()
 }
 
 impl FakeRunner {
     fn run(
         &self,
-        texts: &[String],
+        inputs: &[EmbeddingInput],
+        request: &EmbeddingRequestOptions,
         batch: &mut EmbeddingBatch,
         error: &mut String,
     ) -> EmbeddingStatus {
+        let texts: Vec<String> = inputs.iter().map(joined).collect();
         self.calls.fetch_add(1, Ordering::SeqCst);
-        *self.last_texts.lock().unwrap() = texts.to_vec();
+        *self.last_texts.lock().unwrap() = texts.clone();
+        self.last_truncate.store(request.truncate, Ordering::SeqCst);
         for (i, text) in texts.iter().enumerate() {
             if text.starts_with("TOOLONG") {
+                if request.truncate {
+                    batch.embeddings.push(fake_embedding(text));
+                    batch.token_counts.push(MAX_INPUT_TOKENS);
+                    continue;
+                }
                 batch.failed_index = i;
                 return EmbeddingStatus::InputTooLong;
             }
@@ -91,8 +111,8 @@ fn service_with(runner: EmbeddingRunner) -> Arc<EmbeddingService> {
 
 fn make_service(runner: &Arc<FakeRunner>) -> Arc<EmbeddingService> {
     let runner = runner.clone();
-    service_with(Box::new(move |texts, batch, error| {
-        runner.run(texts, batch, error)
+    service_with(Box::new(move |inputs, request, batch, error| {
+        runner.run(inputs, request, batch, error)
     }))
 }
 
@@ -118,6 +138,42 @@ fn send_with(
 
 fn send(service: &Arc<EmbeddingService>, body: &str) -> HttpResponse {
     send_with(service, body, "POST", None)
+}
+
+fn send_to(service: &Arc<EmbeddingService>, path: &str, body: &str) -> HttpResponse {
+    handle_embeddings_api_request(
+        &HttpRequest {
+            method: "POST".into(),
+            path: path.into(),
+            body: body.as_bytes().to_vec(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            ..HttpRequest::default()
+        },
+        service,
+    )
+    .unwrap()
+}
+
+/// A service whose runner records the inputs it receives.
+fn capturing_service() -> (
+    Arc<EmbeddingService>,
+    Arc<Mutex<Vec<EmbeddingInput>>>,
+    Arc<AtomicI32>,
+) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicI32::new(0));
+    let (c, n) = (captured.clone(), calls.clone());
+    let service = service_with(Box::new(move |inputs, _, batch, _| {
+        n.fetch_add(1, Ordering::SeqCst);
+        *c.lock().unwrap() = inputs.to_vec();
+        for input in inputs {
+            let text = joined(input);
+            batch.embeddings.push(fake_embedding(&text));
+            batch.token_counts.push(fake_tokens(&text));
+        }
+        EmbeddingStatus::Ok
+    }));
+    (service, captured, calls)
 }
 
 fn parse(response: &HttpResponse) -> Value {
@@ -477,7 +533,7 @@ fn input_validation() {
             "non-string user",
         ),
         (
-            r#"{"input":"x","truncate":true}"#,
+            r#"{"input":"x","normalize":true}"#,
             400,
             "unsupported_field",
             "unknown member",
@@ -609,7 +665,7 @@ fn limits_and_failures() {
     );
 
     // A runner that returns fewer vectors than inputs is a server bug.
-    let short_service = service_with(Box::new(|_, batch, _| {
+    let short_service = service_with(Box::new(|_, _, batch, _| {
         batch.embeddings = vec![fake_embedding("only")];
         batch.token_counts = vec![3];
         EmbeddingStatus::Ok
@@ -647,9 +703,9 @@ fn cancellation() {
     // sent.
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = cancelled.clone();
-    let cancelling = service_with(Box::new(move |texts, batch, _| {
+    let cancelling = service_with(Box::new(move |inputs, _, batch, _| {
         flag.store(true, Ordering::SeqCst);
-        batch.embeddings = vec![fake_embedding(&texts[0])];
+        batch.embeddings = vec![fake_embedding(&joined(&inputs[0]))];
         batch.token_counts = vec![3];
         EmbeddingStatus::Ok
     }));
@@ -678,7 +734,7 @@ fn service_lifecycle() {
     assert_eq!(service.model_id(), "embeddinggemma-2", "model id kept");
     let defaulted = EmbeddingService::new(EmbeddingServiceOptions {
         validate_model: false,
-        runner: Some(Box::new(|_, _, _| EmbeddingStatus::Ok)),
+        runner: Some(Box::new(|_, _, _, _| EmbeddingStatus::Ok)),
         ..EmbeddingServiceOptions::default()
     });
     assert_eq!(defaulted.model_id(), "embeddinggemma-2", "default model id");
@@ -689,7 +745,7 @@ fn service_lifecycle() {
         model_root: "/nonexistent/embeddinggemma".into(),
         validate_model: true,
         model_validator: Some(Box::new(|root| root.join("config.json").is_file())),
-        runner: Some(Box::new(|_, _, _| EmbeddingStatus::Ok)),
+        runner: Some(Box::new(|_, _, _, _| EmbeddingStatus::Ok)),
         ..EmbeddingServiceOptions::default()
     });
     assert!(
@@ -699,7 +755,7 @@ fn service_lifecycle() {
     let mut batch = EmbeddingBatch::default();
     let mut error = String::new();
     assert!(
-        invalid.embed(&["x".into()], &|| false, &mut batch, &mut error) == EmbeddingStatus::Failed
+        invalid.embed(&["x".into()], None, &mut batch, &mut error) == EmbeddingStatus::Failed
             && !error.is_empty(),
         "a service that is not ready refuses work"
     );
@@ -722,12 +778,12 @@ fn service_lifecycle() {
     let (a, o) = (active.clone(), overlapped.clone());
     let serial = Arc::new(EmbeddingService::new(EmbeddingServiceOptions {
         validate_model: false,
-        runner: Some(Box::new(move |texts, out, _| {
+        runner: Some(Box::new(move |inputs, _, out, _| {
             if a.fetch_add(1, Ordering::SeqCst) != 0 {
                 o.fetch_add(1, Ordering::SeqCst);
             }
             std::thread::sleep(Duration::from_millis(5));
-            out.embeddings = vec![fake_embedding(&texts[0])];
+            out.embeddings = vec![fake_embedding(&joined(&inputs[0]))];
             out.token_counts = vec![3];
             a.fetch_sub(1, Ordering::SeqCst);
             EmbeddingStatus::Ok
@@ -741,7 +797,7 @@ fn service_lifecycle() {
                 let mut result = EmbeddingBatch::default();
                 let mut error = String::new();
                 assert_eq!(
-                    serial.embed(&["x".into()], &|| false, &mut result, &mut error),
+                    serial.embed(&["x".into()], None, &mut result, &mut error),
                     EmbeddingStatus::Ok,
                     "concurrent embed succeeds"
                 );
@@ -779,13 +835,50 @@ impl EmbeddingEngine for FakeEngine {
         ids
     }
 
+    fn encode_truncated(&self, text: &str, max_tokens: usize) -> Vec<u32> {
+        let mut ids = self.encode(text);
+        if ids.len() > max_tokens && max_tokens >= 2 {
+            let end = ids.len() - 1;
+            ids.drain(max_tokens - 1..end);
+        }
+        ids
+    }
+
+    fn supports_vision(&self) -> bool {
+        false
+    }
+
+    fn supports_audio(&self) -> bool {
+        false
+    }
+
+    fn image_processor_error(&self) -> String {
+        String::new()
+    }
+
+    fn audio_processor_error(&self) -> String {
+        String::new()
+    }
+
+    fn process_image(&self, _: &[u8]) -> Result<EngineMedia, String> {
+        Err("no images".into())
+    }
+
+    fn process_audio(
+        &self,
+        _: &[u8],
+        _: Option<&CancellationCheck>,
+    ) -> Result<EngineMedia, String> {
+        Err("no audio".into())
+    }
+
     fn embed(
         &self,
-        sequences: &[Vec<u32>],
-        is_cancelled: &dyn Fn() -> bool,
+        sequences: Vec<EngineSequence>,
+        is_cancelled: Option<CancellationCheck>,
     ) -> Result<Vec<Vec<f32>>, String> {
-        *self.sequences.lock().unwrap() = sequences.to_vec();
-        if is_cancelled() {
+        *self.sequences.lock().unwrap() = sequences.iter().map(|s| s.tokens.clone()).collect();
+        if is_cancelled.is_some_and(|cancelled| cancelled()) {
             return Err("embedding_gemma2: request cancelled".into());
         }
         if self.fail {
@@ -814,10 +907,35 @@ fn native_service(fail: bool) -> (Arc<EmbeddingService>, Arc<FakeEngine>) {
         fn encode(&self, text: &str) -> Vec<u32> {
             self.0.encode(text)
         }
+        fn encode_truncated(&self, text: &str, max_tokens: usize) -> Vec<u32> {
+            self.0.encode_truncated(text, max_tokens)
+        }
+        fn supports_vision(&self) -> bool {
+            self.0.supports_vision()
+        }
+        fn supports_audio(&self) -> bool {
+            self.0.supports_audio()
+        }
+        fn image_processor_error(&self) -> String {
+            self.0.image_processor_error()
+        }
+        fn audio_processor_error(&self) -> String {
+            self.0.audio_processor_error()
+        }
+        fn process_image(&self, bytes: &[u8]) -> Result<EngineMedia, String> {
+            self.0.process_image(bytes)
+        }
+        fn process_audio(
+            &self,
+            bytes: &[u8],
+            is_cancelled: Option<&CancellationCheck>,
+        ) -> Result<EngineMedia, String> {
+            self.0.process_audio(bytes, is_cancelled)
+        }
         fn embed(
             &self,
-            sequences: &[Vec<u32>],
-            is_cancelled: &dyn Fn() -> bool,
+            sequences: Vec<EngineSequence>,
+            is_cancelled: Option<CancellationCheck>,
         ) -> Result<Vec<Vec<f32>>, String> {
             self.0.embed(sequences, is_cancelled)
         }
@@ -906,4 +1024,716 @@ fn the_native_engine_tokenizes_limits_and_reports_device_loss() {
         "lost device",
     );
     assert!(lost.device_lost());
+}
+
+#[test]
+fn typed_input() {
+    let (service, captured, _) = capturing_service();
+    let response = send(
+        &service,
+        r#"{"input":["plain",{"content":[{"type":"text","text":"before"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"text","text":"after"}]},{"content":[{"type":"text","text":"typed"}]}]}"#,
+    );
+    assert_eq!(response.status, 200, "typed input succeeds");
+    {
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.len() == 3 && captured[1].content.len() == 3,
+            "typed inputs preserve item and part counts"
+        );
+        assert!(
+            captured[0].content[0].value == "plain"
+                && captured[1].content[0].value == "before"
+                && captured[1].content[1].kind == EmbeddingPartType::Image
+                && captured[1].content[1].value == "data:image/png;base64,AAAA"
+                && captured[1].content[2].value == "after"
+                && captured[2].content[0].value == "typed",
+            "typed inputs preserve order and image URL"
+        );
+    }
+    for body in [
+        r#"{"input":[{"content":[]}]}"#,
+        r#"{"input":[{"content":[{"type":"text","text":""}]}]}"#,
+    ] {
+        expect_error(
+            &send(&service, body),
+            400,
+            "empty_input",
+            "empty typed input",
+        );
+    }
+    for body in [
+        r#"{"input":[{"content":"x"}]}"#,
+        r#"{"input":[{"content":[true]}]}"#,
+        r#"{"input":[{"content":[{"type":"text","text":3}]}]}"#,
+        r#"{"input":[{"content":[{"type":"image_url","image_url":"x"}]}]}"#,
+        r#"{"input":[{"content":[{"type":"image_url","image_url":{"url":""}}]}]}"#,
+        r#"{"input":[{"content":[{"type":"image_url","image_url":{"url":"x","detail":"low"}}]}]}"#,
+    ] {
+        expect_error(
+            &send(&service, body),
+            400,
+            "invalid_parameter_type",
+            "malformed typed input",
+        );
+    }
+    expect_error(
+        &send(
+            &service,
+            r#"{"input":[{"content":[{"type":"input_audio","input_audio":{}}]}]}"#,
+        ),
+        400,
+        "invalid_parameter_type",
+        "audio source is required",
+    );
+    let audio = send(
+        &service,
+        r#"{"input":["plain",{"content":[{"type":"input_audio","input_audio":{"data":"AAAA","url":"ignored","format":"ignored"}},{"type":"text","text":"middle"},{"type":"input_audio","input_audio":{"url":"https://example.com/test.wav"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}"#,
+    );
+    {
+        let captured = captured.lock().unwrap();
+        assert!(
+            audio.status == 200 && captured.len() == 2 && captured[1].content.len() == 4,
+            "audio and mixed content are accepted"
+        );
+        let parts = &captured[1].content;
+        assert!(
+            parts[0].kind == EmbeddingPartType::Audio
+                && parts[0].value == "AAAA"
+                && parts[1].value == "middle"
+                && parts[2].kind == EmbeddingPartType::Audio
+                && parts[2].value == "https://example.com/test.wav"
+                && parts[3].kind == EmbeddingPartType::Image,
+            "audio data precedence and part order match the request"
+        );
+    }
+    for body in [
+        r#"{"input":[{"content":[{"type":"input_audio","input_audio":null}]}]}"#,
+        r#"{"input":[{"content":[{"type":"input_audio","input_audio":{"data":7}}]}]}"#,
+        r#"{"input":[{"content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":7}}]}]}"#,
+        r#"{"input":[{"content":[{"type":"input_audio","input_audio":{"data":"AAAA","other":"x"}}]}]}"#,
+    ] {
+        expect_error(
+            &send(&service, body),
+            400,
+            "invalid_parameter_type",
+            "malformed audio part",
+        );
+    }
+    let many = |part: &str| {
+        format!(
+            r#"{{"input":[{{"content":[{}]}}]}}"#,
+            vec![part; 33].join(",")
+        )
+    };
+    expect_error(
+        &send(
+            &service,
+            &many(r#"{"type":"input_audio","input_audio":{"data":"AAAA"}}"#),
+        ),
+        400,
+        "too_many_audio",
+        "audio count bounded before decoding",
+    );
+    expect_error(
+        &send(
+            &service,
+            &many(r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}"#),
+        ),
+        400,
+        "too_many_images",
+        "image count bounded before reading",
+    );
+}
+
+#[test]
+fn native_embeddings() {
+    assert!(
+        is_embeddings_api_path("/embeddings")
+            && is_embeddings_api_path("/embedding")
+            && !is_embeddings_api_path("/embeddings/")
+            && !is_embeddings_api_path("/v1/embedding"),
+        "native embeddings paths are recognized exactly"
+    );
+    let (service, captured, calls) = capturing_service();
+
+    // Frigate's text request.
+    let text = send_to(
+        &service,
+        "/embeddings",
+        r#"{"model":"embeddinggemma-2","content":[{"prompt_string":"a red car"},{"prompt_string":"a dog"}]}"#,
+    );
+    assert_eq!(text.status, 200, "native text request succeeds");
+    let body = parse(&text);
+    assert!(
+        body.is_array() && body.len() == 2,
+        "native response is a bare array"
+    );
+    for (i, item) in body.items().iter().enumerate() {
+        assert!(
+            item.len() == 2 && item.member_size("index", 99) == i,
+            "native items carry only index and embedding, in order"
+        );
+        let nested = item.find("embedding").unwrap();
+        assert!(
+            nested.is_array() && nested.len() == 1,
+            "the pooled vector is nested"
+        );
+        assert_eq!(
+            floats_of(&nested.items()[0]),
+            fake_embedding(if i == 0 { "a red car" } else { "a dog" }),
+            "native floats round-trip exactly"
+        );
+    }
+    {
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.len() == 2
+                && captured[0].content.len() == 1
+                && captured[0].content[0].kind == EmbeddingPartType::Text
+                && captured[0].content[0].value == "a red car",
+            "a prompt_string without media is one text part"
+        );
+    }
+
+    // Frigate's image request: the marker, a newline, and one base64 JPEG.
+    let image = send_to(
+        &service,
+        "/embeddings",
+        r#"{"model":"embeddinggemma-2","content":[{"prompt_string":"<__media__>\n","multimodal_data":["/9j/AAAA"]}]}"#,
+    );
+    assert_eq!(image.status, 200, "native image request succeeds");
+    {
+        let captured = captured.lock().unwrap();
+        let parts = &captured[0].content;
+        assert!(
+            captured.len() == 1
+                && parts.len() == 2
+                && parts[0].kind == EmbeddingPartType::Image
+                && parts[0].value == "data:image/jpeg;base64,/9j/AAAA"
+                && parts[1].kind == EmbeddingPartType::Text
+                && parts[1].value == "\n",
+            "the marker becomes the image part, in place, before the newline"
+        );
+    }
+    let around = send_to(
+        &service,
+        "/embedding",
+        r#"{"content":{"prompt_string":"before <__media__> mid <__media__>","multimodal_data":["AAAA","BBBB"]}}"#,
+    );
+    assert_eq!(
+        around.status, 200,
+        "legacy path and a single prompt object work"
+    );
+    {
+        let captured = captured.lock().unwrap();
+        let values: Vec<&str> = captured[0]
+            .content
+            .iter()
+            .map(|p| p.value.as_str())
+            .collect();
+        assert_eq!(
+            values,
+            [
+                "before ",
+                "data:image/jpeg;base64,AAAA",
+                " mid ",
+                "data:image/jpeg;base64,BBBB"
+            ],
+            "text around markers keeps its order and whitespace"
+        );
+    }
+
+    // Like llama.cpp's mtmd helper, files that look like WAV, MP3 or FLAC
+    // (and Ogg) become audio parts; WebP's RIFF container and PNG stay
+    // images.
+    let media = send_to(
+        &service,
+        "/embeddings",
+        r#"{"content":{"prompt_string":"<__media__><__media__><__media__><__media__><__media__><__media__><__media__>","multimodal_data":["UklGRiQAAABXQVZFZm10IA==","SUQzBAAAAAAAAAAA","//uQAAAAAAAAAAAA","ZkxhQwAAACIAAAAA","T2dnUwACAAAAAAAA","UklGRiQAAABXRUJQVlA4IA==","iVBORw0KGgoAAAANSUhEUg=="]}}"#,
+    );
+    assert_eq!(media.status, 200, "native audio files succeed");
+    {
+        use EmbeddingPartType::{Audio, Image};
+        let captured = captured.lock().unwrap();
+        let kinds: Vec<EmbeddingPartType> = captured[0].content.iter().map(|p| p.kind).collect();
+        assert_eq!(kinds, [Audio, Audio, Audio, Audio, Audio, Image, Image]);
+        assert_eq!(
+            captured[0].content[0].value, "UklGRiQAAABXQVZFZm10IA==",
+            "multimodal_data audio is kept as raw base64"
+        );
+    }
+
+    // The same text embeds identically on both routes; `input` wins over
+    // `content`, as in llama.cpp.
+    let plain = send_to(&service, "/embeddings", r#"{"input":"x","content":"y"}"#);
+    assert_eq!(plain.status, 200, "input and content together succeed");
+    assert_eq!(captured.lock().unwrap()[0].content[0].value, "x");
+    let oai = send(&service, r#"{"input":"x"}"#);
+    assert_eq!(
+        floats_of(&parse(&plain).items()[0].find("embedding").unwrap().items()[0]),
+        floats_of(
+            parse(&oai).find("data").unwrap().items()[0]
+                .find("embedding")
+                .unwrap()
+        ),
+        "both routes return the same vector"
+    );
+    assert_eq!(
+        send_to(
+            &service,
+            "/embeddings",
+            r#"{"content":"y","embd_normalize":2,"encoding_format":"float"}"#
+        )
+        .status,
+        200
+    );
+    let base64 = send_to(
+        &service,
+        "/embeddings",
+        r#"{"content":"y","encoding_format":"base64"}"#,
+    );
+    assert!(
+        base64.status == 200
+            && parse(&base64).items()[0].find("embedding").unwrap().items()[0].is_array(),
+        "the native form returns floats for base64 too"
+    );
+    assert_eq!(
+        send_to(
+            &service,
+            "/embeddings",
+            r#"{"content":[{"content":[{"type":"text","text":"typed"}]}]}"#
+        )
+        .status,
+        200,
+        "typed content objects work here too"
+    );
+
+    let before = calls.load(Ordering::SeqCst);
+    expect_error(
+        &send_to(&service, "/embeddings", r#"{"model":"embeddinggemma-2"}"#),
+        400,
+        "missing_input",
+        "native request without input or content",
+    );
+    for (body, what) in [
+        (
+            r#"{"content":[{"prompt_string":"<__media__><__media__>","multimodal_data":["AAAA"]}]}"#,
+            "more markers than files",
+        ),
+        (
+            r#"{"content":[{"prompt_string":"x","multimodal_data":["AAAA"]}]}"#,
+            "a file without a marker",
+        ),
+    ] {
+        expect_error(
+            &send_to(&service, "/embeddings", body),
+            400,
+            "invalid_multimodal_data",
+            what,
+        );
+    }
+    for bad in [
+        r#"{"content":[{"prompt_string":3}]}"#,
+        r#"{"content":[{"prompt_string":"x","extra":1}]}"#,
+        r#"{"content":[{"prompt_string":"x","multimodal_data":"AAAA"}]}"#,
+        r#"{"content":[{"prompt_string":"<__media__>","multimodal_data":[""]}]}"#,
+        r#"{"content":[{"prompt_string":"<__media__>","multimodal_data":[7]}]}"#,
+    ] {
+        expect_error(
+            &send_to(&service, "/embeddings", bad),
+            400,
+            "invalid_parameter_type",
+            bad,
+        );
+    }
+    expect_error(
+        &send_to(
+            &service,
+            "/embeddings",
+            r#"{"content":[{"prompt_string":""}]}"#,
+        ),
+        400,
+        "empty_input",
+        "empty prompt_string",
+    );
+    expect_error(
+        &send_to(&service, "/embeddings", r#"{"content":[1,2,3]}"#),
+        400,
+        "unsupported_input",
+        "token arrays stay unsupported",
+    );
+    for normalize in ["-1", "0", "1", "3", r#""2""#] {
+        expect_error(
+            &send_to(
+                &service,
+                "/embeddings",
+                &format!(r#"{{"content":"y","embd_normalize":{normalize}}}"#),
+            ),
+            400,
+            "unsupported_embd_normalize",
+            normalize,
+        );
+    }
+    expect_error(
+        &send_to(
+            &service,
+            "/embeddings",
+            r#"{"content":"y","encoding_format":"int8"}"#,
+        ),
+        400,
+        "invalid_encoding_format",
+        "encoding_format is validated",
+    );
+    expect_error(
+        &send_to(
+            &service,
+            "/embeddings",
+            r#"{"content":"y","pooling":"none"}"#,
+        ),
+        400,
+        "unsupported_field",
+        "unknown native fields are rejected",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        before,
+        "rejected native requests never reach the runner"
+    );
+    // The OpenAI route keeps its own field set.
+    expect_error(
+        &send(&service, r#"{"content":"y"}"#),
+        400,
+        "unsupported_field",
+        "no content",
+    );
+    expect_error(
+        &send(&service, r#"{"input":"y","embd_normalize":2}"#),
+        400,
+        "unsupported_field",
+        "no embd_normalize",
+    );
+    expect_error(
+        &send(&service, r#"{"input":[{"prompt_string":"y"}]}"#),
+        400,
+        "invalid_parameter_type",
+        "no prompt objects",
+    );
+}
+
+/// A response's structure: array lengths, member names and float-vector
+/// widths, in the fixture's form.
+fn skeleton(value: &Value) -> Value {
+    match value {
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_number) => {
+            Value::object().with("floats", items.len())
+        }
+        Value::Array(items) => {
+            let mut list = Value::object().with("list", items.len());
+            if let Some(first) = items.first() {
+                list.set("item", skeleton(first));
+            }
+            list
+        }
+        Value::Object(members) => {
+            let mut object = Value::object();
+            for (name, member) in members {
+                object.set(name, skeleton(member));
+            }
+            object
+        }
+        other => other.clone(),
+    }
+}
+
+/// llama.cpp's captured responses and Frigate's requests
+/// (`TestNativeReferenceFixture`).
+#[test]
+fn native_reference_fixture() {
+    let text = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llama_cpp_native_embeddings.json"
+    ))
+    .unwrap();
+    let fixture = json::parse(&text).unwrap();
+    let runner = Arc::new(FakeRunner::default());
+    let service = make_service(&runner);
+    let cases = fixture.find("llama_cpp").unwrap().find("cases").unwrap();
+    assert!(cases.len() >= 6, "fixture holds the llama.cpp cases");
+    for item in cases.items() {
+        let mut request = item.find("request").unwrap().clone();
+        // The capture served another model name.
+        if request.contains("model") {
+            request.set("model", "embeddinggemma-2");
+        }
+        let request = request.dump().unwrap();
+        let response = send_to(&service, &item.member_str("path", ""), &request);
+        assert_eq!(
+            usize::from(response.status),
+            item.member_size("status", 0),
+            "{request}"
+        );
+        assert_eq!(
+            skeleton(&parse(&response)).dump().unwrap(),
+            item.find("response").unwrap().dump().unwrap(),
+            "llama.cpp response shape for {request}"
+        );
+    }
+    let frigate = fixture.find("frigate").unwrap();
+    let path = frigate.member_str("path", "");
+    let texts = send_to(
+        &service,
+        &path,
+        &frigate.find("text").unwrap().dump().unwrap(),
+    );
+    assert!(texts.status == 200 && parse(&texts).len() == 2);
+    let image = send_to(
+        &service,
+        &path,
+        &frigate.find("image").unwrap().dump().unwrap(),
+    );
+    assert!(image.status == 200 && parse(&image).len() == 1);
+}
+
+#[test]
+fn truncate() {
+    let runner = Arc::new(FakeRunner::default());
+    let service = make_service(&runner);
+    expect_error(
+        &send(&service, r#"{"input":["short","TOOLONG input"]}"#),
+        400,
+        "context_length_exceeded",
+        "default refuses",
+    );
+    assert!(
+        !runner.last_truncate.load(Ordering::SeqCst),
+        "truncation is off by default"
+    );
+    expect_error(
+        &send(&service, r#"{"input":"TOOLONG input","truncate":false}"#),
+        400,
+        "context_length_exceeded",
+        "truncate false refuses",
+    );
+    let cut = send(
+        &service,
+        r#"{"input":["short","TOOLONG input"],"truncate":true}"#,
+    );
+    assert_eq!(cut.status, 200, "truncate true embeds an over-length input");
+    assert!(
+        runner.last_truncate.load(Ordering::SeqCst),
+        "truncate true reaches the service"
+    );
+    let body = parse(&cut);
+    assert_eq!(
+        body.find("data").unwrap().len(),
+        2,
+        "both inputs are embedded"
+    );
+    assert_eq!(
+        body.find("usage").unwrap().member_size("prompt_tokens", 0),
+        fake_tokens("short") + MAX_INPUT_TOKENS,
+        "usage counts the tokens embedded after truncation"
+    );
+    expect_error(
+        &send(&service, r#"{"input":"a","truncate":"yes"}"#),
+        400,
+        "invalid_parameter_type",
+        "truncate must be a boolean",
+    );
+    let calls = runner.calls.load(Ordering::SeqCst);
+    expect_error(
+        &send(&service, r#"{"input":"a","truncate":1}"#),
+        400,
+        "invalid_parameter_type",
+        "a numeric truncate is refused",
+    );
+    assert_eq!(runner.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(
+        send(&service, r#"{"input":"a","truncate":null}"#).status,
+        200
+    );
+}
+
+/// The native path's cut for inputs with images: 2 = <bos>, 1 = <eos>,
+/// 9 = image placeholder, 8 = end-of-image marker, 5 = text.
+#[test]
+fn truncation_keeps_images_whole() {
+    let mut text = vec![2, 5, 5, 5, 5, 5, 1];
+    assert!(truncate_keeping_images(&mut text, 4, 9) && text == [2, 5, 5, 1]);
+    let mut image = vec![2, 5, 9, 9, 8, 5, 5, 5, 1];
+    assert!(truncate_keeping_images(&mut image, 6, 9) && image == [2, 5, 9, 9, 8, 1]);
+    let mut marker = vec![2, 5, 9, 9, 8, 5, 5, 5, 1];
+    assert!(!truncate_keeping_images(&mut marker, 5, 9) && marker == [2, 5, 9, 9, 8, 5, 5, 5, 1]);
+    let mut inside = vec![2, 9, 9, 9, 8, 5, 1];
+    assert!(!truncate_keeping_images(&mut inside, 3, 9));
+    let mut fits = vec![2, 9, 8, 1];
+    assert!(truncate_keeping_images(&mut fits, 4, 9) && fits == [2, 9, 8, 1]);
+}
+
+fn prompt_service(runner: &Arc<FakeRunner>, default_name: &str) -> Arc<EmbeddingService> {
+    let runner = runner.clone();
+    Arc::new(EmbeddingService::new(EmbeddingServiceOptions {
+        validate_model: false,
+        model_id: "embeddinggemma-2".into(),
+        prompts: [
+            (
+                "query".to_owned(),
+                "task: search result | query: ".to_owned(),
+            ),
+            ("document".to_owned(), "title: none | text: ".to_owned()),
+        ]
+        .into(),
+        default_prompt_name: default_name.into(),
+        runner: Some(Box::new(move |inputs, request, batch, error| {
+            runner.run(inputs, request, batch, error)
+        })),
+        ..EmbeddingServiceOptions::default()
+    }))
+}
+
+#[test]
+fn prompt_names() {
+    let runner = Arc::new(FakeRunner::default());
+    let texts = || runner.last_texts.lock().unwrap().clone();
+    let service = prompt_service(&runner, "");
+    assert_eq!(send(&service, r#"{"input":"a"}"#).status, 200);
+    assert_eq!(
+        texts(),
+        ["a"],
+        "without a default, inputs reach the encoder unchanged"
+    );
+    assert_eq!(
+        send(&service, r#"{"input":["a","b"],"prompt_name":"query"}"#).status,
+        200
+    );
+    assert_eq!(
+        texts(),
+        [
+            "task: search result | query: a",
+            "task: search result | query: b"
+        ],
+        "prompt_name prefixes every input"
+    );
+    let calls = runner.calls.load(Ordering::SeqCst);
+    expect_error(
+        &send(&service, r#"{"input":"a","prompt_name":"Query"}"#),
+        400,
+        "invalid_prompt_name",
+        "prompt names are case-sensitive",
+    );
+    expect_error(
+        &send(&service, r#"{"input":"a","prompt_name":1}"#),
+        400,
+        "invalid_parameter_type",
+        "a non-string prompt_name",
+    );
+    assert_eq!(runner.calls.load(Ordering::SeqCst), calls);
+
+    let with_default = prompt_service(&runner, "document");
+    assert!(with_default.ready(), "a known default prompt");
+    assert_eq!(send(&with_default, r#"{"input":"a"}"#).status, 200);
+    assert_eq!(texts(), ["title: none | text: a"]);
+    assert_eq!(
+        send(&with_default, r#"{"input":"a","prompt_name":"query"}"#).status,
+        200
+    );
+    assert_eq!(texts(), ["task: search result | query: a"]);
+    assert_eq!(
+        send(&with_default, r#"{"input":"a","prompt_name":""}"#).status,
+        200
+    );
+    assert_eq!(texts(), ["a"], "an empty prompt_name applies no prompt");
+    assert_eq!(
+        send(&with_default, r#"{"input":"a","prompt_name":null}"#).status,
+        200
+    );
+    assert_eq!(
+        texts(),
+        ["title: none | text: a"],
+        "a null prompt_name keeps the default"
+    );
+    assert_eq!(
+        send_to(
+            &with_default,
+            "/embeddings",
+            r#"{"content":"a","prompt_name":"query"}"#
+        )
+        .status,
+        200
+    );
+    assert_eq!(texts(), ["task: search result | query: a"]);
+
+    // The model card passes images and audio without a prefix: the default
+    // skips inputs without text, but a requested prompt applies to all.
+    let image = r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}"#;
+    let audio = r#"{"type":"input_audio","input_audio":{"data":"AAAA"}}"#;
+    let caption = r#"{"type":"text","text":"cap"}"#;
+    let media = format!(
+        r#"{{"input":[{{"content":[{image}]}},{{"content":[{audio}]}},{{"content":[{image},{caption}]}},"a"]}}"#
+    );
+    assert_eq!(send(&with_default, &media).status, 200);
+    let last = texts();
+    assert_eq!(last.len(), 4);
+    assert_eq!(last[0], "data:image/png;base64,AAAA");
+    assert!(!last[1].starts_with("title: none | text: "));
+    assert_eq!(last[2], "title: none | text: data:image/png;base64,AAAAcap");
+    assert_eq!(last[3], "title: none | text: a");
+    assert_eq!(
+        send_to(
+            &with_default,
+            "/embeddings",
+            r#"{"content":{"prompt_string":"<__media__>","multimodal_data":["AAAA"]}}"#
+        )
+        .status,
+        200
+    );
+    assert!(!texts()[0].starts_with("title: none | text: "));
+    assert_eq!(
+        send(
+            &with_default,
+            &format!(r#"{{"input":[{{"content":[{image}]}}],"prompt_name":"query"}}"#)
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        texts(),
+        ["task: search result | query: data:image/png;base64,AAAA"]
+    );
+
+    let unknown = prompt_service(&runner, "missing");
+    assert!(!unknown.ready() && unknown.initialization_error().contains("missing"));
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        load_sentence_transformer_prompts(dir.path())
+            .unwrap()
+            .is_empty()
+    );
+    let file = dir.path().join("config_sentence_transformers.json");
+    std::fs::write(
+        &file,
+        r#"{"default_prompt_name":null,"prompts":{"query":"q: ","document":"d: "}}"#,
+    )
+    .unwrap();
+    let prompts = load_sentence_transformer_prompts(dir.path()).unwrap();
+    assert!(prompts.len() == 2 && prompts["query"] == "q: " && prompts["document"] == "d: ");
+    std::fs::write(&file, r#"{"prompts":{"query":3}}"#).unwrap();
+    assert!(
+        load_sentence_transformer_prompts(dir.path())
+            .unwrap_err()
+            .contains("query")
+    );
+    std::fs::write(&file, r#"{"prompts":["q: "]}"#).unwrap();
+    assert!(
+        load_sentence_transformer_prompts(dir.path())
+            .unwrap_err()
+            .contains("must be an object")
+    );
+    std::fs::write(&file, r#"{"prompts":"#).unwrap();
+    assert!(
+        load_sentence_transformer_prompts(dir.path())
+            .unwrap_err()
+            .contains("config_sentence_transformers.json")
+    );
 }

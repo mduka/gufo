@@ -62,6 +62,7 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
             reuse_prompt,
             cache_prefix_tokens,
             stop_at_eos,
+            persist,
         } = options;
         sampling.validate()?;
         if prompt.is_empty() {
@@ -129,7 +130,7 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
         {
             let prefix = &prompt[..lease.cached_tokens()];
             if !lease.has_snapshot_for(prefix) {
-                self.freeze_live_frontier(&mut lease, prefix, input.at(prefix.len()));
+                self.freeze_live_frontier(&mut lease, prefix, input.at(prefix.len()), persist);
             }
         }
         if reuse_prompt
@@ -171,8 +172,11 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
                 }
             }
         }
+        // A request that must stay off disk may still restore from it above,
+        // but neither plans nor writes any disk checkpoint of its own.
         let mut boundaries = Vec::new();
         if reuse_prompt
+            && persist
             && !cancelled()
             && let Some(store) = &self.disk_store
         {
@@ -250,7 +254,7 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
         let mut inner = RequestInner {
             runner: runner.clone(),
             capabilities,
-            disk_store: self.disk_store.clone(),
+            disk_store: self.disk_store.clone().filter(|_| persist),
             snapshot_tokens: prompt[..count].to_vec(),
             // A live continuation can already be beyond the snapshot point:
             // keep its existing checkpoint, never snapshot mismatched state.
@@ -309,6 +313,7 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
         lease: &mut Lease<R::State, R::Snapshot>,
         prefix: &[Token],
         identity: &[u8],
+        persist: bool,
     ) {
         let runner = &self.validated.runner;
         let started = Instant::now();
@@ -344,7 +349,7 @@ impl<R: TextModelRunner> TextRunnerPool<R> {
         let Some(snapshot) = snapshot else {
             return;
         };
-        if let Some(store) = &self.disk_store {
+        if let Some(store) = self.disk_store.as_ref().filter(|_| persist) {
             // RAM branching does not depend on optional disk admission.
             let _ = store.save_async(
                 runner.clone(),

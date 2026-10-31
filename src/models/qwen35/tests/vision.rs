@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use gufo_core::image::{Image, decode_image};
+use gufo_core::text::ImageDetail;
 use gufo_qwen::vision::resize_image;
 #[cfg(feature = "gpu")]
 use gufo_qwen::vision::{Encoder, Observer};
@@ -53,7 +54,7 @@ fn decoded_and_resized_images_match_the_cpp_path() {
             let decoded = decode_image(&bytes);
             let rejected = match &decoded {
                 Err(_) => true,
-                Ok(image) => resize_image(image).is_err(),
+                Ok(image) => resize_image(image, ImageDetail::Auto).is_err(),
             };
             // A PNG's CRC and zlib checks agree with libpng; JPEG decoders
             // may differ in what they tolerate.
@@ -67,7 +68,7 @@ fn decoded_and_resized_images_match_the_cpp_path() {
                 "{path}: decoded pixels"
             );
         }
-        let resized = resize_image(&decoded).unwrap();
+        let resized = resize_image(&decoded, ImageDetail::Auto).unwrap();
         let expected = read_image(&dir.join(format!("{index}.resized")));
         assert_eq!(
             (resized.width, resized.height),
@@ -181,6 +182,7 @@ fn an_image_after_text_decodes_as_on_a_fresh_session() {
             message.images.push(ImagePart {
                 offset: 0,
                 bytes: Arc::new(bytes),
+                detail: Default::default(),
             });
         }
         ChatRequest {

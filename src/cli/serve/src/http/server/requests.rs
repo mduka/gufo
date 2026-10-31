@@ -501,6 +501,16 @@ pub(super) fn invalid_compatibility_request(message: &str) -> HttpResponse {
     )
 }
 
+/// The served name a validated request selected (`RequestedModel`);
+/// responses echo it. A request without one is answered under the primary
+/// name.
+pub(super) fn requested_model(body: &Value, backend: &Arc<dyn TextGenerationBackend>) -> String {
+    match body.find("model") {
+        Some(Value::String(model)) => model.clone(),
+        _ => backend.model_id(),
+    }
+}
+
 /// Compatibility routes implement a synchronous text subset; options are
 /// validated before dispatch so a client never gets an answer to another
 /// request. The error is the response (a cold path, not worth boxing).
@@ -521,7 +531,7 @@ pub(super) fn read_compatibility_options(
         let Value::String(model) = model else {
             return Err(invalid_compatibility_request("'model' must be a string"));
         };
-        if *model != backend.model_id() {
+        if !backend.serves_model(model) {
             return Err(err(
                 404,
                 "Not Found",
@@ -627,6 +637,18 @@ pub(super) fn read_cache_prompt(body: &Value) -> std::result::Result<bool, HttpR
         Some(Value::Bool(cache_prompt)) => Ok(*cache_prompt),
         Some(_) => Err(invalid_compatibility_request(
             "'cache_prompt' must be a boolean",
+        )),
+    }
+}
+
+/// `cache_persist`: a boolean, default (and null) true.
+#[allow(clippy::result_large_err)]
+pub(super) fn read_cache_persist(body: &Value) -> std::result::Result<bool, HttpResponse> {
+    match body.find("cache_persist") {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Bool(cache_persist)) => Ok(*cache_persist),
+        Some(_) => Err(invalid_compatibility_request(
+            "'cache_persist' must be a boolean",
         )),
     }
 }

@@ -102,7 +102,8 @@ pub use memory::{
 pub use probe::{DeviceProbe, DeviceProbeStatus, exit_immediately};
 pub use queues::cap_hardware_queues;
 pub use stream::{
-    Event, PinnedDownload, Stream, cap_reported_device_free, device_memory, runtime_version,
+    DISPATCH_RESERVE, Event, Fork, PinnedDownload, Stream, cap_reported_device_free, device_memory,
+    heap_fits_above_reserve, runtime_version,
 };
 pub use table::RowTable;
 pub use weights::{LoadedWeights, Pending, Placement, WeightLoader};

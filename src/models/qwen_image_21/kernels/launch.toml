@@ -59,7 +59,7 @@ probes = [
 name = "dense"
 cpp = "LaunchDenseFlat"
 returns = "supported"
-doc = "`output = input · weightsᵀ` in BF16 with FP32 accumulation over packed weights and inputs, for the 4096/12288 projection shapes of the DiT and text encoder."
+doc = "`output = input · weightsᵀ` in BF16 with FP32 accumulation over packed weights and inputs, for the 4096/12288 projection shapes of the DiT and text encoder and the DiT's 64-channel output projection."
 params = [
   { name = "weights", kind = "in", elem = "bf16", len = "channels * inner" },
   { name = "input", kind = "in", elem = "bf16", len = "rows * inner" },
@@ -73,6 +73,8 @@ probes = [
   { rows = 3, channels = 4096, inner = 4096 },
   { rows = 200, channels = 4096, inner = 12288 },
   { rows = 300, channels = 12288, inner = 4096 },
+  { rows = 5, channels = 64, inner = 4096 },
+  { rows = 256, channels = 64, inner = 4096 },
 ]
 
 [[launcher]]

@@ -30,12 +30,12 @@ use gufo_core::text::{
     CancellationCheck, ChatMessage as RequestMessage, ChatRequest, ChatRole, ReasoningOptions,
     Token,
 };
-use gufo_deepseek_v4_flash::chat_template::{ChatMessage, resolve_chat_options};
+use gufo_deepseek_v4_flash::chat_template::{ChatMessage, render_chat, resolve_chat_options};
 use gufo_deepseek_v4_flash::dspark_sampler::DsparkSampler;
 use gufo_deepseek_v4_flash::engine::Engine;
 use gufo_deepseek_v4_flash::runner::{DeepSeekRunner, RunnerOptions};
 use gufo_deepseek_v4_flash::session::{DsparkItem, Session};
-use gufo_serve::backend::{GenerationResult, TextGenerationBackend};
+use gufo_serve::backend::{GenerationResult, TextGenerationBackend, TokenPiece};
 use gufo_serve::pool::{TextRunnerDiskCacheOptions, TextRunnerPool};
 use gufo_serve::scheduled_backend::ScheduledBackend;
 use gufo_serve::scheduler::{TextPrefillPolicy, TextSchedulerPolicy};
@@ -124,6 +124,7 @@ fn complete(
             None,
             "quality",
             &[],
+            true,
             true,
         )
         .unwrap()
@@ -266,6 +267,8 @@ struct Served {
     sampled: [GenerationResult; 2],
     chat: GenerationResult,
     repeated_chat: GenerationResult,
+    /// The chat's render sent as a raw prompt.
+    rendered: GenerationResult,
     continuation: GenerationResult,
     fork: GenerationResult,
     concurrent: [GenerationResult; 2],
@@ -321,6 +324,25 @@ fn serve_autoregressive() -> Served {
     assert_eq!(
         repeated.cache_snapshot_bytes, 0,
         "exact DeepSeek reuse avoids another full snapshot copy"
+    );
+    // A raw prompt holding the chat render, as /apply-template returns it,
+    // parses the template's control tokens like the chat request does.
+    let rendered = complete(
+        &backend,
+        &render_chat(
+            &[
+                message("system", "Answer with one short sentence."),
+                message("user", "Name one primary color."),
+            ],
+            &[],
+            &resolve_chat_options(&ReasoningOptions::default()),
+        ),
+        2,
+        &greedy(),
+    );
+    assert_eq!(
+        rendered.prompt_tokens, first.prompt_tokens,
+        "raw rendered prompt tokenizes like the chat request"
     );
 
     let text = String::from_utf8_lossy(&first.text).into_owned();
@@ -392,7 +414,7 @@ fn serve_autoregressive() -> Served {
             .map(|(request, tag)| {
                 let events = &events;
                 scope.spawn(move || {
-                    let mut on_token = |_: &[u8]| {
+                    let mut on_token = |_: &TokenPiece<'_>| {
                         events.lock().unwrap().push(tag);
                         true
                     };
@@ -437,6 +459,7 @@ fn serve_autoregressive() -> Served {
             "quality",
             &[],
             true,
+            true,
         )
         .unwrap();
     assert!(cancelled.cancelled, "cancellation status");
@@ -454,6 +477,7 @@ fn serve_autoregressive() -> Served {
         sampled,
         chat: first,
         repeated_chat: repeated,
+        rendered,
         continuation,
         fork,
         concurrent: [a, b],
@@ -500,6 +524,10 @@ fn check_autoregressive(served: &Served) {
     assert_eq!(
         served.repeated_chat.tokens, direct_chat,
         "repeated DeepSeek chat differs from cold target execution"
+    );
+    assert_eq!(
+        served.rendered.tokens, direct_chat,
+        "raw rendered prompt tokenizes like the chat request"
     );
     let text = String::from_utf8_lossy(&served.chat.text).into_owned();
     for (result, question, what) in [
@@ -779,7 +807,7 @@ fn serve_dspark(references: &[Reference]) {
                 .push_str(" additional context");
         }
         let mut late = None;
-        let mut on_token = |_: &[u8]| {
+        let mut on_token = |_: &TokenPiece<'_>| {
             if late.is_none() {
                 late = Some(start(&backend, &long_request, 8, &greedy()));
             }

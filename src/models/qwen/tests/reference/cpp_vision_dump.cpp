@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
     WriteImage(out / (index + ".rgb"), decoded);
     gufo::core::Image resized;
     try {
-      resized = gufo::models::qwen::vision::ResizeImage(decoded);
+      resized = gufo::models::qwen::vision::ResizeImage(
+          decoded, gufo::tokenization::ChatMessage::ImageDetail::kAuto);
     } catch (const std::exception& error) {
       std::ofstream(out / (index + ".error")) << error.what() << '\n';
       continue;

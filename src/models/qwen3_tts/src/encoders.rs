@@ -160,6 +160,7 @@ fn gemm_f32(
         reduction,
         input,
         reduction,
+        None,
         output,
         output_columns,
     )
@@ -439,6 +440,8 @@ impl SpeechEncoder {
         }
         let tokenizer = &checkpoint.config.speech_tokenizer;
         let gemm = RocBlas::new(&stream).map_err(hip("rocblas_create_handle"))?;
+        // Weights were converted into owned device buffers.
+        checkpoint.release_host_pages();
         Ok(Self {
             gemm,
             encoder_norm_eps: tokenizer.encoder_norm_eps,
@@ -1079,6 +1082,8 @@ impl SpeakerEncoder {
         let asp_conv = conv("asp.conv", 128, 1536, 1, 1)?;
         let fc = conv("fc", 3072, 2048, 1, 1)?;
         let gemm = RocBlas::new(&stream).map_err(hip("rocblas_create_handle"))?;
+        // Weights were converted into owned device buffers.
+        checkpoint.release_host_pages();
         Ok(Self {
             gemm,
             block0,

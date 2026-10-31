@@ -30,6 +30,7 @@ pub(super) fn llama_completion(
                 Err(message) => return Ok(invalid_compatibility_request(&message)),
             };
         let cache_prompt = try_response!(read_cache_prompt(&body));
+        let cache_persist = try_response!(read_cache_persist(&body));
         let result = backend.complete(
             prompt,
             max_tokens,
@@ -39,6 +40,7 @@ pub(super) fn llama_completion(
             &request.client_id,
             &stop_sequences,
             cache_prompt,
+            cache_persist,
         )?;
         let limited = result.finish_reason == FinishReason::Length;
         let matched = result.finish_reason == FinishReason::StopSequence;
@@ -54,7 +56,8 @@ pub(super) fn llama_completion(
             .with("tokens_evaluated", result.prompt_tokens)
             .with("tokens_cached", result.cached_prompt_tokens)
             .with("timings", generation_timings(&result))
-            .with("usage", usage_json(&result));
+            .with("usage", usage_json(&result))
+            .with("cache_persist", cache_persist);
         Ok(with_timing(ok(&response), &result))
     })())
 }
@@ -224,8 +227,12 @@ pub(super) fn list_models(
     services: &HttpServices,
 ) -> HttpResponse {
     let mut data = Value::array();
-    if let Some(backend) = backend {
-        let mut entry = model_entry(&backend.model_id(), "gufo");
+    // One entry per served name of the text model.
+    for (backend, id) in backend
+        .into_iter()
+        .flat_map(|backend| backend.model_ids().into_iter().map(move |id| (backend, id)))
+    {
+        let mut entry = model_entry(&id, "gufo");
         if backend.max_context() > 0 {
             entry.set("context_length", backend.max_context());
         }

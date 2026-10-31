@@ -48,6 +48,7 @@ unsafe extern "C" {
     pub fn hipEventCreateWithFlags(event: *mut HipEvent, flags: u32) -> HipError;
     pub fn hipEventDestroy(event: HipEvent) -> HipError;
     pub fn hipEventRecord(event: HipEvent, stream: HipStream) -> HipError;
+    pub fn hipStreamWaitEvent(stream: HipStream, event: HipEvent, flags: u32) -> HipError;
     pub fn hipEventSynchronize(event: HipEvent) -> HipError;
     pub fn hipEventQuery(event: HipEvent) -> HipError;
     pub fn hipEventElapsedTime(ms: *mut f32, start: HipEvent, stop: HipEvent) -> HipError;

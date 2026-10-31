@@ -113,7 +113,8 @@ std::int32_t gufo_rocblas_gemm_f32(void* handle, std::int32_t trans_a,
                                    std::int32_t trans_b, std::int32_t m,
                                    std::int32_t n, std::int32_t k,
                                    const float* a, std::int32_t lda,
-                                   const float* b, std::int32_t ldb, float* c,
+                                   const float* b, std::int32_t ldb,
+                                   const float* c_input, float* c,
                                    std::int32_t ldc) noexcept {
   constexpr float alpha = 1.0F;
   constexpr float beta = 0.0F;
@@ -121,9 +122,10 @@ std::int32_t gufo_rocblas_gemm_f32(void* handle, std::int32_t trans_a,
       static_cast<rocblas_handle>(handle),
       static_cast<rocblas_operation>(trans_a),
       static_cast<rocblas_operation>(trans_b), m, n, k, &alpha, a,
-      rocblas_datatype_f32_r, lda, b, rocblas_datatype_f32_r, ldb, &beta, c,
-      rocblas_datatype_f32_r, ldc, c, rocblas_datatype_f32_r, ldc,
-      rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+      rocblas_datatype_f32_r, lda, b, rocblas_datatype_f32_r, ldb, &beta,
+      c_input != nullptr ? c_input : c, rocblas_datatype_f32_r, ldc, c,
+      rocblas_datatype_f32_r, ldc, rocblas_datatype_f32_r,
+      rocblas_gemm_algo_standard, 0, 0);
 }
 
 std::int32_t gufo_blas_destroy(void* handle) noexcept {

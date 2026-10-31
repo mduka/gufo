@@ -5,7 +5,7 @@ Start the OpenAI/Anthropic-compatible text LLM HTTP server.
 Model:
   -m, --model <PATH>         Path to GGUF model file (required)
       --mmproj <PATH>        Qwen BF16 vision sidecar (auto-discovered beside model)
-      --served-model-name <ID> Model identifier exposed by the OpenAI API
+      --served-model-name <ID> Model identifier exposed by the OpenAI API (repeatable; the first is primary)
   -c, --context <N>          Context tokens per session (default: 0 = model native context)
       --enable-yarn          Flash-Next: static YaRN, required for --context above the native 262144; it applies to every request
 
@@ -49,7 +49,7 @@ Scheduling:
       --max-buffered-output-total <N> Maximum queued stream bytes across requests (default: 262144)
 
 Cache:
-      --cache-ram-bytes <N>  Retained RAM-cache byte budget (default: 0 = auto: half of free RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB)
+      --cache-ram-bytes <N|off> Retained RAM-cache byte budget (default: 0 = auto: half of free RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB). off keeps no RAM checkpoints and commits no cache memory; sessions still reuse their own live state, and --cache-disk still works
       --cache-disk <DIR>     Opt-in restart-safe continuation cache directory
       --cache-disk-bytes <N> Retained disk-cache byte budget (default: 8589934592)
       --cache-disk-staging-bytes <N> RAM limit for queued snapshots and each disk read (default: 0 = auto, at most the disk budget and 1/8 available RAM)

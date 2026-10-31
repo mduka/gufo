@@ -15,6 +15,7 @@ use gufo_core::text::{ReasoningEffort, ReasoningOptions};
 use gufo_serve::disk_store::DEFAULT_CAPACITY_BYTES;
 use gufo_serve::logging::LogLevel;
 use gufo_serve::openai_chat::{ApiCompat, ResponsesReasoningTarget};
+use gufo_serve::pool::{TextRunnerRamCacheOptions, parse_ram_cache_option};
 use gufo_serve::sampling_request::parse_sampling_config;
 use gufo_serve::scheduler::{
     DEFAULT_DECODE_ACTIVE_PREFILL_TOKENS, DEFAULT_MAX_BUFFERED_OUTPUT_BYTES,
@@ -115,8 +116,9 @@ pub struct LlmOptions {
     pub model: String,
     /// `--mmproj`; empty when not given.
     pub vision_model: String,
-    /// Empty keeps the model's own ID.
-    pub served_model_name: String,
+    /// `--served-model-name` in command-line order, the first primary; empty
+    /// keeps the model's own ID.
+    pub served_model_names: Vec<String>,
     /// Zero: the model's native context, resolved at load.
     pub max_context: u32,
     /// Zero: until EOS or the remaining context is exhausted.
@@ -142,8 +144,9 @@ pub struct LlmOptions {
     pub dflash_policy: DFlashDraftPolicy,
     pub prefill: TextPrefillPolicy,
     pub scheduler: TextSchedulerPolicy,
-    /// Zero: automatic, see `TextRunnerRamCacheOptions`.
-    pub cache_ram_bytes: usize,
+    /// `--cache-ram-bytes`: zero is automatic, `off` disables the RAM cache;
+    /// see `TextRunnerRamCacheOptions`.
+    pub cache_ram: TextRunnerRamCacheOptions,
     /// Empty disables the disk cache.
     pub cache_disk_directory: PathBuf,
     pub cache_disk_bytes: usize,
@@ -188,6 +191,9 @@ pub enum Modality {
     Embedding {
         model: PathBuf,
         served_model_name: String,
+        /// Checkpoint prompt for text inputs without `prompt_name`; empty
+        /// applies none.
+        default_prompt_name: String,
     },
 }
 
@@ -419,11 +425,12 @@ fn image_parser<'a>(
 fn embedding_parser<'a>(
     model: &'a mut PathBuf,
     name: &'a mut String,
+    default_prompt_name: &'a mut String,
     server: &'a mut ServerOptions,
 ) -> ArgParser<'a> {
     let mut parser = ArgParser::new(
         "gufo serve embedding",
-        "Serve EmbeddingGemma 2 text embeddings.",
+        "Serve EmbeddingGemma 2 text, image and audio embeddings.",
     );
     parser
         .add_option(
@@ -441,6 +448,14 @@ fn embedding_parser<'a>(
             "Public API model ID (default: embeddinggemma-2)",
             "Model",
             name,
+        )
+        .add_option(
+            "",
+            "--default-prompt-name",
+            "NAME",
+            "Checkpoint prompt for text inputs without prompt_name (default: none)",
+            "Model",
+            default_prompt_name,
         );
     add_server_options(&mut parser, server, false);
     parser
@@ -474,7 +489,7 @@ fn speech_parser<'a>(
 /// The raw `serve llm` options before validation.
 struct LlmCli {
     model: String,
-    served_model_name: String,
+    served_model_names: Vec<String>,
     /// Zero: the model's native context.
     max_context: u32,
     /// -1: until EOS or the context is full.
@@ -505,7 +520,7 @@ struct LlmCli {
     max_output_bytes: usize,
     max_buffered_output_bytes: usize,
     max_buffered_output_bytes_total: usize,
-    cache_ram_bytes: usize,
+    cache_ram: TextRunnerRamCacheOptions,
     cache_disk_directory: PathBuf,
     cache_disk_bytes: usize,
     cache_disk_staging_bytes: usize,
@@ -516,7 +531,7 @@ impl LlmCli {
     fn new() -> Self {
         Self {
             model: String::new(),
-            served_model_name: String::new(),
+            served_model_names: Vec::new(),
             max_context: 0,
             max_tokens: -1,
             sampling: SamplingConfig::default(),
@@ -545,7 +560,7 @@ impl LlmCli {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_buffered_output_bytes: DEFAULT_MAX_BUFFERED_OUTPUT_BYTES,
             max_buffered_output_bytes_total: DEFAULT_MAX_BUFFERED_OUTPUT_BYTES_TOTAL,
-            cache_ram_bytes: 0,
+            cache_ram: TextRunnerRamCacheOptions::default(),
             cache_disk_directory: PathBuf::new(),
             cache_disk_bytes: DEFAULT_CAPACITY_BYTES,
             // Zero: automatic, see `ContinuationDiskStoreOptions`.
@@ -558,7 +573,7 @@ impl LlmCli {
 fn llm_parser<'a>(cli: &'a mut LlmCli, server: &'a mut ServerOptions) -> ArgParser<'a> {
     let LlmCli {
         model,
-        served_model_name,
+        served_model_names,
         max_context,
         max_tokens,
         sampling,
@@ -586,7 +601,7 @@ fn llm_parser<'a>(cli: &'a mut LlmCli, server: &'a mut ServerOptions) -> ArgPars
         max_output_bytes,
         max_buffered_output_bytes,
         max_buffered_output_bytes_total,
-        cache_ram_bytes,
+        cache_ram,
         cache_disk_directory,
         cache_disk_bytes,
         cache_disk_staging_bytes,
@@ -613,13 +628,21 @@ fn llm_parser<'a>(cli: &'a mut LlmCli, server: &'a mut ServerOptions) -> ArgPars
             "Model",
             vision_model_path,
         )
-        .add_option(
+        .add_custom_option(
             "",
             "--served-model-name",
             "ID",
-            "Model identifier exposed by the OpenAI API",
+            "Model identifier exposed by the OpenAI API (repeatable; the first is primary)",
             "Model",
-            served_model_name,
+            move |_, value| {
+                if served_model_names.iter().any(|name| name == value) {
+                    return Err("duplicate --served-model-name".into());
+                }
+                if !value.is_empty() {
+                    served_model_names.push(value.to_owned());
+                }
+                Ok(())
+            },
         )
         .add_option(
             "-c",
@@ -809,14 +832,19 @@ fn llm_parser<'a>(cli: &'a mut LlmCli, server: &'a mut ServerOptions) -> ArgPars
             "Scheduling",
             max_buffered_output_bytes_total,
         )
-        .add_option(
+        .add_custom_option(
             "",
             "--cache-ram-bytes",
-            "N",
+            "N|off",
             "Retained RAM-cache byte budget (default: 0 = auto: half of free RAM, at most 32 GiB; \
-             explicit values may use free RAM minus 4 GiB)",
+             explicit values may use free RAM minus 4 GiB). off keeps no RAM checkpoints and \
+             commits no cache memory; sessions still reuse their own live state, and \
+             --cache-disk still works",
             "Cache",
-            cache_ram_bytes,
+            move |_, value| {
+                *cache_ram = parse_ram_cache_option(value)?;
+                Ok(())
+            },
         )
         .add_option(
             "",
@@ -876,8 +904,9 @@ pub fn serve_help(program_name: &str, subcommand: &str) -> String {
         }
         "embedding" => {
             let (mut model, mut name) = (PathBuf::new(), EMBEDDING_MODEL_ID.to_owned());
+            let mut default_prompt_name = String::new();
             rename(
-                embedding_parser(&mut model, &mut name, &mut server),
+                embedding_parser(&mut model, &mut name, &mut default_prompt_name, &mut server),
                 program_name,
                 "embedding",
             )
@@ -903,7 +932,7 @@ pub fn serve_help(program_name: &str, subcommand: &str) -> String {
              image     Serve Qwen-Image-2.1 (/v1/images/generations, /v1/images/edits)\n  \
              tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)\n  \
              asr       Serve Qwen3-ASR transcription (/v1/audio/transcriptions)\n  \
-             embedding Serve EmbeddingGemma 2 text embeddings (/v1/embeddings)\n\n\
+             embedding Serve EmbeddingGemma 2 text, image and audio embeddings (/v1/embeddings)\n\n\
              Server:\n  \
              -i, --host <IP>        Bind address (default: 127.0.0.1)\n  \
              -p, --port <N>         Port to listen on (default: 8080)\n  \
@@ -1134,8 +1163,10 @@ pub fn parse_serve_with(
         }
         "embedding" => {
             let (mut model, mut name) = (PathBuf::new(), EMBEDDING_MODEL_ID.to_owned());
+            let mut default_prompt_name = String::new();
             let (parsed, help_requested) = {
-                let mut parser = embedding_parser(&mut model, &mut name, &mut server);
+                let mut parser =
+                    embedding_parser(&mut model, &mut name, &mut default_prompt_name, &mut server);
                 (parser.parse(&sub_args), parser.is_help_requested())
             };
             if let Err(message) = parsed {
@@ -1158,6 +1189,7 @@ pub fn parse_serve_with(
                 Modality::Embedding {
                     model,
                     served_model_name: name,
+                    default_prompt_name,
                 },
             )
         }
@@ -1333,7 +1365,7 @@ fn resolve_llm(mut cli: LlmCli) -> Result<LlmOptions, String> {
     Ok(LlmOptions {
         model: cli.model,
         vision_model: cli.vision_model_path,
-        served_model_name: cli.served_model_name,
+        served_model_names: cli.served_model_names,
         max_context: cli.max_context,
         max_tokens: usize::try_from(cli.max_tokens).unwrap_or(0),
         sampling: cli.sampling,
@@ -1361,7 +1393,7 @@ fn resolve_llm(mut cli: LlmCli) -> Result<LlmOptions, String> {
             log_progress: cli.log_progress,
             ..TextSchedulerPolicy::default()
         },
-        cache_ram_bytes: cli.cache_ram_bytes,
+        cache_ram: cli.cache_ram,
         cache_disk_directory: cli.cache_disk_directory,
         cache_disk_bytes: cli.cache_disk_bytes,
         cache_disk_staging_bytes: cli.cache_disk_staging_bytes,
@@ -1932,8 +1964,17 @@ mod tests {
             Modality::Embedding {
                 model: "eg2".into(),
                 served_model_name: "embeddinggemma-2".into(),
+                default_prompt_name: String::new(),
             }
         );
+        let request = run_request(
+            &["embedding", "-m", "eg2", "--default-prompt-name", "query"],
+            &[],
+        );
+        assert!(matches!(
+            request.modality,
+            Modality::Embedding { default_prompt_name, .. } if default_prompt_name == "query"
+        ));
         let request = run_request(
             &["embedding", "-m", "eg2", "--served-model-name", "vectors"],
             &[],

@@ -6,7 +6,7 @@
 
 use gufo_formats::GgmlType;
 use gufo_hip::{
-    DeviceBuffer, DeviceCopy, DeviceSlice, DeviceSliceMut, DeviceTensor, F16, IndexSlice,
+    DeviceBuffer, DeviceCopy, DeviceSlice, DeviceSliceMut, DeviceTensor, F16, Fork, IndexSlice,
     QuantSlice, RowTable,
 };
 use gufo_qwen38_flash_next_kernels as k;

@@ -508,6 +508,7 @@ fn attach_images(options: &PromptOptions, message: &mut ChatMessage) -> Result<(
         message.images.push(ImagePart {
             offset: 0,
             bytes: std::sync::Arc::new(bytes),
+            detail: Default::default(),
         });
     }
     Ok(())

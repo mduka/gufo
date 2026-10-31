@@ -6,7 +6,9 @@
 //! dense target p costs more than it saves. A rejected draw becomes the next
 //! cycle's anchor. The owner copies the RNG back after each cycle.
 
-use gufo_core::sampling::{SamplerState, SamplingConfig, TokenId, build_distribution};
+use gufo_core::sampling::{
+    SamplerState, SamplingConfig, TokenId, TokenLogprobs, build_distribution, collect_logprobs,
+};
 use gufo_core::text::{Error, Result};
 
 use crate::dspark_model::MAX_BLOCK;
@@ -64,6 +66,12 @@ pub struct DsparkSampler {
     stochastic: bool,
     draws: u32,
     verifications: u32,
+    /// The raw target log probabilities of every draw, for requests that
+    /// ask for them (`observe`).
+    logprobs: Vec<TokenLogprobs>,
+    /// The request's selection is the unmodified argmax: observing it must
+    /// keep the greedy replay and frontier (`unmodified_argmax`).
+    unmodified_argmax: bool,
     /// A hook that only samples, returning this token (a C++ test hook),
     /// and the number of draws.
     #[cfg(test)]
@@ -80,9 +88,37 @@ impl DsparkSampler {
             stochastic,
             draws: 0,
             verifications: 0,
+            logprobs: Vec::new(),
+            unmodified_argmax: sampler.config().can_use_unmodified_argmax(),
             #[cfg(test)]
             fixed: None,
         }
+    }
+
+    /// The log probabilities observed so far, one per draw.
+    pub fn logprobs(&self) -> &[TokenLogprobs] {
+        &self.logprobs
+    }
+
+    /// Whether the request selects the unmodified argmax, which keeps the
+    /// greedy replay although the hook observes its draws.
+    pub fn unmodified_argmax(&self) -> bool {
+        self.unmodified_argmax
+    }
+
+    /// `Observe`: records the log probabilities of `token` in `logits` when
+    /// the request asks for them.
+    pub fn observe(&mut self, logits: &[f32], token: i32) -> Result<()> {
+        let count = self.working.config().logprobs;
+        if count.is_none() {
+            return Ok(());
+        }
+        let token =
+            TokenId::try_from(token).map_err(|_| Error::invalid("invalid logprob selection"))?;
+        if let Some(value) = collect_logprobs(logits, token, count)? {
+            self.logprobs.push(value);
+        }
+        Ok(())
     }
 
     /// A hook whose every draw is `token`, without proposals.
@@ -137,7 +173,8 @@ impl DsparkSampler {
             return Ok(false);
         }
         let config = self.working.config();
-        if config.temperature != 0.0 || config.penalties_enabled() {
+        // Observed draws need their row's logits.
+        if config.logprobs.is_some() || config.temperature != 0.0 || config.penalties_enabled() {
             return Ok(false);
         }
         let Ok(token) = TokenId::try_from(token) else {
@@ -158,6 +195,7 @@ impl DsparkSampler {
             return Ok(*token);
         }
         let token = self.working.sample(logits)?;
+        self.observe(logits, token as i32)?;
         self.working.accept(token)?;
         Ok(token as i32)
     }
@@ -278,6 +316,7 @@ impl DsparkSampler {
                 self.working.mutable_rng_state(),
             )?
         };
+        self.observe(logits, token as i32)?;
         self.working.accept(token)?;
         Ok(token as i32)
     }
@@ -561,5 +600,31 @@ mod tests {
         let expected = unfiltered.sample(&LOGITS).unwrap();
         assert_eq!(delta.sample(&LOGITS).unwrap(), expected as i32);
         assert_eq!(delta.rng_state(), unfiltered.rng_state());
+    }
+
+    /// Observing logprobs keeps the draws and reports the raw target
+    /// distribution, also for a correction drawn earlier (`CheckLogprobs`).
+    #[test]
+    fn logprobs_preserve_draws_and_report_the_target() {
+        let logits = [2.0f32, 1.0, -1.0];
+        for temperature in [0.0, 0.8] {
+            let mut config = SamplingConfig {
+                temperature,
+                seed: 73,
+                ..SamplingConfig::default()
+            };
+            let mut plain = DsparkSampler::new(&SamplerState::new(config.clone(), &[]).unwrap());
+            config.logprobs = Some(2);
+            let mut observed = DsparkSampler::new(&SamplerState::new(config, &[]).unwrap());
+            let token = observed.sample(&logits).unwrap();
+            assert_eq!(token, plain.sample(&logits).unwrap());
+            assert_eq!(observed.rng_state(), plain.rng_state());
+            let z = (2f64.exp() + 1f64.exp() + (-1f64).exp()).ln();
+            assert_eq!(observed.logprobs().len(), 1);
+            let logprob = observed.logprobs()[0].selected.logprob;
+            assert!((logprob - (f64::from(logits[token as usize]) - z)).abs() < 1e-12);
+            observed.observe(&logits, 2).unwrap();
+            assert_eq!(observed.logprobs().last().unwrap().selected.token, 2);
+        }
     }
 }

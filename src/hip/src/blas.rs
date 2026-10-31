@@ -54,6 +54,7 @@ mod ffi {
             lda: i32,
             b: *const f32,
             ldb: i32,
+            c_input: *const f32,
             c: *mut f32,
             ldc: i32,
         ) -> i32;
@@ -328,7 +329,9 @@ impl RocBlas {
 
     /// `C = op(A) · op(B)` in f32 (alpha 1, beta 0; `rocblas_gemm_ex` with
     /// the standard algorithm): `C` is `m × n`, `op(A)` is `m × k`, `op(B)`
-    /// is `k × n`, all column-major.
+    /// is `k × n`, all column-major. `c_input` is the GEMM's C operand when
+    /// it is not `c` itself: beta 0 leaves it unread, but rocBLAS runs an
+    /// in-place one-column GEMM as a GEMV with another sum tree.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f32(
         &self,
@@ -342,6 +345,7 @@ impl RocBlas {
         lda: usize,
         b: DeviceSlice<'_, f32>,
         ldb: usize,
+        c_input: Option<DeviceSlice<'_, f32>>,
         mut c: DeviceSliceMut<'_, f32>,
         ldc: usize,
     ) -> Result<(), LaunchError> {
@@ -362,6 +366,9 @@ impl RocBlas {
         l::require_in(stream, "a", &a, a_layout.extent("a")?)?;
         l::require_in(stream, "b", &b, b_layout.extent("b")?)?;
         l::require_out(stream, "c", &c, c_layout.extent("c")?)?;
+        if let Some(c_input) = &c_input {
+            l::require_in(stream, "c_input", c_input, c_layout.extent("c_input")?)?;
+        }
         let dims = [
             to_i32(m, "m")?,
             to_i32(n, "n")?,
@@ -371,7 +378,8 @@ impl RocBlas {
             to_i32(ldc, "ldc")?,
         ];
         // SAFETY: every operand belongs to this handle's stream and covers the
-        // extent its layout needs; dimensions fit in i32.
+        // extent its layout needs (`c_input` that of `c`, or null for `c`);
+        // dimensions fit in i32.
         let status = unsafe {
             ffi::gufo_rocblas_gemm_f32(
                 self.handle,
@@ -384,6 +392,7 @@ impl RocBlas {
                 dims[3],
                 b.as_ptr(),
                 dims[4],
+                c_input.map_or(std::ptr::null(), |c_input| c_input.as_ptr()),
                 c.as_mut_ptr(),
                 dims[5],
             )

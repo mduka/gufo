@@ -96,37 +96,39 @@ __global__ static void indexer_scores_kernel(
 
 /* DSpark Markov correction: select argmax(logits + W2 * W1[prev]) without
  * moving the vocabulary row back to the host. W1 and W2 are Q8_0. */
+template<bool DEVICE_PREVIOUS = false>
 __global__ static void dspark_markov_argmax_kernel(
-        unsigned long long *out_key,
-        const float *logits,
-        const unsigned char *w1_row,
-        const unsigned char *w2,
-        uint32_t vocab,
-        uint32_t rank_blocks) {
-    __shared__ float state[256];
-    const uint32_t tid = threadIdx.x;
-    if (tid < rank_blocks * 32u) {
-        const uint32_t block = tid >> 5u;
-        const uint32_t lane = tid & 31u;
-        const unsigned char *qblock = w1_row + (uint64_t)block * 34u;
-        const float scale = __half2float(*(const __half *)qblock);
-        state[tid] =
-            scale * (float)((const int8_t *)(qblock + 2u))[lane];
-    }
-    __syncthreads();
+    unsigned long long* out_key, const float* logits,
+    const unsigned char* w1_row, const unsigned char* w2, uint32_t vocab,
+    uint32_t rank_blocks, const int32_t* previous = nullptr) {
+  if constexpr (DEVICE_PREVIOUS) {
+    const int32_t token = *previous;
+    if (token < 0 || static_cast<uint32_t>(token) >= vocab)
+      return;
+    w1_row += static_cast<uint64_t>(token) * rank_blocks * 34u;
+  }
+  __shared__ float state[256];
+  const uint32_t tid = threadIdx.x;
+  if (tid < rank_blocks * 32u) {
+    const uint32_t block = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const unsigned char* qblock = w1_row + (uint64_t)block * 34u;
+    const float scale = __half2float(*(const __half*)qblock);
+    state[tid] = scale * (float)((const int8_t*)(qblock + 2u))[lane];
+  }
+  __syncthreads();
 
-    float best_value = -INFINITY;
-    uint32_t best_index = 0;
-    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < vocab;
-         i += gridDim.x * blockDim.x) {
-        const unsigned char *row =
-            w2 + (uint64_t)i * rank_blocks * 34u;
-        float acc = 0.0f;
-        for (uint32_t block = 0; block < rank_blocks; block++) {
-            const unsigned char *qblock = row + (uint64_t)block * 34u;
-            const float scale = __half2float(*(const __half *)qblock);
-            const int8_t *quants = (const int8_t *)(qblock + 2u);
-            float sum = 0.0f;
+  float best_value = -INFINITY;
+  uint32_t best_index = 0;
+  for (uint32_t i = blockIdx.x * blockDim.x + tid; i < vocab;
+       i += gridDim.x * blockDim.x) {
+    const unsigned char* row = w2 + (uint64_t)i * rank_blocks * 34u;
+    float acc = 0.0f;
+    for (uint32_t block = 0; block < rank_blocks; block++) {
+      const unsigned char* qblock = row + (uint64_t)block * 34u;
+      const float scale = __half2float(*(const __half*)qblock);
+      const int8_t* quants = (const int8_t*)(qblock + 2u);
+      float sum = 0.0f;
 #pragma unroll
             for (uint32_t lane = 0; lane < 32u; lane++) {
                 sum += (float)quants[lane] * state[block * 32u + lane];

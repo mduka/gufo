@@ -13,6 +13,8 @@ use gufo_core::text::{
     CancellationCheck, ChatRequest, Error, GenerationErrorCode, ReasoningOptions, Result, Token,
 };
 
+pub use crate::logprobs::{DecodedLogprobs, TokenPiece};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum FinishReason {
     #[default]
@@ -58,6 +60,9 @@ impl SamplingDefaults {
 pub struct GenerationResult {
     /// Decoded bytes; the transport repairs incomplete UTF-8.
     pub text: Vec<u8>,
+    /// Per generated token (stop tokens included) of a request that asks
+    /// for log probabilities.
+    pub logprobs: Vec<DecodedLogprobs>,
     pub tokens: Vec<Token>,
     pub prompt_tokens: usize,
     pub cached_prompt_tokens: usize,
@@ -126,6 +131,7 @@ impl Default for GenerationResult {
     fn default() -> Self {
         Self {
             text: Vec::new(),
+            logprobs: Vec::new(),
             tokens: Vec::new(),
             prompt_tokens: 0,
             cached_prompt_tokens: 0,
@@ -211,7 +217,7 @@ pub struct PromptProgress {
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(&PromptProgress) -> bool;
 
 /// Receives each generated piece; returning false cancels the request.
-pub type TokenCallback<'a> = &'a mut dyn FnMut(&[u8]) -> bool;
+pub type TokenCallback<'a> = &'a mut dyn FnMut(&TokenPiece<'_>) -> bool;
 
 /// Called when a streaming request starts; returning false cancels it.
 pub type StartCallback<'a> = &'a mut dyn FnMut() -> bool;
@@ -258,6 +264,16 @@ pub trait GenerationRequest: Send {
 /// and aggregate metrics only.
 pub trait TextGenerationBackend: Send + Sync + 'static {
     fn model_id(&self) -> String;
+
+    /// Every name requests may select this model by, [`Self::model_id`] first.
+    fn model_ids(&self) -> Vec<String> {
+        vec![self.model_id()]
+    }
+
+    fn serves_model(&self, name: &str) -> bool {
+        self.model_ids().iter().any(|id| id == name)
+    }
+
     fn ready(&self) -> bool;
 
     /// The session context of the loaded model; zero when unknown.
@@ -315,7 +331,9 @@ pub trait TextGenerationBackend: Send + Sync + 'static {
 
     /// A raw prompt; `stop_sequences` end generation where they match the
     /// output and are excluded from it. Without `cache_prompt` the request
-    /// skips the cache lookup (its result may still populate the cache).
+    /// skips the cache lookup (its result may still populate the cache);
+    /// without `cache_persist` none of its checkpoints reaches the disk
+    /// cache.
     #[allow(clippy::too_many_arguments)]
     fn complete(
         &self,
@@ -327,6 +345,7 @@ pub trait TextGenerationBackend: Send + Sync + 'static {
         client_id: &str,
         stop_sequences: &[String],
         cache_prompt: bool,
+        cache_persist: bool,
     ) -> Result<GenerationResult>;
 
     fn chat(
@@ -370,6 +389,7 @@ pub trait TextGenerationBackend: Send + Sync + 'static {
         stop_sequences: &[String],
         return_progress: bool,
         cache_prompt: bool,
+        cache_persist: bool,
     ) -> Result<Option<Box<dyn GenerationRequest>>> {
         let _ = (
             prompt,
@@ -381,6 +401,7 @@ pub trait TextGenerationBackend: Send + Sync + 'static {
             stop_sequences,
             return_progress,
             cache_prompt,
+            cache_persist,
         );
         if ignore_eos {
             return Err(Error::invalid("this backend does not support ignore_eos"));
@@ -394,6 +415,13 @@ pub trait TextGenerationBackend: Send + Sync + 'static {
     /// without generating (`count_chat_tokens`); `None` when this backend
     /// cannot tell.
     fn count_chat_tokens(&self, _request: &ChatRequest) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// The prompt text a chat request renders to through the model's chat
+    /// template, before tokenization (`render_chat_prompt`); `None` when
+    /// the backend cannot tell.
+    fn render_chat_prompt(&self, _request: &ChatRequest) -> Result<Option<String>> {
         Ok(None)
     }
 }
@@ -413,6 +441,7 @@ pub fn start_complete(
     stop_sequences: &[String],
     return_progress: bool,
     cache_prompt: bool,
+    cache_persist: bool,
 ) -> Result<Box<dyn GenerationRequest>> {
     if let Some(started) = backend.start_complete(
         prompt,
@@ -425,6 +454,7 @@ pub fn start_complete(
         stop_sequences,
         return_progress,
         cache_prompt,
+        cache_persist,
     )? {
         return Ok(started);
     }
@@ -436,6 +466,7 @@ pub fn start_complete(
         client_id: client_id.to_owned(),
         stop_sequences: stop_sequences.to_vec(),
         cache_prompt,
+        cache_persist,
         external_cancellation: is_cancelled,
         waited: false,
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -450,6 +481,7 @@ struct DeferredCompletion {
     client_id: String,
     stop_sequences: Vec<String>,
     cache_prompt: bool,
+    cache_persist: bool,
     external_cancellation: Option<CancellationCheck>,
     waited: bool,
     cancelled: Arc<AtomicBool>,
@@ -474,6 +506,7 @@ impl GenerationRequest for DeferredCompletion {
             &self.client_id,
             &self.stop_sequences,
             self.cache_prompt,
+            self.cache_persist,
         )
     }
 

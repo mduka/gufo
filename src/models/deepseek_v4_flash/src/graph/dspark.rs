@@ -910,7 +910,8 @@ impl Graph {
     }
 
     /// `rocm_graph_dspark_select_block`: the greedy Markov trajectory of
-    /// `n_rows` verification logits rows after `target_next_token`.
+    /// `n_rows` verification logits rows after `target_next_token`, chained
+    /// on the device and read back once.
     fn dspark_select_block(
         &mut self,
         t: &Target<'_>,
@@ -933,35 +934,37 @@ impl Graph {
             op: "dspark select",
         })?;
         let (w1, w2) = (sw(present(&last.markov_w1)?), sw(present(&last.markov_w2)?));
-        let mut tokens = Vec::with_capacity(n_rows as usize);
-        let mut previous = target_next_token;
-        for row in 0..n_rows {
-            if previous < 0 || previous as u32 >= N_VOCAB {
-                return Err(Error {
-                    op: "dspark select",
-                });
-            }
-            let logits_row = rows(logits_rows, row, 1, u64::from(N_VOCAB))?;
-            b.dspark_markov_argmax(
-                &mut ds.markov_index,
-                &mut ds.markov_key,
-                &logits_row,
-                w1,
-                w2,
-                N_VOCAB,
-                d.markov_rank,
-                previous as u32,
-            )?;
-            let mut selected = [0u8; 4];
-            b.read(&ds.markov_index, 0, &mut selected)?;
-            let selected = i32::from_le_bytes(selected);
-            if selected < 0 || selected as u32 >= N_VOCAB {
-                return Err(Error {
-                    op: "dspark select",
-                });
-            }
-            tokens.push(selected);
-            previous = selected;
+        if target_next_token < 0 || target_next_token as u32 >= N_VOCAB {
+            return Err(Error {
+                op: "dspark select",
+            });
+        }
+        b.dspark_markov_chain(
+            &mut ds.markov_index,
+            &mut ds.markov_key,
+            &rows(logits_rows, 0, n_rows, u64::from(N_VOCAB))?,
+            w1,
+            w2,
+            N_VOCAB,
+            d.markov_rank,
+            target_next_token as u32,
+            n_rows,
+        )?;
+        let mut bytes = vec![0u8; n_rows as usize * 4];
+        b.read(&ds.markov_index, 0, &mut bytes)?;
+        let tokens: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| i32::from_le_bytes(c))
+            .collect();
+        if tokens
+            .iter()
+            .any(|&token| token < 0 || token as u32 >= N_VOCAB)
+        {
+            return Err(Error {
+                op: "dspark select",
+            });
         }
         Ok(tokens)
     }
@@ -1032,15 +1035,24 @@ impl Graph {
         let b = t.b;
         let d = t.dspark.ok_or(Error { op: "dspark draft" })?;
         let block = d.block_size;
+        let selected_rows = if max_tokens != 0 {
+            block.min(max_tokens)
+        } else {
+            block
+        };
         self.check_workspace(ws)?;
         // Narrow-batch routing for the support model without the verifier's
         // arithmetic candidates.
         b.set_batch_mode(BatchMode::Support);
         let result = (|| {
             self.dspark_prepare_hidden(t, ws, target_next_token, pos0, Hidden::FfnNorm)?;
+            // Non-causal support attention still needs the complete block.
+            // Its final vocabulary projection and Markov selection only need
+            // the requested prefix; later positions cannot influence earlier
+            // selections.
             let logits = b
                 .begin_commands()
-                .and_then(|()| self.encode_dspark_logits(t, &ws.ffn_norm, block));
+                .and_then(|()| self.encode_dspark_logits(t, &ws.ffn_norm, selected_rows));
             match logits {
                 Ok(()) => b.end_commands()?,
                 Err(error) => {
@@ -1061,7 +1073,7 @@ impl Graph {
                 select_sampled(t, self, ws, &mut requests, block)?;
                 return Ok(std::mem::take(&mut requests[0].tokens));
             }
-            self.dspark_select_block(t, target_next_token, block)
+            self.dspark_select_block(t, target_next_token, selected_rows)
         })();
         b.set_batch_mode(BatchMode::Off);
         result
