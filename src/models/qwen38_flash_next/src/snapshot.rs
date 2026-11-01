@@ -815,13 +815,13 @@ impl Executor {
     }
 
     /// Replaces the session's context with `payload`, keeping at most the
-    /// rollback rows the restored operation needs (`next_drafts`); never
-    /// allocates (`RestoreSnapshot`).
+    /// rollback rows the restored operation needs (`next_drafts`), or all of
+    /// them with `None`; never allocates (`RestoreSnapshot`).
     pub fn restore_snapshot(
         &mut self,
         session: &mut Session,
         payload: &[u8],
-        next_drafts: u32,
+        next_drafts: Option<u32>,
     ) -> Result<SnapshotInfo, String> {
         if session.owner != self.id {
             return Err("session belongs to another executor".into());
@@ -866,7 +866,7 @@ impl Executor {
         &mut self,
         session: &mut Session,
         snapshot: &Handle,
-        next_drafts: u32,
+        next_drafts: Option<u32>,
     ) -> Result<SnapshotInfo, String> {
         if session.owner != self.id {
             return Err("session belongs to another executor".into());
@@ -973,7 +973,7 @@ impl Executor {
         h: &Header,
         grids: &[u8],
         payload_len: usize,
-        next_drafts: u32,
+        next_drafts: Option<u32>,
     ) -> Result<(Vec<Section>, RopeLayout), String> {
         let h = *h;
         let max_blocks = h.position / h.compress_ratio;
@@ -1034,12 +1034,14 @@ impl Executor {
         self.stream
             .synchronize()
             .map_err(|e| format!("restore drain: {e}"))?;
-        let remaining = session.max_context - h.position;
-        session.trim_rollback(
-            next_drafts
-                .min(self.core.options.max_speculative - 1)
-                .min(remaining.saturating_sub(1)),
-        );
+        if let Some(next_drafts) = next_drafts {
+            let remaining = session.max_context - h.position;
+            session.trim_rollback(
+                next_drafts
+                    .min(self.core.options.max_speculative - 1)
+                    .min(remaining.saturating_sub(1)),
+            );
+        }
         Ok((sections, layout))
     }
 

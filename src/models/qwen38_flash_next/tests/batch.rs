@@ -116,8 +116,8 @@ fn batched_forwards_match_isolated_ones() {
             ex.rollback(&mut a, na as u32, None).unwrap();
             ex.rollback(&mut b, nb as u32, None).unwrap();
         }
-        ex.restore_snapshot(&mut a, &pa, 7).unwrap();
-        ex.restore_snapshot(&mut b, &pb, 7).unwrap();
+        ex.restore_snapshot(&mut a, &pa, Some(7)).unwrap();
+        ex.restore_snapshot(&mut b, &pb, Some(7)).unwrap();
         {
             let mut items = vec![
                 BatchItem {
@@ -151,7 +151,7 @@ fn batched_forwards_match_isolated_ones() {
                 .count();
             assert_eq!(differ, 0, "{label}, session {name}: logits differ");
         }
-        ex.restore_snapshot(&mut a, &pa, 7).unwrap();
-        ex.restore_snapshot(&mut b, &pb, 7).unwrap();
+        ex.restore_snapshot(&mut a, &pa, Some(7)).unwrap();
+        ex.restore_snapshot(&mut b, &pb, Some(7)).unwrap();
     }
 }

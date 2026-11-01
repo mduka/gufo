@@ -365,19 +365,46 @@ impl Model {
     /// device copies for a borrowed one, and into the session it borrows
     /// from, the rows it still holds stay.
     pub fn restore(&mut self, s: &mut Session, snapshot: &SessionSnapshot) -> Result<(), String> {
+        self.restore_part(s, snapshot, false)
+    }
+
+    /// [`restore`](Self::restore) into a session the continuation cache
+    /// reassigns: an MTP session keeps all its verification scratch and the
+    /// graphs that captured it, as upstream's component cache restores in
+    /// place (`ContinuationAdapter::BeginRestore`).
+    pub fn restore_reusing_mtp(
+        &mut self,
+        s: &mut Session,
+        snapshot: &SessionSnapshot,
+    ) -> Result<(), String> {
+        self.restore_part(s, snapshot, true)
+    }
+
+    fn restore_part(
+        &mut self,
+        s: &mut Session,
+        snapshot: &SessionSnapshot,
+        reuse_mtp: bool,
+    ) -> Result<(), String> {
         let at = snapshot.head.len();
         let total = snapshot.len();
         match &snapshot.executor {
-            Part::Host(bytes) => {
-                self.restore_with(s, &snapshot.head, total, at, |executor, native, next| {
-                    executor.restore_snapshot(native, bytes, next)
-                })
-            }
-            Part::Borrowed(handle) => {
-                self.restore_with(s, &snapshot.head, total, at, |executor, native, next| {
-                    executor.restore_borrowed(native, handle, next)
-                })
-            }
+            Part::Host(bytes) => self.restore_with(
+                s,
+                &snapshot.head,
+                total,
+                at,
+                reuse_mtp,
+                |executor, native, next| executor.restore_snapshot(native, bytes, next),
+            ),
+            Part::Borrowed(handle) => self.restore_with(
+                s,
+                &snapshot.head,
+                total,
+                at,
+                reuse_mtp,
+                |executor, native, next| executor.restore_borrowed(native, handle, next),
+            ),
         }
     }
 
@@ -399,23 +426,55 @@ impl Model {
     /// Replaces the session's context with a snapshot of the same model
     /// (`RestoreSnapshot`).
     pub fn restore_snapshot(&mut self, s: &mut Session, payload: &[u8]) -> Result<(), String> {
-        self.restore_with(s, payload, payload.len(), 0, |executor, native, next| {
-            let at = payload.len() - executor_part_len(payload);
-            executor.restore_snapshot(native, &payload[at..], next)
-        })
+        self.restore_payload(s, payload, false)
+    }
+
+    /// [`restore_snapshot`](Self::restore_snapshot) into a session the
+    /// continuation cache reassigns, as [`restore_reusing_mtp`](Self::restore_reusing_mtp).
+    pub fn restore_snapshot_reusing_mtp(
+        &mut self,
+        s: &mut Session,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        self.restore_payload(s, payload, true)
+    }
+
+    fn restore_payload(
+        &mut self,
+        s: &mut Session,
+        payload: &[u8],
+        reuse_mtp: bool,
+    ) -> Result<(), String> {
+        self.restore_with(
+            s,
+            payload,
+            payload.len(),
+            0,
+            reuse_mtp,
+            |executor, native, next| {
+                let at = payload.len() - executor_part_len(payload);
+                executor.restore_snapshot(native, &payload[at..], next)
+            },
+        )
     }
 
     /// Restores the session part `payload` (at least the head of a
     /// `total`-byte payload whose executor part starts at `at`, or at its
     /// computed offset when `at` is 0) and the executor part through
-    /// `executor`.
+    /// `executor`, which keeps the rollback rows it is given (all of them
+    /// with `reuse_mtp`).
     pub(super) fn restore_with(
         &mut self,
         s: &mut Session,
         payload: &[u8],
         total: usize,
         at: usize,
-        executor: impl FnOnce(&mut Executor, &mut state::Session, u32) -> Result<SnapshotInfo, String>,
+        reuse_mtp: bool,
+        executor: impl FnOnce(
+            &mut Executor,
+            &mut state::Session,
+            Option<u32>,
+        ) -> Result<SnapshotInfo, String>,
     ) -> Result<(), String> {
         if payload.len() < SESSION_HEADER_BYTES {
             return Err("session snapshot is truncated".into());
@@ -487,6 +546,7 @@ impl Model {
             // scratch either eligible policy can use after the restore.
             next_drafts = next_drafts.max(restored_policy.choose(budget, token_count, 0, true));
         }
+        let next_drafts = (!reuse_mtp).then_some(next_drafts);
         let info = match executor(&mut self.executor, &mut s.native, next_drafts) {
             Ok(info) => info,
             Err(e) => {

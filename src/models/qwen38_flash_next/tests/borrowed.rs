@@ -6,7 +6,9 @@
 //! session appends or decodes, a reset and the session's destruction; a
 //! dropped deep snapshot frees what only it needed; and without device
 //! headroom (`CheckDeviceExhaustion`) snapshots fall back to host bytes; a
-//! capture for the disk holds exactly its payload in host memory:
+//! capture for the disk holds exactly its payload in host memory; and a
+//! restore by the continuation cache keeps the session's verification
+//! scratch:
 //! cargo test --profile gpu-test -p gufo-qwen38-flash-next --features gpu --test borrowed
 
 #![cfg(feature = "gpu")]
@@ -305,6 +307,47 @@ fn persistence(model: &mut Model, prompt: &[i32], mode: SessionMode) {
     println!("persistence {mode:?}: host capture exact, no spare capacity");
 }
 
+/// A restore by the continuation cache keeps every rollback row of the
+/// session, and so the graphs that captured them, for its next decode
+/// (`ContinuationAdapter::BeginRestore`).
+fn cache_restore(model: &mut Model, prompt: &[i32]) {
+    let mut source = model
+        .create_session(SessionMode::Speculative, CONTEXT)
+        .unwrap();
+    model.sync(&mut source, &prompt[..32]).unwrap();
+    let expected = model.save_snapshot(&source).unwrap();
+    let borrowed = model.snapshot(&source).unwrap();
+    let empty = source.allocated_bytes();
+    decode(model, &mut source, 32);
+    let warm = source.allocated_bytes();
+    assert!(warm > empty, "decoding allocated no rollback rows");
+    model.restore_reusing_mtp(&mut source, &borrowed).unwrap();
+    assert_eq!(
+        source.allocated_bytes(),
+        warm,
+        "a cache restore discarded rollback rows"
+    );
+    assert!(
+        model.save_snapshot(&source).unwrap() == expected,
+        "a cache restore differs from its checkpoint"
+    );
+    decode(model, &mut source, 32);
+    let warm = source.allocated_bytes();
+    model
+        .restore_snapshot_reusing_mtp(&mut source, &expected)
+        .unwrap();
+    assert_eq!(
+        source.allocated_bytes(),
+        warm,
+        "a cache restore from bytes discarded rollback rows"
+    );
+    assert!(
+        model.save_snapshot(&source).unwrap() == expected,
+        "a cache restore from bytes differs from its checkpoint"
+    );
+    println!("cache restore: rollback rows kept, exact");
+}
+
 #[test]
 fn borrowed_snapshots_restore_like_host_snapshots() {
     let mut model = load();
@@ -315,4 +358,5 @@ fn borrowed_snapshots_restore_like_host_snapshots() {
         exhaustion(&mut model, &prompt, mode);
         persistence(&mut model, &prompt, mode);
     }
+    cache_restore(&mut model, &prompt);
 }

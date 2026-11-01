@@ -930,7 +930,7 @@ impl TextModelRunner for FlashNextRunner {
         let session_snapshot = self.check_snapshot(snapshot)?;
         let mut model = self.exec();
         self.ready(&mut model, state);
-        if let Err(e) = model.restore(&mut state.session, session_snapshot) {
+        if let Err(e) = model.restore_reusing_mtp(&mut state.session, session_snapshot) {
             text::TextRunnerState::invalidate(state);
             return Err(engine(format!(
                 "Qwen3.8-Flash-Next snapshot restore failed: {e}"
@@ -980,7 +980,7 @@ impl TextModelRunner for FlashNextRunner {
     ) -> Result<()> {
         let mut model = self.exec();
         self.ready(&mut model, state);
-        if let Err(e) = model.restore_snapshot(&mut state.session, payload) {
+        if let Err(e) = model.restore_snapshot_reusing_mtp(&mut state.session, payload) {
             text::TextRunnerState::invalidate(state);
             return Err(engine(format!(
                 "Qwen3.8-Flash-Next persistent snapshot restore failed: {e}"
