@@ -265,7 +265,7 @@ Against v0.27.0. Everything not listed behaves as upstream does.
 
 | Area | Rust |
 | --- | --- |
-| Conversation cache | Rust keeps its own continuation cache (RAM and disk tiers, same-slot in-place restore) with upstream's policies: the deepest checkpoint across RAM and disk, metadata-only startup, oversized checkpoints on disk only and the wait for checkpoints being published. It does not use upstream's `src/cache` component. Disk checkpoints are written in 1 MiB pieces but serialised and restored as whole payloads, so a disk transfer stages the whole checkpoint in host memory. Two consequences show in the functional suites on Flash-Next: an exactly repeated request restores the state before the assistant's opening and prefills its 7 tokens again, where `src/cache` keeps the whole prompt (`sampling-defaults`); and after earlier suites have filled the cache, `cache-edits` misses an intermediate checkpoint (alone, it passes). Restoring a Flash-Next snapshot into another session copies all of its rows; upstream tracks snapshot lineage and keeps rows both sessions already share. |
+| Conversation cache | Rust keeps its own continuation cache (RAM and disk tiers, same-slot in-place restore) with upstream's policies: the deepest checkpoint across RAM and disk, metadata-only startup, oversized checkpoints on disk only and the wait for checkpoints being published. It does not use upstream's `src/cache` component. Disk checkpoints are written in 1 MiB pieces but serialised and restored as whole payloads, so a disk transfer stages the whole checkpoint in host memory. Two consequences show in the functional suites on Flash-Next: an exactly repeated request restores the state before the assistant's opening and prefills its 7 tokens again, where `src/cache` keeps the whole prompt (`sampling-defaults`); and after earlier suites have filled the cache, `cache-edits` misses an intermediate checkpoint (alone, it passes). Restoring a Flash-Next snapshot into another session copies all of its rows; upstream tracks snapshot lineage and keeps rows both sessions already share. A Flash-Next capture freezes the mutable state on the device and leaves the rows in the session; once a request has generated 10 tokens, the frozen state of the snapshots captured so far moves into pageable host memory on a thread of its own and the device blocks return for the next captures. Upstream copies captures into pinned host memory, 2 GiB of which it commits at load and grows before each prefill; restoring the state from pageable memory takes about 1.5 ms longer. |
 | Flash-Next n-gram rows across cache checkpoints | Read through the page cache; the prefetch across checkpoint boundaries is not ported. |
 | Image sessions and HIP graphs | Graph keys carry whether a session has an image RoPE table, so text graphs survive an image's arrival and image graphs are captured once per shape. |
 | JPEG decoding | `zune-jpeg` instead of libjpeg-turbo: pixels may differ by a few levels (another IDCT and upsampling), so outputs on JPEG images may differ. PNG and WebP decode as upstream's do. |
@@ -311,8 +311,8 @@ ratio of a Rust run's rounds to the pooled C++ rounds. Peak memory is
 everything a run takes from the machine: host memory the kernel cannot
 reclaim, which on the APU includes the GTT, plus VRAM. Device memory (VRAM
 plus GTT) is reported but not judged, as both sides keep some buffers in
-different places: C++ copies serving snapshots into host memory, Rust
-keeps them on the device.
+different places: C++ copies serving snapshots into pinned host memory it
+commits at load, Rust keeps them on the device until a decode is under way.
 
 ### Results
 
@@ -387,23 +387,31 @@ Measured in alternating rounds as well, the single embedding request takes
 +3.4% (≤ +5.7) with three single requests per round, each right after a
 batch, where its latency varies by about 15% from request to request; 200
 single requests per server, alternating, take 5.85 to 5.86 ms against
-C++'s 5.82 to 5.84 (+0.4%). Where Rust is slower:
+C++'s 5.82 to 5.84 (+0.4%). Runs that each start from a GPU cooled to
+45 °C, alternating and in swapped order, remove the run order from the
+other gaps: 27B DFlash2 prefill is +0.03% (+0.62% in alternating rounds,
+where the later slot ran hotter), Flash-Next decodes with MTP at 49.16 to
+49.27 tokens per second against C++'s 48.73 to 49.25, and serving the 27B
+with DFlash2 takes +0.15 to +0.25% (about 3 ms) to the first token and
+about +0.1% per token at concurrency 4.
 
-- **27B with DFlash2, prefill:** +0.62% in alternating rounds (+0.46 to
-  +0.73%). Autoregressive prefill is equal, so the cost lies in the DFlash2
-  part (the prompt feature capture or the draft's context); the cause is
-  open.
-- **Flash-Next with MTP:** +2.0% in alternating rounds (+0.2 to +5.2%),
-  within the machine-state noise above. Under
-  `rocprofv3`, both decode the same work (81,042 and 81,050 dispatches) with
-  the same kernel time (2,556 ms) and span (2,766 ms), and single runs with
-  steady rounds give 47.95 to 48.65 tokens per second against C++'s 48.13
-  to 48.85.
-- **Flash-Next serving with MTP, first token:** +1.1 to +3.8%. Rust keeps
-  each request's prompt snapshot on the device, where the stream pool maps
-  new memory while the continuation cache fills; C++ copies snapshots into
-  host memory it reserves at load.
-- **27B serving at concurrency 4 and first token:** +0.2 to +0.5%.
+Flash-Next serving with MTP was measured that way after the table's runs,
+with the snapshot handling of the [conversation
+cache](#implemented-differently): time to the first and the tenth streamed
+token at concurrency 1, four servers per side. A new 443-token prompt takes 440.7
+to 440.9 and 571.6 to 572.4 ms against C++'s 441.0 to 442.8 and 572.8 to
+575.0 ms (one server per side, whose first requests ran in the slow
+machine state, left out). The second turn of a conversation (568 tokens
+cached, 29 prefilled) takes 132.6 to 133.1 and 326.3 to 330.9 ms against
+134.7 to 137.0 and 329.8 to 332.2 ms, the third 136.6 to 139.0 and 269.3
+to 271.0 ms against 138.5 to 142.1 and 272.1 to 275.9 ms. An exactly
+repeated prompt restores its snapshot from host memory and takes 6.7 to
+6.9 and 132.7 to 133.5 ms against 5.2 to 5.3 and 131.6 to 132.0 ms, so
+Rust is slower there:
+
+- **Flash-Next serving, a repeated prompt:** +1.4 to +1.7 ms to the first
+  token, +0.5 to +1.4% to the tenth: the snapshot's state comes from
+  pageable host memory ([conversation cache](#implemented-differently)).
 - **Embedding:** one request +0.4%; the cause is open.
 
 ### The C++ reference
