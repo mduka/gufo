@@ -410,8 +410,14 @@ repeated prompt restores its snapshot from host memory and takes 6.7 to
 Rust is slower there:
 
 - **Flash-Next serving, a repeated prompt:** +1.4 to +1.7 ms to the first
-  token, +0.5 to +1.4% to the tenth: the snapshot's state comes from
-  pageable host memory ([conversation cache](#implemented-differently)).
+  token, +0.5 to +1.4% to the tenth. The restore copies the snapshot's
+  frozen state (about 118 MB) from pageable host memory
+  ([conversation cache](#implemented-differently)), which takes 3.5 to
+  4.6 ms; C++ copies it from the pinned host memory it commits at load, in
+  2.2 to 2.8 ms. Matching that needs pinned memory held for the cache, and
+  Rust reserves no host memory up front. Pinning a buffer for each capture
+  instead costs 35 to 55 ms to the first token, and batching the restore's
+  copies gains nothing, as the transfer from pageable memory dominates.
 - **Embedding:** one request +0.4%; the cause is open.
 
 ### The C++ reference
