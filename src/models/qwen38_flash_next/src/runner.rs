@@ -168,7 +168,16 @@ pub struct FlashNextState {
     reuse_mtp: bool,
     /// False for an `ignore_eos` request.
     stop_at_eos: bool,
+    /// The position at which the decode settles earlier snapshots
+    /// ([`SETTLE_AFTER_TOKENS`]).
+    settle_at: Option<usize>,
 }
+
+/// Tokens a request generates before the frozen state of the snapshots
+/// captured so far moves into host memory: the copies then share the decode
+/// with the GPU instead of delaying a prefill or the first tokens. Snapshots
+/// of a shorter request settle in the next one.
+const SETTLE_AFTER_TOKENS: usize = 10;
 
 /// A session snapshot, borrowed or in host bytes
 /// (`QwenFlashNextTextRunnerSnapshot`).
@@ -354,6 +363,14 @@ impl FlashNextRunner {
         u32::try_from(token).is_ok_and(|token| stops.contains(token))
     }
 
+    /// Settles earlier snapshots once the request's first tokens are out.
+    fn settle_after_start(&self, state: &mut FlashNextState) {
+        if state.settle_at.is_some_and(|at| state.position >= at) {
+            state.settle_at = None;
+            self.snapshots.settle_ahead();
+        }
+    }
+
     /// Resets an invalidated state before it runs again.
     fn ready(&self, model: &mut Model, state: &mut FlashNextState) {
         if std::mem::take(&mut state.reset_pending) {
@@ -537,6 +554,7 @@ impl TextModelRunner for FlashNextRunner {
             reset_pending: false,
             reuse_mtp: false,
             stop_at_eos: true,
+            settle_at: None,
         })
     }
 
@@ -609,6 +627,9 @@ impl TextModelRunner for FlashNextRunner {
             return Err(engine(format!("Qwen3.8-Flash-Next prefill failed: {e}")));
         }
         state.position = next;
+        if next == prompt.len() {
+            state.settle_at = Some(next + SETTLE_AFTER_TOKENS);
+        }
         Ok(TextPrefillStep {
             consumed_tokens: consumed,
             decode_ready: next == prompt.len(),
@@ -674,6 +695,9 @@ impl TextModelRunner for FlashNextRunner {
                 }
             };
         state.position = next;
+        if next == prompt.len() {
+            state.settle_at = Some(next + SETTLE_AFTER_TOKENS);
+        }
         Ok(TextPrefillThrough {
             step: TextPrefillStep {
                 consumed_tokens: consumed,
@@ -724,6 +748,7 @@ impl TextModelRunner for FlashNextRunner {
             .evaluate(&mut state.session, token)
             .map_err(|e| engine(format!("Qwen3.8-Flash-Next decode failed: {e}")))?;
         state.position += 1;
+        self.settle_after_start(state);
         Ok(())
     }
 
@@ -768,6 +793,7 @@ impl TextModelRunner for FlashNextRunner {
         // distribution.
         sampler.copy_draw_state_from(&working);
         state.position = state.session.position() as usize;
+        self.settle_after_start(state);
         let after = state.session.statistics();
         Ok(TextDecodeStep {
             selections: self.step_selections(&mut decoded),
@@ -824,6 +850,7 @@ impl TextModelRunner for FlashNextRunner {
                     result.map_err(|e| engine(format!("Flash-Next MTP failed: {e}")))?;
                 d.sampler.copy_draw_state_from(sampler);
                 d.state.position = d.state.session.position() as usize;
+                self.settle_after_start(d.state);
                 let after = d.state.session.statistics();
                 Ok(TextDecodeStep {
                     execution_plan: if active > 1 && !decoded.tokens.is_empty() {
@@ -877,6 +904,7 @@ impl TextModelRunner for FlashNextRunner {
             .map(|(a, result)| {
                 result.map_err(|e| engine(format!("Flash-Next advance failed: {e}")))?;
                 a.state.position = a.state.session.position() as usize;
+                self.settle_after_start(a.state);
                 Ok(())
             })
             .collect())

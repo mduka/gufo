@@ -6,12 +6,16 @@
 //! restore, the session's end) the rows are copied out once per set of
 //! borrowing snapshots (`Preserve`); without device headroom the affected
 //! snapshots move into host payloads instead. Byte readers materialize the
-//! unchanged host payload. All of a session's snapshots live in its
+//! unchanged host payload. Once a decode is under way, the frozen state moves
+//! into host memory on a thread of its own and its device blocks return to
+//! the pool, so later captures reuse them instead of committing device
+//! pages, as upstream's component cache keeps its captures in host memory;
+//! the rows stay borrowed. All of a session's snapshots live in its
 //! registry, behind the one lock every reader and writer of their rows takes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use gufo_hip::{DeviceBuffer, DeviceSlice, SharedBytes, Stream, device_memory, huge_page_buffer};
 
@@ -21,6 +25,10 @@ use crate::snapshot::{HEADER_BYTES, Header};
 /// executor's lazy scratch, for the runtime and driver
 /// (`kSnapshotDeviceSlackBytes`).
 pub(crate) const DEVICE_SLACK_BYTES: usize = 512 << 20;
+/// Bytes per copy when snapshots settle into host memory: a staged copy into
+/// pageable memory delays the request thread's HIP allocations while it
+/// runs, a 118 MB one by up to 12 ms.
+const SETTLE_PIECE_BYTES: usize = 16 << 20;
 /// Released mutable-state blocks kept for the next captures: committing
 /// device pages runs at about 25 GB/s and stalls other HIP calls
 /// (`kSpareBlocks`).
@@ -34,6 +42,8 @@ pub(crate) struct Pool {
     host: Mutex<Stream>,
     spares: Mutex<Vec<DeviceBuffer<u8>>>,
     reserve: usize,
+    /// Snapshots whose frozen state is still on the device, oldest first.
+    unsettled: Mutex<Vec<(Weak<Registry>, u64)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -49,7 +59,30 @@ impl Pool {
             host: Mutex::new(stream()?),
             spares: Mutex::new(Vec::new()),
             reserve: scratch + DEVICE_SLACK_BYTES,
+            unsettled: Mutex::new(Vec::new()),
         }))
+    }
+
+    /// Moves the frozen state of every snapshot captured so far into host
+    /// memory, on a thread of its own: later captures reuse their device
+    /// blocks (upstream copies its captures into host backing it prepares
+    /// ahead, `GrowAhead`).
+    pub fn settle_ahead(&self) {
+        let pending = std::mem::take(&mut *lock(&self.unsettled));
+        if pending.is_empty() {
+            return;
+        }
+        // Without a thread the snapshots stay on the device, as before.
+        let _ = std::thread::Builder::new()
+            .name("gufo-snapshot-settle".into())
+            .spawn(move || {
+                for (registry, id) in pending {
+                    if let Some(registry) = registry.upgrade() {
+                        // A failed copy leaves the snapshot on the device.
+                        let _ = registry.settle(id);
+                    }
+                }
+            });
     }
 
     /// Whether allocating `bytes` keeps the reserve free. The snapshot
@@ -75,6 +108,14 @@ impl Pool {
         }
         drop(spares);
         self.block(stream, bytes)
+    }
+
+    /// Keeps a released mutable-state block for the next captures, unless
+    /// a reader still holds it.
+    fn release_shared(&self, buffer: Arc<DeviceBuffer<u8>>) {
+        if let Ok(buffer) = Arc::try_unwrap(buffer) {
+            self.release(buffer);
+        }
     }
 
     fn release(&self, buffer: DeviceBuffer<u8>) {
@@ -120,6 +161,31 @@ pub(crate) struct Piece {
     pub at: usize,
 }
 
+/// Frozen payload bytes, on the device or, once settled, in host memory.
+pub(crate) enum Frozen<'a> {
+    Device(DeviceSlice<'a, u8>),
+    Host(&'a [u8]),
+}
+
+impl Frozen<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Frozen::Device(slice) => slice.len(),
+            Frozen::Host(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// A snapshot's frozen regions in host memory (`Settle`): the mutable
+/// prefix at its payload offset and the other small regions with their
+/// pieces.
+struct Settled {
+    mutable_at: usize,
+    mutable: Vec<u8>,
+    extras: Vec<u8>,
+    pieces: Vec<Piece>,
+}
+
 /// Trunk and draft rows a write keeps, and their pooled blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Keep {
@@ -157,9 +223,12 @@ pub(crate) struct Entry {
     /// The image grids after the sections.
     pub grids: Vec<u8>,
     /// The payload's mutable prefix, frozen: its payload offset and block.
-    mutable: Option<(usize, DeviceBuffer<u8>)>,
+    /// Shared with a settling copy, which reads it outside the lock.
+    mutable: Option<(usize, Arc<DeviceBuffer<u8>>)>,
     /// The other small regions, frozen in one block.
-    extras: Option<(DeviceBuffer<u8>, Vec<Piece>)>,
+    extras: Option<(Arc<DeviceBuffer<u8>>, Vec<Piece>)>,
+    /// Both frozen parts once moved to host memory.
+    settled: Option<Settled>,
     regions: Vec<Region>,
     /// The host payload once materialized.
     payload: Option<Arc<Vec<u8>>>,
@@ -174,30 +243,43 @@ impl Entry {
         self.payload.as_ref()
     }
 
-    /// The frozen device copy of payload bytes `[offset, offset + len)` of
-    /// the mutable prefix, when they lie in it.
-    pub fn mutable(&self, offset: usize, len: usize) -> Option<DeviceSlice<'_, u8>> {
+    /// The frozen copy of payload bytes `[offset, offset + len)` of the
+    /// mutable prefix, when they lie in it.
+    pub fn mutable(&self, offset: usize, len: usize) -> Option<Frozen<'_>> {
+        if let Some(settled) = &self.settled {
+            let start = offset.checked_sub(settled.mutable_at)?;
+            return settled.mutable.get(start..start + len).map(Frozen::Host);
+        }
         let (at, block) = self.mutable.as_ref()?;
         let start = offset.checked_sub(*at)?;
-        (start + len <= block.len()).then(|| block.slice(start..start + len))
+        (start + len <= block.len()).then(|| Frozen::Device(block.slice(start..start + len)))
     }
 
     /// The frozen pieces overlapping payload bytes `[offset, offset + len)`:
-    /// (offset within the range, device bytes).
-    pub fn extras(&self, offset: usize, len: usize) -> Vec<(usize, DeviceSlice<'_, u8>)> {
+    /// (offset within the range, bytes).
+    pub fn extras(&self, offset: usize, len: usize) -> Vec<(usize, Frozen<'_>)> {
+        let overlaps = |pieces: &[Piece]| {
+            pieces
+                .iter()
+                .filter_map(|p| {
+                    let begin = offset.max(p.offset);
+                    let end = (offset + len).min(p.offset + p.bytes);
+                    (begin < end).then(|| (begin - offset, p.at + begin - p.offset, end - begin))
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(settled) = &self.settled {
+            return overlaps(&settled.pieces)
+                .into_iter()
+                .map(|(within, at, bytes)| (within, Frozen::Host(&settled.extras[at..at + bytes])))
+                .collect();
+        }
         let Some((block, pieces)) = &self.extras else {
             return Vec::new();
         };
-        pieces
-            .iter()
-            .filter_map(|p| {
-                let begin = offset.max(p.offset);
-                let end = (offset + len).min(p.offset + p.bytes);
-                (begin < end).then(|| {
-                    let at = p.at + begin - p.offset;
-                    (begin - offset, block.slice(at..at + end - begin))
-                })
-            })
+        overlaps(pieces)
+            .into_iter()
+            .map(|(within, at, bytes)| (within, Frozen::Device(block.slice(at..at + bytes))))
             .collect()
     }
 
@@ -256,9 +338,10 @@ impl Entry {
 
     fn release(&mut self, pool: &Pool) {
         if let Some((_, block)) = self.mutable.take() {
-            pool.release(block);
+            pool.release_shared(block);
         }
         self.extras = None;
+        self.settled = None;
         self.regions.clear();
     }
 
@@ -272,6 +355,14 @@ impl Entry {
         self.header.write(&mut out);
         let grids = out.len() - self.grids.len();
         out[grids..].copy_from_slice(&self.grids);
+        if let Some(settled) = &self.settled {
+            let at = settled.mutable_at;
+            out[at..at + settled.mutable.len()].copy_from_slice(&settled.mutable);
+            for p in &settled.pieces {
+                out[p.offset..p.offset + p.bytes]
+                    .copy_from_slice(&settled.extras[p.at..p.at + p.bytes]);
+            }
+        }
         let stream = lock(&pool.host);
         let mut copy = |source: DeviceSlice<'_, u8>, at: usize| {
             stream
@@ -360,6 +451,64 @@ impl Registry {
 
     pub fn lock(&self) -> MutexGuard<'_, State> {
         lock(&self.state)
+    }
+
+    /// Moves snapshot `id`'s frozen state into host memory and returns its
+    /// device blocks to the pool; its rows stay borrowed. The copy runs
+    /// outside the lock, which every forward takes, from blocks no writer
+    /// touches; a snapshot dropped or materialized meanwhile keeps the
+    /// result of that.
+    pub fn settle(&self, id: u64) -> Result<(), String> {
+        let (mutable, extras) = {
+            let state = self.lock();
+            state.check()?;
+            match state.entries.get(&id) {
+                Some(entry) if entry.payload.is_none() && entry.settled.is_none() => {
+                    (entry.mutable.clone(), entry.extras.clone())
+                }
+                _ => return Ok(()),
+            }
+        };
+        let mut settled = Settled {
+            mutable_at: mutable.as_ref().map_or(0, |(at, _)| *at),
+            mutable: Vec::new(),
+            extras: Vec::new(),
+            pieces: extras.as_ref().map_or_else(Vec::new, |(_, p)| p.clone()),
+        };
+        {
+            let stream = lock(&self.pool.host);
+            let copy = |source: &DeviceBuffer<u8>| {
+                let mut out = huge_page_buffer(source.len());
+                for (i, piece) in out.chunks_mut(SETTLE_PIECE_BYTES).enumerate() {
+                    let at = i * SETTLE_PIECE_BYTES;
+                    stream
+                        .download_bytes_across(source.slice(at..at + piece.len()), piece)
+                        .map_err(|e| format!("snapshot settle: {e}"))?;
+                }
+                Ok::<_, String>(out)
+            };
+            if let Some((_, block)) = &mutable {
+                settled.mutable = copy(block)?;
+            }
+            if let Some((block, _)) = &extras {
+                settled.extras = copy(block)?;
+            }
+        }
+        let (old_mutable, old_extras) = {
+            let mut state = self.lock();
+            match state.entries.get_mut(&id) {
+                Some(entry) if entry.payload.is_none() && entry.settled.is_none() => {
+                    entry.settled = Some(settled);
+                    (entry.mutable.take(), entry.extras.take())
+                }
+                _ => (None, None),
+            }
+        };
+        drop((mutable, extras, old_extras));
+        if let Some((_, block)) = old_mutable {
+            self.pool.release_shared(block);
+        }
+        Ok(())
     }
 
     /// Freezes a capture: `mutable` (payload offset, sources) into one block,
@@ -451,12 +600,14 @@ impl Registry {
             Entry {
                 header,
                 grids,
-                mutable: Some((mutable_at, mutable_block)),
-                extras: extras_block.map(|block| (block, pieces)),
+                mutable: Some((mutable_at, Arc::new(mutable_block))),
+                extras: extras_block.map(|block| (Arc::new(block), pieces)),
+                settled: None,
                 regions,
                 payload: None,
             },
         );
+        lock(&self.pool.unsettled).push((Arc::downgrade(self), id));
         Ok(Some(Handle {
             registry: Arc::clone(self),
             id,
@@ -677,6 +828,11 @@ impl Handle {
             .get_mut(&self.id)
             .ok_or("snapshot is no longer registered")?;
         entry.materialize(&self.registry.pool)
+    }
+
+    /// [`Registry::settle`] of this snapshot.
+    pub fn settle(&self) -> Result<(), String> {
+        self.registry.settle(self.id)
     }
 
     /// Device bytes the snapshot holds, counting each shared block once

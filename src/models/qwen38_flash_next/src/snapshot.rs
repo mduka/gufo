@@ -13,7 +13,7 @@ use gufo_hip::Stream;
 
 use gufo_qwen::vision::{ImageGrid, RopeLayout};
 
-use crate::borrowed::{Handle, Keep, Pool, Registry, RowSection};
+use crate::borrowed::{Frozen, Handle, Keep, Pool, Registry, RowSection};
 use crate::checkpoint::{CheckpointStorage, PrefillCheckpoint};
 use crate::config::Config;
 use crate::executor::Executor;
@@ -637,6 +637,11 @@ impl Saver {
         self.capture(session, None, h)
     }
 
+    /// [`Pool::settle_ahead`] of the executor's snapshot storage.
+    pub(crate) fn settle_ahead(&self) {
+        self.pool.settle_ahead();
+    }
+
     /// [`save_checkpoint`](Self::save_checkpoint) as a borrowed snapshot:
     /// the checkpoint's mutable state is frozen before the next forward
     /// reuses `storage`.
@@ -924,6 +929,13 @@ impl Executor {
                     .copy_across(source, target)
                     .map_err(|e| format!("snapshot restore: {e}"))
             };
+            // Frozen state is on the device until it settles into host memory.
+            let put = |source: Frozen<'_>, target: DeviceSliceMut<'_, u8>| match source {
+                Frozen::Device(source) => copy(source, target),
+                Frozen::Host(bytes) => stream
+                    .upload_bytes(bytes, target)
+                    .map_err(|e| format!("snapshot restore: {e}")),
+            };
             for s in &sections {
                 if session.check_cancelled() {
                     return Err("generation cancelled".into());
@@ -933,12 +945,13 @@ impl Executor {
                         let frozen = entry
                             .mutable(s.offset, s.bytes)
                             .ok_or("snapshot mutable state is missing")?;
-                        copy(frozen, view_mut(session, s)?.into_bytes()?)?;
+                        put(frozen, view_mut(session, s)?.into_bytes()?)?;
                     }
                     Kind::Extra => {
                         for (at, piece) in entry.extras(s.offset, s.bytes) {
                             let target = view_mut(session, s)?.into_bytes()?;
-                            copy(piece, target.range(at..at + piece.len()))?;
+                            let len = piece.len();
+                            put(piece, target.range(at..at + len))?;
                         }
                     }
                     Kind::Rows { .. } => {

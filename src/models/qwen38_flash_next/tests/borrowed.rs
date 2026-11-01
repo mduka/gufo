@@ -6,9 +6,10 @@
 //! session appends or decodes, a reset and the session's destruction; a
 //! dropped deep snapshot frees what only it needed; and without device
 //! headroom (`CheckDeviceExhaustion`) snapshots fall back to host bytes; a
-//! capture for the disk holds exactly its payload in host memory; and a
+//! capture for the disk holds exactly its payload in host memory; a
 //! restore by the continuation cache keeps the session's verification
-//! scratch:
+//! scratch; and a snapshot whose frozen state settled into host memory gives
+//! back its device blocks and stays exact:
 //! cargo test --profile gpu-test -p gufo-qwen38-flash-next --features gpu --test borrowed
 
 #![cfg(feature = "gpu")]
@@ -307,6 +308,69 @@ fn persistence(model: &mut Model, prompt: &[i32], mode: SessionMode) {
     println!("persistence {mode:?}: host capture exact, no spare capacity");
 }
 
+/// A snapshot whose frozen state settled into host memory, at once or in
+/// the background while it is restored, holds no device block, and
+/// restores, forks and materializes the same bytes, through a rewind over
+/// its rows.
+fn settled(model: &mut Model, prompt: &[i32], mode: SessionMode) {
+    let mut source = model.create_session(mode, CONTEXT).unwrap();
+    model.sync(&mut source, &prompt[..64]).unwrap();
+    let expected = model.save_snapshot(&source).unwrap();
+    let snapshot = model.snapshot(&source).unwrap();
+    assert!(
+        snapshot.device_bytes() != 0,
+        "{mode:?}: the capture did not borrow"
+    );
+    snapshot.settle().unwrap();
+    assert_eq!(
+        snapshot.device_bytes(),
+        0,
+        "{mode:?}: a settled snapshot kept device blocks"
+    );
+    decode(model, &mut source, 16);
+    model.restore(&mut source, &snapshot).unwrap();
+    assert!(
+        model.save_snapshot(&source).unwrap() == expected,
+        "{mode:?}: a settled snapshot restores differently"
+    );
+    let mut fork = model.create_session(mode, CONTEXT).unwrap();
+    model.restore(&mut fork, &snapshot).unwrap();
+    assert!(
+        model.save_snapshot(&fork).unwrap() == expected,
+        "{mode:?}: a settled snapshot forks differently"
+    );
+    model.reset(&mut source);
+    model.sync(&mut source, &prompt[100..140]).unwrap();
+    assert!(
+        snapshot.to_bytes().unwrap() == expected,
+        "{mode:?}: a settled snapshot lost its overwritten rows"
+    );
+
+    model.sync(&mut fork, &prompt[..96]).unwrap();
+    let expected = model.save_snapshot(&fork).unwrap();
+    let snapshot = model.snapshot(&fork).unwrap();
+    decode(model, &mut fork, 16);
+    model.snapshotter().unwrap().settle_ahead();
+    model.restore(&mut fork, &snapshot).unwrap();
+    assert!(
+        model.save_snapshot(&fork).unwrap() == expected,
+        "{mode:?}: a snapshot restored while it settles differs"
+    );
+    let started = std::time::Instant::now();
+    while snapshot.device_bytes() != 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{mode:?}: the snapshot did not settle in the background"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        snapshot.to_bytes().unwrap() == expected,
+        "{mode:?}: a snapshot settled in the background differs"
+    );
+    println!("settled snapshots {mode:?}: no device blocks; restore, fork, rewind exact");
+}
+
 /// A restore by the continuation cache keeps every rollback row of the
 /// session, and so the graphs that captured them, for its next decode
 /// (`ContinuationAdapter::BeginRestore`).
@@ -357,6 +421,7 @@ fn borrowed_snapshots_restore_like_host_snapshots() {
         retention(&mut model, &prompt, mode);
         exhaustion(&mut model, &prompt, mode);
         persistence(&mut model, &prompt, mode);
+        settled(&mut model, &prompt, mode);
     }
     cache_restore(&mut model, &prompt);
 }

@@ -63,6 +63,13 @@ impl Snapshotter {
         self.capture_parts(s, true)
     }
 
+    /// Moves the frozen state of the borrowed snapshots captured so far into
+    /// host memory in the background: later captures reuse their device
+    /// blocks.
+    pub fn settle_ahead(&self) {
+        self.saver.settle_ahead();
+    }
+
     /// [`save`](Self::save) as a [`SessionSnapshot`] in host bytes.
     pub fn capture_host(&self, s: &Session) -> Result<SessionSnapshot, String> {
         self.capture_parts(s, false)
@@ -291,6 +298,15 @@ impl SessionSnapshot {
         match &self.executor {
             Part::Host(_) => 0,
             Part::Borrowed(handle) => handle.device_bytes(),
+        }
+    }
+
+    /// Moves a borrowed snapshot's frozen state into host memory now; its
+    /// rows stay borrowed.
+    pub fn settle(&self) -> Result<(), String> {
+        match &self.executor {
+            Part::Borrowed(handle) => handle.settle(),
+            Part::Host(_) => Ok(()),
         }
     }
 
