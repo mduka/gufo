@@ -14,9 +14,10 @@ with its measurement. Techniques that carry over to other models are
 collected under "Transferable techniques".
 
 The kernels in this tree are upstream's. Entries marked "measured" were
-implemented and measured on the Rust engine, but their kernel changes are
-kept apart, to land as changes of their own that the C++ engine can take as
-well.
+implemented and measured on the Rust engine before it took upstream's
+kernels unchanged. Checked against upstream `main` on 2026-11-01, upstream
+has made F8 and F9 itself and F1 no longer applies on ROCm 10.1, so none of
+them is left to land (see each entry).
 
 ## Index
 
@@ -46,18 +47,18 @@ well.
 | S1 | Grammar masks on the device | serving | changes bits unless exact | 27B DFlash2: 26.7 against 28.8 tok/s with a JSON schema |
 | S2 | Asynchronous warm-continuation snapshot | serving | bit-exact | scheduler stall with several requests |
 | S3 | Decode during a snapshot capture | serving | bit-exact | c2: 2 × 37.8 ms instead of one ~48 ms step |
-| F1 | Logits written to host-visible memory by a kernel | Flash-Next (measured), dense Qwen | bit-exact | Flash-Next c2 −0.5%, c1 and MTP level |
+| F1 | Logits written to host-visible memory by a kernel | Flash-Next (measured), dense Qwen | bit-exact | none on ROCm 10.1: the download already runs as a copy kernel (2026-11-01) |
 | F2 | MTP host time per cycle | Flash-Next | bit-exact | ~0.1 to 0.3% |
 | F3 | Preallocated rollback rows and control slots | Flash-Next | bit-exact | 4.6 to 8.2 ms on first growth, 20 to 290 µs per new width |
 | F4 | One copy less for the PLE rows | Flash-Next | bit-exact | one host copy per token |
 | F5 | Host allocations in the batched GatedDeltaNet path | Flash-Next | bit-exact | ~64 `Vec`s per linear layer and step |
 | F6 | Prefill kernels | Flash-Next | changes bits | pp512 1026 against 1043 t/s (C++) |
 | F7 | Device stall after the PLE convolution | Flash-Next | bit-exact | none: a profiler artifact (2026-10-05) |
-| F8 | Fewer decode kernels: shared and fused activation quantization | Flash-Next (measured) | bit-exact | AR −1.7%, MTP −1.6%; 1,623 → 1,247 kernels per step |
-| F9 | Latency-bound decode kernels | Flash-Next (HC combine, HC mix epilogue, small GEMM measured) | bit-exact | AR −5.5%, MTP −3.1% |
+| F8 | Fewer decode kernels: shared and fused activation quantization | Flash-Next (measured) | bit-exact | in upstream (#518, `qfn_mmq_moe_gated_vec_preq`); was AR −1.7%, MTP −1.6% |
+| F9 | Latency-bound decode kernels | Flash-Next (HC combine, HC mix epilogue, small GEMM measured) | bit-exact | in upstream (#518, #894); was AR −5.5%, MTP −3.1% |
 | F10 | Quantizations after a GEMV, in the consuming GEMV | Flash-Next | bit-exact | ~94 kernels per step, ~0.5% |
 | F11 | Remaining short decode chains and small grids | Flash-Next | bit-exact | ≤ 0.5 ms per token |
-| F12 | Serving measurement of F1 to F9 | Flash-Next | measurement only | c1, c2, c4 against the build before F1 |
+| F12 | Serving measurement of F1 to F9 | Flash-Next | measurement only | moot: none of them is left to land |
 | A1 | Lazy encoder upload | Qwen3-ASR | bit-exact | load 415 against 346 ms (serve) |
 | I1 | Device memory below the C++ pool order | Qwen-Image | bit-exact | peaks of 32.42 and 40.55 GiB |
 | I2 | Faster hashing for the tokenizer | Qwen-Image | bit-exact | `/ready` ~309 against ~261 ms |
@@ -72,7 +73,7 @@ names where to look, not a measured gain.
 
 | Technique | In Flash-Next | Precondition | Where to look next |
 | --- | --- | --- | --- |
-| Logits written to host-visible memory by a compute-queue kernel (F1) | per-token download | downloads queue behind copy-engine work (snapshots) | dense Qwen (F1) |
+| Logits written to host-visible memory by a compute-queue kernel (F1) | per-token download | downloads queue behind copy-engine work (snapshots); on ROCm 10.1 they run as copy kernels already | dense Qwen (F1), only where a trace shows the download on the copy engine |
 | One quantized input for every projection of the same rows (F8 step 1) | shared and routed experts | two launchers quantize the same rows | DeepSeek V4 Flash's MoE (own `ds4_mmq` quantizer) |
 | The producing kernel writes the next GEMV's Q8_1 rows (`StoreQ8_1`, F8 step 2) | five producers, 376 kernels fewer per step | a wave holds 32 consecutive values; padded rows get zero blocks; write only when the next projection reads Q8_1 | dense Qwen already fuses norm and SwiGLU quantization (`batched_*_quantize_q8_1`): check its decode trace for standalone `quantize_q8_1`; DeepSeek V4 Flash |
 | Load-first kernels for small grids (F9) | HC combine, HC mix epilogue, small F16 GEMM: 2 to 3.7 times faster | far below bandwidth with few blocks per token; element mapping and sum order stay | decode kernels with a short grid and a loop over K or streams, in every engine |
@@ -298,7 +299,11 @@ sessions, 8192 context, two runs of 4 ABBA rounds, outputs identical): c2
 −0.59% [0.9915, 0.9987] and −0.53% [0.9873, 1.0012], c1, decode, TTFT and c4
 level; `ab.py text` AR and MTP tg128 level. A device copy into the same
 memory (`hipMemcpyAsync` device to device) still ran on the copy engine.
-Dense Qwen could do the same.
+Dense Qwen could do the same. On ROCm 10.1 there is nothing left to gain: a
+trace of upstream `main` (eddcfea6, 2026-11-01) shows its logits download
+(`hipMemcpyAsync` into pinned memory) as a copy kernel,
+`__amd_rocclr_copyBuffer`, on the queue of the forward's kernels (10.5 µs),
+not on the copy engine.
 
 **F2. MTP host time per cycle** (bit-exact; ~0.1 to 0.3%). The n-gram hash
 and read start (~40 µs), separate uploads of tokens and control words, two
@@ -363,6 +368,12 @@ of a block with heavy cancellation
 (`src/models/qwen38_flash_next/kernels/tests/q8_rows.rs`). The producers
 write the rows only when the next projection takes the Q8_0 decode GEMV.
 
+Upstream made both steps itself: #518 (in v0.23.0) lets the producers write
+the Q8_1 rows of their projections, and `qfn_mmq_moe_gated_vec_preq` takes
+the shared expert's rows. A decode token of upstream `main` (eddcfea6,
+traced on ROCm 10.1, 2026-11-01) runs 52 `quantize_q8_1` (96 after F8) and
+910 kernels in all (1,247 after F8 and F9).
+
 **F9. Latency-bound decode kernels** (bit-exact; HC combine, HC mix
 epilogue and small GEMM measured 2026-10-07). A decode token runs the HC combine as four blocks (one per
 stream), and each thread waited for its loads once per element chunk in
@@ -395,6 +406,12 @@ kernel writes exactly that chain (a per-step dot changed BF16 rows).
 `src/models/qwen38_flash_next/kernels/tests/small_gemm.rs` keeps both kernels equal bit for bit (an
 unaligned input copy takes the scalar one).
 
+Upstream has the same: #518 issues the reads of `SmallGemm`, the HC mix
+epilogue and the HC combine up front, and #894 runs a decode token's HC
+mixer (combine, down and up projections, epilogue) as one kernel. In the
+trace of upstream `main` above, the router, alpha/beta and attention
+projections take 13.64, 4.04 and 5.04 µs, as `SmallGemmAheadKernel` did.
+
 **F10. Quantizations after a GEMV** (bit-exact; open). 94 of the 96
 `quantize_q8_1` left per decode step follow a GEMV: the shared expert's
 gated projection before its down projection, and the routed gate/up
@@ -409,9 +426,11 @@ Per decode step: `SsmConv4` → `GdnPrep` (35 each, ~2.9 and ~1.4 µs) could
 be one kernel; so could the small attention steps (`PrepareAttention`,
 `StoreRows`, 12 each). `RouterTopK` (47 × 6.1 µs) runs one block per token
 after the router GEMM, and the register HC combine still runs four blocks
-per token (93 × 5.2 µs). Together at most ~0.5 ms per token.
+per token (93 × 5.2 µs; upstream's #894 runs it inside one mixer kernel).
+Together at most ~0.5 ms per token.
 
-**F12. Serving measurement of F1 to F9** (measurement only; open). The
+**F12. Serving measurement of F1 to F9** (measurement only; moot since
+upstream made F8 and F9 and F1 no longer applies). The
 series was measured with `ab.py text` (tg128, AR and MTP); an `ab.py serve`
 run (c1, c2, c4) against the build before F1 shows how much reaches the
 server.

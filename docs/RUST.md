@@ -465,7 +465,7 @@ not the runtime it loads; check that with `ldd`.
   ([functional tests](../tests/functional/README.md)).
 - **Small dense Qwen:** decode stays 0.2 to 0.4% behind C++ below the 9B
   ([optimizations](OPTIMIZATIONS.md), Q8); Flash-Next's bit-exact
-  follow-ups F10 to F12 are listed there as well.
+  follow-ups F10 and F11 are listed there as well.
 - **References:** the 27B BF16 comparison as a Rust test (upstream's
   `qwen27b_target_test`), Flash-Next's independent MTP audit and deep
   execution check (`--mtp-audit`, `--execution-only`), Flash-Next's F32
