@@ -354,6 +354,12 @@ void ArgmaxFlat(const float* logits, void* scratch, std::int32_t* out,
          stream);
 }
 
+void ArgmaxConfidenceFlat(const float* logits, std::uint32_t* row,
+                          std::uint32_t vocab, hipStream_t stream) {
+  ArgmaxConfidence(logits, reinterpret_cast<std::int32_t*>(row), vocab,
+                   stream);
+}
+
 namespace {
 
 /// The kernels' penalty rows: the triples and each row's end (row 0 starts

@@ -11,6 +11,16 @@ use crate::mtp::{MTP_CANDIDATES, MtpCandidates};
 pub const MAX_DRAFT_TOKENS: u32 = 7;
 const DEPTHS: usize = MAX_DRAFT_TOKENS as usize;
 
+/// A chain ends after its first proposal below its gate: the head's
+/// probability of a greedy draft (`kMtpGateProbability`), or the proposal
+/// probability q of a sampled one (`kMtpSampledGateProbability`).
+pub const GATE_PROBABILITY: f32 = 0.85;
+pub const SAMPLED_GATE_PROBABILITY: f32 = 0.95;
+/// In a jointly planned greedy batch a final proposal below this
+/// probability is not verified: its row costs a C8 cycle more than the
+/// expected accepted token returns (`kMtpBatchDropProbability`).
+pub const BATCH_DROP_PROBABILITY: f32 = 0.6;
+
 /// gfx1151, pinned Flash-Next Q4 target and Q8 MTP, 2026-09-20:
 /// milliseconds per cohort, including catch-up, recursive proposals and
 /// target verification, at contexts 0, 4096 and 32768; rows are the cohorts

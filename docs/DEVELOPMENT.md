@@ -14,7 +14,8 @@ how it differs from and follows upstream.
 | --- | --- |
 | `src/cli` | The `gufo` binary: commands, terminal interfaces and the server (`src/cli/serve`, crate `gufo-serve`) |
 | `src/core` | Shared host code: GGUF loading, tokenizers, sampling, chat requests, diagnostics |
-| `src/hip` | `gufo-hip`: the HIP runtime, memory, streams, graphs, BLAS; the only crate with `unsafe` |
+| `src/hip` | `gufo-hip`: the HIP runtime, memory, streams, graphs, BLAS; with `gufo-ffmpeg` the only crates with `unsafe` |
+| `src/ffmpeg` | `gufo-ffmpeg`: video decoding through FFmpeg, loaded on the first video |
 | `src/kernel_build` | `gufo-kernel-build`: compiles a kernel crate's HIP sources from its `launch.toml` and generates checked launchers |
 | `src/formats` | GGUF types and host dequantisation |
 | `src/models/<model>` | One model package: config, weights, engine, sessions, runner; `kernels/` holds its kernel crate and HIP sources |
@@ -93,8 +94,8 @@ edits; a failure caused by a missing model or device is not a quality pass.
 ## Conventions
 
 - Rust follows `rustfmt` and the workspace lints; crates other than
-  `gufo-hip` forbid `unsafe` (kernel crates allow it only on their
-  generated launchers).
+  `gufo-hip` and `gufo-ffmpeg` forbid `unsafe` (kernel crates allow it only
+  on their generated launchers).
 - HIP and C++ follow [.clang-format](../.clang-format): Google style,
   C++20, two-space indent, 80 columns.
 - One canonical long option and backend name per behavior; no aliases.

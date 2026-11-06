@@ -168,6 +168,11 @@ void ArgmaxFlat(const float* logits, void* scratch, std::int32_t* out,
                 std::uint32_t n_tokens, std::uint32_t vocab,
                 hipStream_t stream);
 
+/// ArgmaxConfidence over the two words of `row` as unsigned: row[1] becomes
+/// the float bits of softmax(logits)[row[0]].
+void ArgmaxConfidenceFlat(const float* logits, std::uint32_t* row,
+                          std::uint32_t vocab, hipStream_t stream);
+
 /// PenalizedArgmax over (token, generated count, repeated) triples, row r
 /// ending at end_r (row 0 starting at 0), with its partial and output
 /// candidates in untyped memory; false unless 1 <= rows <= 7.

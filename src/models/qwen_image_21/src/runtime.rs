@@ -13,12 +13,12 @@ use gufo_hip::blas::{
     AlgoPolicy, Blas, BlasLt, Heuristic, Layout, MatmulBatch, MatmulShape, Op, Strides,
 };
 use gufo_hip::{
-    Bf16, DeviceBuffer, DeviceIndices, DeviceSlice, DeviceSliceMut, HipError, IndexSpec, Launch,
-    LaunchError, PinnedBuffer, Stream,
+    Bf16, DeviceBuffer, DeviceIndices, DeviceSlice, DeviceSliceMut, FileUpload, HipError,
+    IndexSpec, Launch, LaunchError, PinnedBuffer, Stream,
 };
 use gufo_qwen_image_21_kernels as k;
 
-use crate::weights::Weights;
+use crate::weights::{Weight, Weights};
 
 /// Freed blocks the pool keeps for reuse (`Pool::kMaxCachedBytes`).
 const MAX_CACHED_BYTES: usize = 8 << 30;
@@ -162,6 +162,25 @@ impl Matrix {
         Ok(buffer.as_mut_slice().range(range))
     }
 
+    /// Hands the matrix's whole block to a [`FileUpload`], which writes it
+    /// from the start; the matrix has no memory until
+    /// [`Matrix::restore_buffer`].
+    fn take_buffer(&mut self) -> Result<DeviceBuffer<u8>> {
+        if self.offset != 0 {
+            return Err(logic("Qwen-Image upload into a tensor view"));
+        }
+        Arc::get_mut(&mut self.block)
+            .and_then(|block| block.buffer.take())
+            .ok_or_else(|| logic("Qwen-Image tensor uploaded while shared"))
+    }
+
+    fn restore_buffer(&mut self, buffer: DeviceBuffer<u8>) -> Result<()> {
+        let block = Arc::get_mut(&mut self.block)
+            .ok_or_else(|| logic("Qwen-Image tensor uploaded while shared"))?;
+        block.buffer = Some(buffer);
+        Ok(())
+    }
+
     /// The BF16 elements.
     pub fn bf16(&self) -> Result<DeviceSlice<'_, Bf16>> {
         self.raw()?
@@ -218,7 +237,7 @@ impl Matrix {
 
     /// Whether `self` and `other` view the same elements with the same
     /// shape (`PackedInput`'s identity).
-    fn same_view(&self, other: &Matrix) -> bool {
+    pub fn same_view(&self, other: &Matrix) -> bool {
         Arc::ptr_eq(&self.block, &other.block)
             && self.offset == other.offset
             && self.rows == other.rows
@@ -297,6 +316,13 @@ struct Limits {
     values: Vec<i32>,
     keys: usize,
     indices: DeviceIndices,
+}
+
+/// Device buffers for one weight (`StagedWeight`): `m` in BF16, plus `raw`
+/// for an FP32 source.
+struct StagedWeight {
+    m: Matrix,
+    raw: Option<Matrix>,
 }
 
 /// `Runtime`.
@@ -441,8 +467,8 @@ impl Runtime {
 
     /// `Runtime::Weight`: uploads a weight on first use, converting FP32 to
     /// BF16 and packing dense projections and 3x3 convolutions for the WMMA
-    /// kernels. The first weight of a component faults the whole component
-    /// in first.
+    /// kernels. The first weight of a component loads the whole component
+    /// at once (text-to-image never needs the visual encoder).
     pub fn weight(&mut self, weights: &Weights, name: &str) -> Result<Matrix> {
         if let Some(matrix) = self.device_weights.get(name) {
             return Ok(matrix.clone());
@@ -455,12 +481,36 @@ impl Runtime {
             "vae.decoder.",
         ] {
             if name.starts_with(prefix) && !self.prefetched.contains(&prefix) {
-                weights.prefetch(prefix)?;
+                // Without an upload pipeline, fault the component in
+                // parallel instead of serial faults during each upload.
+                if !self.upload_group(weights, prefix)? {
+                    weights.prefetch(prefix)?;
+                }
                 self.prefetched.push(prefix);
                 break;
             }
         }
+        if let Some(matrix) = self.device_weights.get(name) {
+            return Ok(matrix.clone());
+        }
         let w = weights.get(name)?;
+        let mut target = self.stage(w)?;
+        let host = weights.bytes(w);
+        let staging = staging_buffers(&mut self.staging)?;
+        match target.raw.as_mut() {
+            Some(raw) => self
+                .stream
+                .upload_bytes_staged(host, raw.f32_mut()?, staging),
+            None => self
+                .stream
+                .upload_bytes_staged(host, target.m.bf16_mut()?, staging),
+        }
+        .map_err(hip_error)?;
+        self.store(weights, name, w, target)
+    }
+
+    /// `Runtime::Stage`: the device buffers of one weight.
+    fn stage(&mut self, w: &Weight) -> Result<StagedWeight> {
         let rows = w.shape.first().copied().unwrap_or(1);
         let count = w.bytes() / if w.bf16 { 2 } else { 4 };
         if count / rows > i32::MAX as usize {
@@ -468,20 +518,102 @@ impl Runtime {
                 "Qwen-Image weight exceeds matrix dimensions",
             ));
         }
-        let cols = count / rows;
-        let mut m = self.new_matrix(rows, cols)?;
-        let host = weights.bytes(w);
-        if w.bf16 {
-            let staging = staging_buffers(&mut self.staging)?;
-            self.stream
-                .upload_bytes_staged(host, m.bf16_mut()?, staging)
-                .map_err(hip_error)?;
+        let m = self.new_matrix(rows, count / rows)?;
+        let raw = if w.bf16 {
+            None
         } else {
-            let mut raw = self.raw(w.bytes())?;
-            let staging = staging_buffers(&mut self.staging)?;
-            self.stream
-                .upload_bytes_staged(host, raw.f32_mut()?, staging)
-                .map_err(hip_error)?;
+            Some(self.raw(w.bytes())?)
+        };
+        Ok(StagedWeight { m, raw })
+    }
+
+    /// `Runtime::UploadGroup`: streams a component from its safetensors
+    /// files through [`FileUpload`]'s bounded pinned buffers; `false` when
+    /// no upload can start. Copying through the mapping faults every page
+    /// into the process working set first; on Windows those pages stay
+    /// resident, so a 31 GB model exhausts a 32 GB host beside the GPU
+    /// carve-out.
+    fn upload_group(&mut self, weights: &Weights, prefix: &str) -> Result<bool> {
+        // Bound temporary device storage as well as pinned host storage.
+        // Keeping an entire F32 component staged needs three times its final
+        // BF16 size.
+        const BATCH_BYTES: usize = 256 << 20;
+        let Ok(mut upload) = FileUpload::new() else {
+            return Ok(false);
+        };
+        // Pool blocks handed out below may still be read by queued kernels,
+        // and the upload copies on its own streams.
+        self.synchronize()?;
+        let mut staged = Vec::new();
+        let mut staged_bytes = 0usize;
+        for (name, w) in weights.group(prefix) {
+            if self.device_weights.contains_key(name) {
+                continue;
+            }
+            let bytes = if w.bf16 {
+                w.bytes()
+            } else {
+                w.bytes() + w.bytes() / 2
+            };
+            // A tensor larger than the budget is uploaded alone.
+            if !staged.is_empty() && bytes > BATCH_BYTES - staged_bytes.min(BATCH_BYTES) {
+                self.flush_group(&mut upload, weights, &mut staged)?;
+                staged_bytes = 0;
+            }
+            let mut target = self.stage(w)?;
+            let destination = target.raw.as_mut().unwrap_or(&mut target.m).take_buffer()?;
+            staged.push((name, w, target));
+            staged_bytes += bytes;
+            if upload
+                .copy(
+                    &weights.files()[w.file],
+                    w.range.start,
+                    w.bytes(),
+                    destination,
+                )
+                .is_err()
+            {
+                break;
+            }
+        }
+        self.flush_group(&mut upload, weights, &mut staged)?;
+        Ok(true)
+    }
+
+    /// Waits for the staged weights' copies and stores them.
+    fn flush_group(
+        &mut self,
+        upload: &mut FileUpload,
+        weights: &Weights,
+        staged: &mut Vec<(&str, &Weight, StagedWeight)>,
+    ) -> Result<()> {
+        let buffers = upload
+            .finish()
+            .map_err(|e| Error::runtime(format!("Qwen-Image weight upload failed: {e}")))?;
+        for ((name, w, mut target), buffer) in staged.drain(..).zip(buffers) {
+            target
+                .raw
+                .as_mut()
+                .unwrap_or(&mut target.m)
+                .restore_buffer(buffer)?;
+            self.store(weights, name, w, target)?;
+        }
+        Ok(())
+    }
+
+    /// `Runtime::Store`: converts an FP32 source to BF16, packs dense
+    /// projections and 3x3 convolutions and keeps the weight resident.
+    fn store(
+        &mut self,
+        weights: &Weights,
+        name: &str,
+        w: &Weight,
+        target: StagedWeight,
+    ) -> Result<Matrix> {
+        let StagedWeight { mut m, raw } = target;
+        let (rows, cols) = (m.rows, m.cols);
+        let count = rows * cols;
+        if let Some(raw) = raw {
             k::float_to_bf16(&self.stream, raw.f32()?, m.bf16_mut()?, count)
                 .map_err(launch_error)?;
         }

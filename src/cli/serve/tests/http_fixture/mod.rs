@@ -79,6 +79,11 @@ pub struct FakeBackend {
     pub chat_token_count: Mutex<Option<usize>>,
     /// The messages and tools of the last counted request.
     pub counted: Mutex<(usize, usize)>,
+    /// The last counted request.
+    pub counted_chat: Mutex<ChatRequest>,
+    /// Makes `count_chat_tokens` fail: 1 with an invalid prompt, 2 with a
+    /// prompt too large.
+    pub count_failure: AtomicI32,
     me: Weak<FakeBackend>,
     last: Mutex<Call>,
     output: Mutex<Vec<u8>>,
@@ -113,6 +118,8 @@ impl FakeBackend {
             tool_format: Mutex::new(None),
             chat_token_count: Mutex::new(None),
             counted: Mutex::new((0, 0)),
+            counted_chat: Mutex::new(ChatRequest::default()),
+            count_failure: AtomicI32::new(0),
             me,
             last: Mutex::new(Call::default()),
             output: Mutex::new(b"ok".to_vec()),
@@ -238,7 +245,13 @@ impl TextGenerationBackend for FakeBackend {
     }
 
     fn count_chat_tokens(&self, request: &ChatRequest) -> Result<Option<usize>> {
+        *self.counted_chat.lock().expect("counted") = request.clone();
         *self.counted.lock().expect("counted") = (request.messages.len(), request.tools.len());
+        match self.count_failure.load(Ordering::SeqCst) {
+            1 => return Err(Error::invalid("invalid counting prompt")),
+            2 => return Err(Error::length("counting prompt too large")),
+            _ => {}
+        }
         Ok(*self.chat_token_count.lock().expect("count"))
     }
 

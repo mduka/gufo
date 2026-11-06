@@ -35,6 +35,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE.parent / "fixtures"
+EMBEDDING_FIXTURES = HERE.parents[1] / "src" / "models" / "embedding_gemma2" / "tests" / "fixtures"
 AUDIO = HERE / "fixtures" / "audio"
 MINIMUM_EMBEDDING_COSINE = 0.9999
 MAXIMUM_ASR_WER = 0.15
@@ -121,7 +122,7 @@ def server(binary, service, model, extra, log_path, timeout):
 
 
 def check_embedding(args):
-    golden = json.loads((FIXTURES / "embedding_gemma2" / "embedding_golden.json")
+    golden = json.loads((EMBEDDING_FIXTURES / "embedding_golden.json")
                         .read_text(encoding="utf-8"))
     cases = list(golden["cases"])
     with server(args.binary, "embedding", args.model, ["--served-model-name", "embeddinggemma-2"],
@@ -129,7 +130,7 @@ def check_embedding(args):
         result = request(url + "/v1/embeddings", {
             "model": "embeddinggemma-2", "input": [case["text"] for case in cases],
             "encoding_format": "float"})
-        audio_golden = json.loads((FIXTURES / "embedding_gemma2" / "audio_embedding_golden.json")
+        audio_golden = json.loads((EMBEDDING_FIXTURES / "audio_embedding_golden.json")
                                   .read_text(encoding="utf-8"))
         clip = next(case for case in audio_golden["cases"] if case["name"] == "triangle_16000")
         buffer = io.BytesIO()

@@ -9,7 +9,9 @@ mod common;
 use common::make_image;
 use gufo_core::image::Image;
 use gufo_core::json;
-use gufo_embedding_gemma2::image_processor::process_image;
+use gufo_embedding_gemma2::image_processor::{
+    DEFAULT_IMAGE_SOFT_TOKENS, IMAGE_SOFT_TOKEN_BUDGETS, process_image, supported_image_soft_tokens,
+};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -21,8 +23,13 @@ fn patches_match_the_reference_processor() {
     let fixture = json::parse(&std::fs::read(path).unwrap()).unwrap();
     for case in fixture.find("cases").unwrap().items() {
         let name = case.member_str("name", "");
+        let budget = case.member_size("max_soft_tokens", DEFAULT_IMAGE_SOFT_TOKENS as usize) as u32;
         for specification in case.find("images").unwrap().items() {
-            let patches = process_image(&make_image(specification)).unwrap();
+            let patches = process_image(&make_image(specification), budget).unwrap();
+            assert!(
+                patches.soft_tokens() <= budget as usize,
+                "{name} soft-token budget"
+            );
             assert_eq!(
                 (patches.rows as usize, patches.columns as usize),
                 (
@@ -51,6 +58,22 @@ fn patches_match_the_reference_processor() {
 
 #[test]
 fn invalid_images_are_refused() {
-    assert!(process_image(&Image::new(1, 1, vec![0; 3]).unwrap()).is_ok());
-    assert!(process_image(&Image::new(40000, 1, vec![0; 120000]).unwrap()).is_err());
+    let budget = DEFAULT_IMAGE_SOFT_TOKENS;
+    assert!(process_image(&Image::new(1, 1, vec![0; 3]).unwrap(), budget).is_ok());
+    assert!(process_image(&Image::new(40000, 1, vec![0; 120000]).unwrap(), budget).is_err());
+}
+
+#[test]
+fn only_the_processor_budgets_are_supported() {
+    for budget in IMAGE_SOFT_TOKEN_BUDGETS {
+        assert!(supported_image_soft_tokens(budget));
+    }
+    let image = Image::new(1, 1, vec![0; 3]).unwrap();
+    for budget in [0, 69, 281, 1121, u32::MAX] {
+        assert!(!supported_image_soft_tokens(budget));
+        assert_eq!(
+            process_image(&image, budget).unwrap_err(),
+            "image max_soft_tokens must be one of 70, 140, 280, 560, or 1120"
+        );
+    }
 }

@@ -6,7 +6,7 @@
 
 > [!NOTE]
 > **This fork ports Gufo's host code to Rust.** It is [Gufo](https://github.com/gufo-org/gufo)
-> release [v0.27.0](https://github.com/gufo-org/gufo/releases/tag/v0.27.0) with the C++
+> release [v0.28.1](https://github.com/gufo-org/gufo/releases/tag/v0.28.1) with the C++
 > engines, server, CLI and HIP resource management rewritten in Rust. The GPU kernels are
 > upstream's HIP code, unchanged. Outputs equal the
 > C++ build's bit for bit on its deterministic paths, and speed, load time and memory are
@@ -177,6 +177,7 @@ MIOpen are not build or runtime requirements.
 | --- | --- |
 | ROCm HIP compiler and runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
 | hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
+| FFmpeg development files (libavformat, libavcodec, libavutil, libswscale), pkg-config | Video embedding decoding and RGB conversion; the libraries load on the first video request |
 
 Install ROCm using [AMD's Linux instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
 The build takes its ROCm from `$ROCM_PATH`, else `/opt/rocm/core`, else
@@ -184,7 +185,9 @@ The build takes its ROCm from `$ROCM_PATH`, else `/opt/rocm/core`, else
 Debian/Ubuntu, with AMD's repository:
 
 ```sh
-sudo apt install build-essential hipblas-dev hipblaslt-dev rocblas-dev \
+sudo apt install build-essential pkg-config \
+  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+  hipblas-dev hipblaslt-dev rocblas-dev \
   hipcub-dev rocprim-dev rocwmma-dev
 
 cargo build --release -p gufo

@@ -1,7 +1,9 @@
 //! A prefill checkpoint inside `gated_delta_net` (`gdn_ops_test.cpp`): the full pass is unchanged bit for bit, the captured
 //! recurrent state and convolution history equal those of a pass ending at
 //! the checkpoint, and nothing is written past either buffer. Both
-//! recurrences (row split and per-row) and the `history_prefix` launcher:
+//! recurrences (row split and per-row) and the `history_prefix` launcher. A
+//! prompt finished by a short pass after a restore gives each row the bits of
+//! the single pass (`CheckSplitPasses`):
 //! cargo test --profile gpu-test -p gufo-qwen38-flash-next-kernels --features gpu --test checkpoint
 
 #![cfg(feature = "gpu")]
@@ -196,6 +198,127 @@ fn gated_delta_net_checkpoint_equals_a_pass_ending_there() {
                 );
             }
         }
+    }
+}
+
+/// Rows `first..first + count` continuing from `conv` and `state`, their
+/// output at row `first` of `out` (row split recurrence).
+fn pass_rows(
+    stream: &Stream,
+    layer: &Layer,
+    first: usize,
+    count: usize,
+    conv: &mut DeviceBuffer<f32>,
+    state: &mut DeviceBuffer<f32>,
+    out: &mut DeviceBuffer<f32>,
+) {
+    let channels = channels();
+    let value = V_HEADS * D;
+    let stride = channels + value;
+    let base = first * stride;
+    let mut scratch = stream.alloc::<f32>((count + KERNEL) * channels).unwrap();
+    let mut qn = stream.alloc::<f32>(count * K_HEADS * D).unwrap();
+    let mut kn = stream.alloc::<f32>(count * K_HEADS * D).unwrap();
+    let mut raw = stream.alloc::<f32>(count * value).unwrap();
+    let launched = k::gated_delta_net(
+        stream,
+        layer
+            .qkvz
+            .slice(base..base + (count - 1) * stride + channels),
+        stride as u32,
+        layer
+            .qkvz
+            .slice(base + channels..base + (count - 1) * stride + channels + value),
+        stride as u32,
+        layer
+            .alpha_beta
+            .slice(first * 2 * V_HEADS..(first + count) * 2 * V_HEADS),
+        layer.conv_w.as_slice(),
+        layer.a.as_slice(),
+        layer.dt.as_slice(),
+        layer.norm_w.as_slice(),
+        conv.as_mut_slice(),
+        scratch.as_mut_slice(),
+        qn.as_mut_slice(),
+        kn.as_mut_slice(),
+        raw.as_mut_slice(),
+        state.as_mut_slice(),
+        out.slice_mut(first * value..(first + count) * value),
+        None,
+        None,
+        &mut [],
+        &mut [],
+        0,
+        count as u32,
+        K_HEADS as u32,
+        V_HEADS as u32,
+        KERNEL as u32,
+        true,
+        false,
+        1e-6,
+        None,
+        None,
+        0,
+        None,
+    )
+    .unwrap();
+    assert_eq!(launched, Launch::Launched);
+}
+
+/// A prefill pass that finishes a prompt after a checkpoint restore covers
+/// only its last rows: eight or fewer take the history-saving convolution,
+/// wider ones the token-tiled one. Each row's output and the final recurrent
+/// and convolution state equal the single pass's, bit for bit
+/// (`CheckSplitPasses`).
+#[test]
+fn gated_delta_net_rows_do_not_depend_on_the_prefill_split() {
+    let stream = Stream::new().unwrap();
+    let channels = channels();
+    let value = V_HEADS * D;
+    let stride = channels + value;
+    let tokens = 99;
+    let mut seed = 0x5B11_7001;
+    let layer = Layer {
+        qkvz: upload(&stream, &random(&mut seed, tokens * stride, 1.0)),
+        alpha_beta: upload(&stream, &random(&mut seed, tokens * 2 * V_HEADS, 2.0)),
+        conv_w: upload(&stream, &random(&mut seed, channels * KERNEL, 0.5)),
+        a: upload(
+            &stream,
+            &(0..V_HEADS)
+                .map(|_| uniform(&mut seed, 1.0) - 1.5)
+                .collect::<Vec<_>>(),
+        ),
+        dt: upload(&stream, &random(&mut seed, V_HEADS, 1.0)),
+        norm_w: upload(
+            &stream,
+            &(0..D)
+                .map(|_| 1.0 + uniform(&mut seed, 0.5))
+                .collect::<Vec<_>>(),
+        ),
+        conv_state: random(&mut seed, (KERNEL - 1) * channels, 1.0),
+        state: random(&mut seed, V_HEADS * D * D, 0.1),
+    };
+    let mut out = stream.alloc::<f32>(tokens * value).unwrap();
+    let mut conv = upload(&stream, &layer.conv_state);
+    let mut state = upload(&stream, &layer.state);
+    pass_rows(&stream, &layer, 0, tokens, &mut conv, &mut state, &mut out);
+    let full_out = download(&stream, &out);
+    let (full_state, full_conv) = (download(&stream, &state), download(&stream, &conv));
+    for tail in [1, 7, 8, 9, 40] {
+        let prefix = tokens - tail;
+        let mut conv = upload(&stream, &layer.conv_state);
+        let mut state = upload(&stream, &layer.state);
+        pass_rows(&stream, &layer, 0, prefix, &mut conv, &mut state, &mut out);
+        pass_rows(
+            &stream, &layer, prefix, tail, &mut conv, &mut state, &mut out,
+        );
+        let split_out = download(&stream, &out);
+        assert!(
+            split_out[prefix * value..] == full_out[prefix * value..]
+                && download(&stream, &state) == full_state
+                && download(&stream, &conv) == full_conv,
+            "GDN rows depend on the prefill split ({prefix} + {tail} rows)"
+        );
     }
 }
 

@@ -35,6 +35,7 @@ for t in "${targets[@]}"; do
   fi
   out="/tmp/${t}"
   extra=()
+  archive=
   if grep -q "hipblas" "$src"; then
     extra+=(-lhipblas -lhipblaslt -lrocblas)
   fi
@@ -45,6 +46,19 @@ for t in "${targets[@]}"; do
     # Exact projection comparisons use the production compiler optimization level.
     compile[1]=-O2
   fi
+  if [[ "$src" -ef tools/qwen27b/verify_sweep/sweep.hip ]]; then
+    # The sweep times the production dispatch: the Qwen kernel crate's
+    # archive of the release build, at the production optimization level.
+    compile[1]=-O2
+    compile+=(-DENGINE_ENABLE_HIP=1)
+    archive=$(ls -t target/release/build/gufo-qwen-kernels-*/out/libgufo_kernels_qwen.a \
+      2>/dev/null | head -1)
+    if [ -z "$archive" ]; then
+      echo "$src needs the release build: cargo build --release -p gufo" >&2
+      exit 1
+    fi
+    extra+=("$archive")
+  fi
   native_sources=()
   if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ||
         "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
@@ -54,8 +68,9 @@ for t in "${targets[@]}"; do
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
   fi
-  if ((${#native_sources[@]})); then
-    # HIP helpers and their callers must share the native wave size.
+  if ((${#native_sources[@]})) || [ -n "$archive" ]; then
+    # HIP helpers and their callers must share the native wave size, and an
+    # archive is a link input, which the compile step would read as HIP source.
     objects="$(mktemp -d "/tmp/${t}.XXXXXX")"
     trap 'rm -rf "$objects"' EXIT
     (

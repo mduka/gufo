@@ -134,6 +134,8 @@ pub struct Session {
     tokens: Vec<i32>,
     logits: Vec<f32>,
     draft_token: i32,
+    /// The head's probability of `draft_token`.
+    draft_confidence: f32,
     verify_logits: Vec<f32>,
     /// First position whose trunk hidden row is kept.
     hidden_base: u32,
@@ -201,7 +203,6 @@ struct Outcome {
 
 /// The work of one draft-verify cycle between preparation and verification
 /// (`PendingDecode`).
-#[derive(Default)]
 struct PendingDecode {
     chain: Vec<i32>,
     proposals: Vec<Proposal>,
@@ -211,6 +212,11 @@ struct PendingDecode {
     gpu_greedy: bool,
     gpu_verification: bool,
     width: usize,
+    /// The chain stops after a proposal below its gate
+    /// ([`PendingDecode::gate_stops`]).
+    gated: bool,
+    /// The head's probability of `draft`.
+    draft_confidence: f32,
     draft_sampler: Option<SamplerState>,
     draft_rng: u64,
     candidates: MtpCandidates,
@@ -230,6 +236,33 @@ struct PendingDecode {
     lookup: u32,
     lookup_start: usize,
     lookup_cap: usize,
+}
+
+impl Default for PendingDecode {
+    fn default() -> Self {
+        Self {
+            chain: Vec::new(),
+            proposals: Vec::new(),
+            base: 0,
+            speculative: false,
+            sampled: false,
+            gpu_greedy: false,
+            gpu_verification: false,
+            width: 0,
+            gated: false,
+            draft_confidence: 1.0,
+            draft_sampler: None,
+            draft_rng: 0,
+            candidates: MtpCandidates::default(),
+            draft: 0,
+            draft_subset: false,
+            sampled_subset_cost: false,
+            policy_concurrency: 0,
+            lookup: 0,
+            lookup_start: 0,
+            lookup_cap: 0,
+        }
+    }
 }
 
 /// The longest visible context of the fused WMMA attention kernel for this

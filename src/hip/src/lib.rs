@@ -106,4 +106,4 @@ pub use stream::{
     heap_fits_above_reserve, runtime_version,
 };
 pub use table::RowTable;
-pub use weights::{LoadedWeights, Pending, Placement, WeightLoader};
+pub use weights::{FileUpload, LoadedWeights, Pending, Placement, WeightLoader};

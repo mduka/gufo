@@ -85,6 +85,7 @@ impl Model {
             tokens: Vec::new(),
             logits: vec![0.0; self.vocab_size() as usize],
             draft_token: 0,
+            draft_confidence: 1.0,
             verify_logits: Vec::new(),
             hidden_base: 0,
             draft_length: LengthController::new(
@@ -201,10 +202,12 @@ impl Model {
             return Ok(());
         };
         let mut token = s.draft_token;
+        let mut confidence = s.draft_confidence;
         let greedy = propose && candidates.is_none();
         // A headless step needs only the persistent K/V.
         let output = MtpOutput {
             token: greedy.then_some(&mut token),
+            confidence: Some(&mut confidence),
             candidates,
             kv_only: !propose,
             draft_subset,
@@ -212,6 +215,7 @@ impl Model {
         self.executor
             .mtp_forward(&mut s.native, &replay, hidden_row, output)?;
         s.draft_token = token;
+        s.draft_confidence = confidence;
         Ok(())
     }
 

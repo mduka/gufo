@@ -183,6 +183,17 @@ ab serve-fn-mtp 6 1 GUFO_FLASH_NEXT_MODEL GUFO_FLASH_NEXT_MTP_MODEL -- \
 ab serve-ds-dspark 4 1 GUFO_DEEPSEEK_V4_FLASH_MODEL GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL -- \
   serve --model "$DS" --name dspark \
   --server-args "--speculative dspark --dspark-model $DSP" --concurrency 1,4
+# Sampled without top-k: verification takes a target distribution over the
+# whole vocabulary per drafted token, on the host for Flash-Next and DeepSeek.
+ab serve-q27-dflash2-t08 6 1 GUFO_QWEN27B_MODEL GUFO_QWEN27B_DFLASH -- \
+  serve --model "$Q4" --name dflash2-t08 --temperature 0.8 \
+  --server-args "--speculative dflash2 --dflash-model $DF --seed 42" --concurrency 1,4
+ab serve-fn-mtp-t08 6 1 GUFO_FLASH_NEXT_MODEL GUFO_FLASH_NEXT_MTP_MODEL -- \
+  serve --model "$FN" --name mtp-t08 --temperature 0.8 \
+  --server-args "--speculative mtp --mtp-model $MTP --seed 42" --concurrency 1,4
+ab serve-ds-dspark-t08 4 1 GUFO_DEEPSEEK_V4_FLASH_MODEL GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL -- \
+  serve --model "$DS" --name dspark-t08 --temperature 0.8 \
+  --server-args "--speculative dspark --dspark-model $DSP --seed 42" --concurrency 1,4
 # Speech, images and embeddings.
 ab asr 8 3 GUFO_QWEN3_ASR_MODEL GUFO_QWEN3_ASR_AUDIO -- \
   asr --model "${GUFO_QWEN3_ASR_MODEL:-}" --audio "${GUFO_QWEN3_ASR_AUDIO:-}"

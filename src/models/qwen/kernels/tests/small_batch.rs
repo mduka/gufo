@@ -2,6 +2,9 @@
 //! byte (upstream `TestSmallBatchExactness` of `q4kxl_quant_ops_test.cpp`):
 //! cargo test --profile gpu-test -p gufo-qwen-kernels --features gpu --test small_batch
 //!
+//! It also checks the tuned 27B block shapes of `verify_gemm_27b` against
+//! the generic dispatch.
+//!
 //! The 27B verifies several drafted rows with one pass whose per-row
 //! arithmetic must equal decoding each row alone. This covers the five-token
 //! IQ4_XS FFN schedule, the four-token Q4_K row-first FMA schedule and their
@@ -181,4 +184,116 @@ fn nine_to_fifteen_k_quant_rows_run_one_masked_group() {
     ] {
         exact(&stream, format, batch, rows, columns);
     }
+}
+
+/// The 27B shapes `verify_gemm_27b` tunes, with the row counts it launches
+/// (`verify_gemm_27b.hip`).
+const TUNED_27B: &[(GgmlType, usize, usize, &[usize])] = &[
+    (GgmlType::Q4K, 1024, 5120, &[2, 3, 4, 5, 6, 7, 8]),
+    (GgmlType::Q4K, 1280, 5120, &[2, 3, 4, 5, 6, 7, 8]),
+    (GgmlType::Q4K, 4096, 5120, &[2, 5, 6, 8]),
+    (GgmlType::Q4K, 5120, 4096, &[2, 5, 6, 8]),
+    (GgmlType::Q4K, 5120, 17408, &[4]),
+    (GgmlType::Q4K, 6144, 5120, &[3, 4, 5, 6, 8]),
+    (GgmlType::Q4K, 10240, 5120, &[8]),
+    (GgmlType::Q4K, 12288, 5120, &[5, 6, 8]),
+    (GgmlType::Q5K, 1024, 5120, &[2, 3, 4, 5, 6, 7]),
+    (GgmlType::Q6K, 1024, 5120, &[3, 4]),
+    (GgmlType::Q6K, 5120, 6144, &[2, 3, 6]),
+    (GgmlType::Q6K, 5120, 17408, &[2, 3, 7, 8]),
+    (GgmlType::Iq4Xs, 5120, 17408, &[5]),
+    (GgmlType::Iq4Xs, 6144, 5120, &[2, 3, 4, 5, 6, 7, 8]),
+    (GgmlType::Iq4Xs, 10240, 5120, &[2, 3, 4, 5]),
+    (GgmlType::Iq4Xs, 12288, 5120, &[3, 4, 5, 8]),
+    (GgmlType::Iq4Xs, 17408, 5120, &[5]),
+    (GgmlType::Iq4Xs, 34816, 5120, &[3, 5]),
+];
+
+/// Every tuned 27B block shape writes the generic dispatch's bits and no
+/// row beyond the batch; other row counts, shapes and formats decline
+/// (the exactness check of `tools/qwen27b/verify_sweep`).
+#[test]
+fn tuned_27b_geometries_match_the_generic_dispatch() {
+    const GUARD_ROWS: usize = 8;
+    let stream = Stream::new().unwrap();
+    for &(format, rows, columns, tuned) in TUNED_27B {
+        let host = weights(format, rows, columns, 0x1234_5678);
+        let x = activations(8, columns);
+        let mut w = stream.alloc::<u8>(host.len()).unwrap();
+        stream.upload(&host, w.as_mut_slice()).unwrap();
+        let mut input = stream.alloc::<f32>(x.len()).unwrap();
+        stream.upload(&x, input.as_mut_slice()).unwrap();
+        let mut generic = stream.alloc::<f32>(8 * rows).unwrap();
+        let mut output = stream.alloc::<f32>((8 + GUARD_ROWS) * rows).unwrap();
+        let w_view = || QuantSlice::new(w.as_slice(), format);
+        for batch in 1..=8 {
+            stream.fill_bytes(output.as_mut_slice(), 0xA5).unwrap();
+            let launched = k::verify_gemm_27b(
+                &stream,
+                w_view(),
+                input.slice(0..batch * columns),
+                output.slice_mut(0..batch * rows),
+                batch,
+                rows,
+                columns,
+            )
+            .unwrap();
+            let expected_launch = tuned.contains(&batch);
+            assert_eq!(
+                launched == gufo_hip::Launch::Launched,
+                expected_launch,
+                "{format:?} {rows}x{columns} batch {batch}"
+            );
+            if !expected_launch {
+                continue;
+            }
+            k::batched_quant_gemm_f32(
+                &stream,
+                w_view(),
+                input.slice(0..batch * columns),
+                generic.slice_mut(0..batch * rows),
+                batch,
+                rows,
+                columns,
+            )
+            .unwrap();
+            let mut got = vec![0f32; (8 + GUARD_ROWS) * rows];
+            stream.download(output.as_slice(), &mut got).unwrap();
+            let mut want = vec![0f32; batch * rows];
+            stream
+                .download(generic.slice(0..batch * rows), &mut want)
+                .unwrap();
+            let differing = got[..batch * rows]
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| !a.is_finite() || a.to_bits() != b.to_bits())
+                .count();
+            let overrun = got[batch * rows..]
+                .iter()
+                .filter(|v| v.to_bits() != 0xA5A5_A5A5)
+                .count();
+            assert_eq!(
+                (differing, overrun),
+                (0, 0),
+                "{format:?} {rows}x{columns} batch {batch}"
+            );
+        }
+    }
+    // Formats it does not tune decline.
+    let host = weights(GgmlType::Q8_0, 1024, 5120, 1);
+    let mut w = stream.alloc::<u8>(host.len()).unwrap();
+    stream.upload(&host, w.as_mut_slice()).unwrap();
+    let input = stream.alloc::<f32>(4 * 5120).unwrap();
+    let mut output = stream.alloc::<f32>(4 * 1024).unwrap();
+    let launched = k::verify_gemm_27b(
+        &stream,
+        QuantSlice::new(w.as_slice(), GgmlType::Q8_0),
+        input.as_slice(),
+        output.as_mut_slice(),
+        4,
+        1024,
+        5120,
+    )
+    .unwrap();
+    assert_eq!(launched, gufo_hip::Launch::Unsupported);
 }

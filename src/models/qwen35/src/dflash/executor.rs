@@ -19,7 +19,8 @@ use std::ops::Range;
 
 use gufo_core::sampling::SamplerState;
 use gufo_hip::{
-    DeviceBuffer, DeviceIndices, DeviceSlice, DeviceSliceMut, DeviceTensor, LaunchError, Stream,
+    DeviceBuffer, DeviceIndices, DeviceSlice, DeviceSliceMut, DeviceTensor, Launch, LaunchError,
+    Stream,
 };
 use gufo_qwen_kernels as k;
 
@@ -46,13 +47,21 @@ fn block_gemm(
     s: &Stream,
     w: &Matrix,
     x: DeviceSlice<'_, f32>,
-    y: DeviceSliceMut<'_, f32>,
+    mut y: DeviceSliceMut<'_, f32>,
     rows: usize,
     m: usize,
     kk: usize,
 ) -> Result<(), LaunchError> {
     match w {
-        Matrix::Quant(q) => k::batched_quant_gemm_f32(s, q.view(), x, y, rows, m, kk),
+        Matrix::Quant(q) => {
+            if rows <= MAX_SHARED_BATCH
+                && k::verify_gemm_27b(s, q.view(), x, y.reborrow(), rows, m, kk)?
+                    == Launch::Launched
+            {
+                return Ok(());
+            }
+            k::batched_quant_gemm_f32(s, q.view(), x, y, rows, m, kk)
+        }
         Matrix::Bf16(b) => k::exact_bf16_gemm_f32(s, b.view(), x, y, rows, m, kk),
     }
 }

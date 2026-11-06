@@ -1,4 +1,4 @@
-//! The EmbeddingGemma 2 text, image and audio embedding service
+//! The EmbeddingGemma 2 text, image, video and audio embedding service
 //! (`src/cli/serve/embedding_service.cpp`): model identity, readiness, the
 //! input preparation and length checks, the checkpoint's named prompts and
 //! the serialised injected runner. The native engine (tokenizer, media
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gufo_core::json;
 use gufo_core::text::CancellationCheck;
 
-use crate::image_url::{ImageReadBudget, read_audio_url, read_image_url};
+use crate::image_url::{ImageReadBudget, read_audio_url, read_image_url, read_video_url};
 use crate::logging;
 
 /// Longest accepted input in tokens, including the surrounding markers: the
@@ -24,10 +24,27 @@ pub const MAX_INPUT_TOKENS: usize = 8192;
 pub const MAX_IMAGES: usize = 32;
 /// Most audio clips of one request.
 pub const MAX_AUDIO: usize = 32;
+/// Most videos of one request.
+pub const MAX_VIDEOS: usize = 32;
+/// Most sampled frames over every video of one request.
+pub const MAX_VIDEO_FRAMES: usize = 64;
+
+/// `Gemma4ImageProcessor`'s supported `max_soft_tokens` values and the
+/// checkpoint's default (`image_processor.hpp`); the binary checks them
+/// against the engine crate.
+pub const IMAGE_SOFT_TOKEN_BUDGETS: [u32; 5] = [70, 140, 280, 560, 1120];
+pub const DEFAULT_IMAGE_SOFT_TOKENS: u32 = 280;
+pub const MAX_IMAGE_SOFT_TOKENS: u32 = 1120;
+
+/// `SupportedImageSoftTokens`.
+pub fn supported_image_soft_tokens(max_soft_tokens: u32) -> bool {
+    IMAGE_SOFT_TOKEN_BUDGETS.contains(&max_soft_tokens)
+}
 
 /// The model's placeholder tokens and their framing (`config.hpp`); the
 /// binary checks them against the engine crate.
 pub const IMAGE_TOKEN_ID: u32 = 258880;
+pub const VIDEO_TOKEN_ID: u32 = 258884;
 pub const AUDIO_TOKEN_ID: u32 = 258881;
 pub const IMAGE_TOKEN: &str = "<|image|>";
 pub const BEGIN_IMAGE_TOKEN: &str = "<|image>";
@@ -60,6 +77,8 @@ pub enum EmbeddingPartType {
     Image,
     /// An audio URL, or raw base64.
     Audio,
+    /// A video URL, or raw base64.
+    Video,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,19 +96,53 @@ impl EmbeddingPart {
     }
 }
 
-/// One input: text, image and audio parts in order.
+/// One input: text, image, video and audio parts in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingInput {
     pub content: Vec<EmbeddingPart>,
 }
 
+/// The video processor controls of one request (`VideoOptions`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmbeddingVideoOptions {
+    pub fps: f64,
+    pub max_frames: usize,
+    pub timestamps: bool,
+    pub truncate_overflow: bool,
+}
+
+impl Default for EmbeddingVideoOptions {
+    fn default() -> Self {
+        Self {
+            fps: 1.0,
+            max_frames: 32,
+            timestamps: false,
+            truncate_overflow: false,
+        }
+    }
+}
+
 /// Per-request choices that change how inputs are encoded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EmbeddingRequestOptions {
     /// Cut an input longer than [`MAX_INPUT_TOKENS`] to its first tokens,
     /// keeping the end marker, instead of refusing it. An input whose images
     /// would not fit whole is still refused.
     pub truncate: bool,
+    /// `Gemma4ImageProcessor` `max_soft_tokens` for every image of the
+    /// request.
+    pub image_soft_tokens: u32,
+    pub video: EmbeddingVideoOptions,
+}
+
+impl Default for EmbeddingRequestOptions {
+    fn default() -> Self {
+        Self {
+            truncate: false,
+            image_soft_tokens: DEFAULT_IMAGE_SOFT_TOKENS,
+            video: EmbeddingVideoOptions::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +152,7 @@ pub enum EmbeddingStatus {
     InputTooLong,
     InvalidInput,
     InvalidAudioInput,
+    InvalidVideoInput,
     Failed,
     /// The device failed a probe after an error. The service stays lost.
     DeviceLost,
@@ -117,11 +171,20 @@ pub type EmbeddingRunner = Box<
         + Sync,
 >;
 
-/// A preprocessed image or audio clip of the engine, opaque to this crate,
-/// with the placeholder tokens it fills.
+/// A preprocessed image, video frame or audio clip of the engine, opaque to
+/// this crate, with the placeholder tokens it fills.
 pub struct EngineMedia {
     pub soft_tokens: usize,
     pub data: Box<dyn Any + Send + Sync>,
+}
+
+/// An image or video frame of a sequence: the offset of its first
+/// placeholder token and the placeholder ([`IMAGE_TOKEN_ID`] or
+/// [`VIDEO_TOKEN_ID`]); video frames share the vision tower.
+pub struct EngineImage {
+    pub offset: usize,
+    pub token_id: u32,
+    pub media: EngineMedia,
 }
 
 /// One sequence for the engine's encoder: its tokens and the media with the
@@ -129,8 +192,25 @@ pub struct EngineMedia {
 #[derive(Default)]
 pub struct EngineSequence {
     pub tokens: Vec<u32>,
-    pub images: Vec<(usize, EngineMedia)>,
+    pub images: Vec<EngineImage>,
     pub audio: Vec<(usize, EngineMedia)>,
+}
+
+/// A decoded video: its sampled frames and the text that frames them
+/// (`FrameVideo`).
+pub struct EngineVideo {
+    pub text: String,
+    pub frames: Vec<EngineMedia>,
+}
+
+/// Why a video could not be preprocessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineVideoError {
+    /// The video libraries could not be loaded: the request fails as a
+    /// server error.
+    Library(String),
+    /// The input was refused or failed to decode.
+    Invalid(String),
 }
 
 /// The native model: its tokenizer, media preprocessing and GPU encoder,
@@ -143,6 +223,7 @@ pub trait EmbeddingEngine: Send + Sync {
     /// Like `encode`, cut to `max_tokens` before the `<eos>`.
     fn encode_truncated(&self, text: &str, max_tokens: usize) -> Vec<u32>;
     fn supports_vision(&self) -> bool;
+    fn supports_video(&self) -> bool;
     fn supports_audio(&self) -> bool;
     /// Why the checkpoint's image processor settings are unsupported; empty
     /// when they are supported.
@@ -150,8 +231,21 @@ pub trait EmbeddingEngine: Send + Sync {
     /// Why the checkpoint's audio feature extractor is unsupported; empty
     /// when it is supported.
     fn audio_processor_error(&self) -> String;
-    /// Decodes and preprocesses an encoded image.
-    fn process_image(&self, bytes: &[u8]) -> Result<EngineMedia, String>;
+    /// Why the checkpoint's video processor settings are unsupported; empty
+    /// when they are supported.
+    fn video_processor_error(&self) -> String;
+    /// Decodes and preprocesses an encoded image at a soft-token budget of
+    /// [`IMAGE_SOFT_TOKEN_BUDGETS`].
+    fn process_image(&self, bytes: &[u8], max_soft_tokens: u32) -> Result<EngineMedia, String>;
+    /// Decodes an encoded video and preprocesses at most `frame_budget`
+    /// sampled frames.
+    fn process_video(
+        &self,
+        bytes: &[u8],
+        options: &EmbeddingVideoOptions,
+        is_cancelled: Option<&CancellationCheck>,
+        frame_budget: usize,
+    ) -> Result<EngineVideo, EngineVideoError>;
     /// Decodes and preprocesses an encoded audio clip; `Ok` with no soft
     /// tokens for a clip too short to embed.
     fn process_audio(
@@ -280,7 +374,8 @@ pub fn load_sentence_transformer_prompts(
     Ok(prompts)
 }
 
-/// Native HIP EmbeddingGemma 2 text, image and audio embedding service.
+/// Native HIP EmbeddingGemma 2 text, image, video and audio embedding
+/// service.
 pub struct EmbeddingService {
     model_id: String,
     prompts: BTreeMap<String, String>,
@@ -289,6 +384,7 @@ pub struct EmbeddingService {
     engine: Option<Box<dyn EmbeddingEngine>>,
     image_processor_error: String,
     audio_processor_error: String,
+    video_processor_error: String,
     /// Serialises the injected runner, which has no device turns of its own.
     runner_lock: Mutex<()>,
     device_lost: AtomicBool,
@@ -319,6 +415,7 @@ impl EmbeddingService {
             engine: None,
             image_processor_error: String::new(),
             audio_processor_error: String::new(),
+            video_processor_error: String::new(),
             runner_lock: Mutex::new(()),
             device_lost: AtomicBool::new(false),
             initialization_error: String::new(),
@@ -374,6 +471,7 @@ impl EmbeddingService {
             Ok(engine) => {
                 service.image_processor_error = engine.image_processor_error();
                 service.audio_processor_error = engine.audio_processor_error();
+                service.video_processor_error = engine.video_processor_error();
                 service.engine = Some(engine);
                 service.ready = true;
             }
@@ -489,6 +587,8 @@ impl EmbeddingService {
         let byte_limit = MAX_INPUT_TOKENS.saturating_mul(engine.max_token_bytes());
         let mut image_count = 0;
         let mut audio_count = 0;
+        let mut video_count = 0;
+        let mut video_frames = 0;
         for (index, input) in inputs.iter().enumerate() {
             if cancelled() {
                 return EmbeddingStatus::Cancelled;
@@ -504,6 +604,63 @@ impl EmbeddingService {
                 }
                 match part.kind {
                     EmbeddingPartType::Text => text.push_str(&part.value),
+                    EmbeddingPartType::Video => {
+                        if !engine.supports_video() || !self.video_processor_error.is_empty() {
+                            *error = if self.video_processor_error.is_empty() {
+                                "unsupported embedding vision configuration".into()
+                            } else {
+                                self.video_processor_error.clone()
+                            };
+                            return EmbeddingStatus::InvalidVideoInput;
+                        }
+                        let processed = (|| {
+                            video_count += 1;
+                            if video_count > MAX_VIDEOS {
+                                return Err(EngineVideoError::Invalid(
+                                    "embedding requests accept at most 32 videos".into(),
+                                ));
+                            }
+                            let bytes = read_video_url(&part.value, &mut budget)
+                                .map_err(|e| EngineVideoError::Invalid(e.message().to_owned()))?;
+                            let video = engine.process_video(
+                                &bytes,
+                                &request.video,
+                                is_cancelled.as_ref(),
+                                MAX_VIDEO_FRAMES - video_frames,
+                            )?;
+                            video_frames += video.frames.len();
+                            if video_frames > MAX_VIDEO_FRAMES {
+                                return Err(EngineVideoError::Invalid(
+                                    "embedding requests accept at most 64 sampled video frames"
+                                        .into(),
+                                ));
+                            }
+                            Ok(video)
+                        })();
+                        match processed {
+                            Ok(video) => {
+                                text.push_str(&video.text);
+                                sequence
+                                    .images
+                                    .extend(video.frames.into_iter().map(|media| EngineImage {
+                                        offset: 0,
+                                        token_id: VIDEO_TOKEN_ID,
+                                        media,
+                                    }));
+                            }
+                            Err(EngineVideoError::Library(failure)) => {
+                                *error = failure;
+                                return EmbeddingStatus::Failed;
+                            }
+                            Err(EngineVideoError::Invalid(failure)) => {
+                                if cancelled() {
+                                    return EmbeddingStatus::Cancelled;
+                                }
+                                *error = failure;
+                                return EmbeddingStatus::InvalidVideoInput;
+                            }
+                        }
+                    }
                     EmbeddingPartType::Audio => {
                         if !engine.supports_audio() || !self.audio_processor_error.is_empty() {
                             *error = if self.audio_processor_error.is_empty() {
@@ -558,7 +715,9 @@ impl EmbeddingService {
                         }
                         let processed = read_image_url(&part.value, &mut budget)
                             .map_err(|e| e.message().to_owned())
-                            .and_then(|bytes| engine.process_image(&bytes));
+                            .and_then(|bytes| {
+                                engine.process_image(&bytes, request.image_soft_tokens)
+                            });
                         let patches = match processed {
                             Ok(patches) => patches,
                             Err(failure) => {
@@ -571,7 +730,11 @@ impl EmbeddingService {
                             text.push_str(IMAGE_TOKEN);
                         }
                         text.push_str(END_IMAGE_TOKEN);
-                        sequence.images.push((0, patches));
+                        sequence.images.push(EngineImage {
+                            offset: 0,
+                            token_id: IMAGE_TOKEN_ID,
+                            media: patches,
+                        });
                     }
                 }
                 if !request.truncate && text.len() > byte_limit {
@@ -605,16 +768,25 @@ impl EmbeddingService {
             // image's features or leave an unfilled image token in the text
             // backbone.
             let count = |token: u32| sequence.tokens.iter().filter(|&&t| t == token).count();
-            if !sequence.images.is_empty()
-                && count(IMAGE_TOKEN_ID)
-                    != sequence
+            if !sequence.images.is_empty() {
+                for token in [IMAGE_TOKEN_ID, VIDEO_TOKEN_ID] {
+                    let expected: usize = sequence
                         .images
                         .iter()
-                        .map(|(_, m)| m.soft_tokens)
-                        .sum::<usize>()
-            {
-                *error = "text must not contain image placeholders when images are supplied".into();
-                return EmbeddingStatus::InvalidInput;
+                        .filter(|image| image.token_id == token)
+                        .map(|image| image.media.soft_tokens)
+                        .sum();
+                    if count(token) != expected {
+                        *error = "text must not contain image/video placeholders when vision \
+                                  inputs are supplied"
+                            .into();
+                        return if token == VIDEO_TOKEN_ID {
+                            EmbeddingStatus::InvalidVideoInput
+                        } else {
+                            EmbeddingStatus::InvalidInput
+                        };
+                    }
+                }
             }
             if !sequence.audio.is_empty()
                 && count(AUDIO_TOKEN_ID)
@@ -628,6 +800,11 @@ impl EmbeddingService {
                 return EmbeddingStatus::InvalidAudioInput;
             }
             if request.truncate && sequence.tokens.len() > MAX_INPUT_TOKENS {
+                let last_video = sequence.tokens.iter().rposition(|&t| t == VIDEO_TOKEN_ID);
+                if last_video.is_some_and(|last| last + 2 > MAX_INPUT_TOKENS - 1) {
+                    batch.failed_index = index;
+                    return EmbeddingStatus::InputTooLong;
+                }
                 let last_audio = sequence.tokens.iter().rposition(|&t| t == AUDIO_TOKEN_ID);
                 if !sequence.audio.is_empty()
                     && last_audio.is_some_and(|last| last + 2 > MAX_INPUT_TOKENS - 1)
@@ -647,18 +824,21 @@ impl EmbeddingService {
                 batch.failed_index = index;
                 return EmbeddingStatus::InputTooLong;
             }
-            for (placeholder, media) in [
-                (IMAGE_TOKEN_ID, &mut sequence.images),
-                (AUDIO_TOKEN_ID, &mut sequence.audio),
-            ] {
-                let mut cursor = 0;
-                for (offset, item) in media.iter_mut() {
-                    while cursor < sequence.tokens.len() && sequence.tokens[cursor] != placeholder {
-                        cursor += 1;
-                    }
-                    *offset = cursor;
-                    cursor += item.soft_tokens;
+            let mut cursor = 0;
+            for image in &mut sequence.images {
+                while cursor < sequence.tokens.len() && sequence.tokens[cursor] != image.token_id {
+                    cursor += 1;
                 }
+                image.offset = cursor;
+                cursor += image.media.soft_tokens;
+            }
+            cursor = 0;
+            for (offset, clip) in &mut sequence.audio {
+                while cursor < sequence.tokens.len() && sequence.tokens[cursor] != AUDIO_TOKEN_ID {
+                    cursor += 1;
+                }
+                *offset = cursor;
+                cursor += clip.soft_tokens;
             }
             batch.token_counts.push(sequence.tokens.len());
             sequences.push(sequence);

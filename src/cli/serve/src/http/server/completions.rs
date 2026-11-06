@@ -294,6 +294,139 @@ pub(super) fn streaming_completion(
     response
 }
 
+/// The request fields Responses and its input-token count share
+/// (`ReadOpenAiResponseChat`): reasoning, sampling and response controls and
+/// the conversation. The error is the response.
+#[allow(clippy::result_large_err)]
+fn read_openai_response_chat(
+    body: &Value,
+    backend: &Arc<dyn TextGenerationBackend>,
+    semantics: Semantics,
+) -> std::result::Result<(ChatRequest, usize, SamplingConfig), HttpResponse> {
+    let reasoning = match read_reasoning(body, ChatApi::Responses, semantics.compat) {
+        Ok(reasoning) => with_reasoning_defaults(reasoning, backend),
+        Err(message) => return Err(invalid_compatibility_request(&message)),
+    };
+    let (max_tokens, mut sampling) = read_compatibility_options(
+        body,
+        backend,
+        "max_output_tokens",
+        &[
+            "reasoning",
+            "chat_template_kwargs",
+            "text",
+            "stream",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "include",
+            "top_logprobs",
+        ],
+        reasoning.enabled,
+    )?;
+    if let Err(error) = parse_responses_logprobs(body, &mut sampling) {
+        return Err(err(
+            400,
+            "Bad Request",
+            &error.message,
+            "invalid_request_error",
+            &error.code,
+        ));
+    }
+    let mut messages = Vec::new();
+    if let Some(instructions) = body.find("instructions") {
+        let Value::String(instructions) = instructions else {
+            return Err(invalid_compatibility_request(
+                "'instructions' must be a string",
+            ));
+        };
+        messages.push(ChatMessage::new(ChatRole::System, instructions.clone()));
+    }
+    match body.find("input") {
+        Some(Value::String(input)) if !input.is_empty() => {
+            messages.push(ChatMessage::new(ChatRole::User, input.clone()));
+        }
+        input => {
+            let mut parse_error = None;
+            if !read_text_messages(
+                input,
+                ChatApi::Responses,
+                semantics,
+                backend.supports_images(),
+                &mut messages,
+                &mut parse_error,
+            ) {
+                return Err(invalid_compatibility_request(
+                    parse_error.as_deref().unwrap_or(
+                        "'input' must be nonempty text, or messages with text and images, \
+                     function calls and their outputs",
+                    ),
+                ));
+            }
+        }
+    }
+    let mut chat = ChatRequest::new(messages);
+    chat.reasoning = reasoning;
+    if let Err((message, code)) = parse_response_tool_controls(body, &mut chat) {
+        return Err(err(
+            400,
+            "Bad Request",
+            &message,
+            "invalid_request_error",
+            code,
+        ));
+    }
+    if let Err(message) = parse_openai_response_format(body, &mut chat) {
+        return Err(err(
+            400,
+            "Bad Request",
+            &message,
+            "invalid_request_error",
+            "invalid_response_format",
+        ));
+    }
+    match body.find("cache_prompt") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(cache_prompt)) => chat.cache_prompt = *cache_prompt,
+        Some(_) => {
+            return Err(err(
+                400,
+                "Bad Request",
+                "'cache_prompt' must be a boolean",
+                "invalid_request_error",
+                "invalid_cache_prompt",
+            ));
+        }
+    }
+    match body.find("cache_persist") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(cache_persist)) => chat.cache_persist = *cache_persist,
+        Some(_) => {
+            return Err(err(
+                400,
+                "Bad Request",
+                "'cache_persist' must be a boolean",
+                "invalid_request_error",
+                "invalid_cache_persist",
+            ));
+        }
+    }
+    match body.find("return_progress") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(return_progress)) => chat.return_progress = *return_progress,
+        Some(_) => {
+            return Err(err(
+                400,
+                "Bad Request",
+                "'return_progress' must be a boolean",
+                "invalid_request_error",
+                "invalid_return_progress",
+            ));
+        }
+    }
+    Ok((chat, max_tokens, sampling))
+}
+
 pub(super) fn openai_responses(
     request: &HttpRequest,
     backend: &Arc<dyn TextGenerationBackend>,
@@ -302,128 +435,9 @@ pub(super) fn openai_responses(
     let target = semantics.target;
     compatibility_errors((|| {
         let body = try_response!(parse_body(request));
-        let reasoning = match read_reasoning(&body, ChatApi::Responses, semantics.compat) {
-            Ok(reasoning) => with_reasoning_defaults(reasoning, backend),
-            Err(message) => return Ok(invalid_compatibility_request(&message)),
-        };
-        let (max_tokens, mut sampling) = try_response!(read_compatibility_options(
-            &body,
-            backend,
-            "max_output_tokens",
-            &[
-                "reasoning",
-                "chat_template_kwargs",
-                "text",
-                "stream",
-                "tools",
-                "tool_choice",
-                "parallel_tool_calls",
-                "include",
-                "top_logprobs",
-            ],
-            reasoning.enabled,
-        ));
-        if let Err(error) = parse_responses_logprobs(&body, &mut sampling) {
-            return Ok(err(
-                400,
-                "Bad Request",
-                &error.message,
-                "invalid_request_error",
-                &error.code,
-            ));
-        }
-        let mut messages = Vec::new();
-        if let Some(instructions) = body.find("instructions") {
-            let Value::String(instructions) = instructions else {
-                return Ok(invalid_compatibility_request(
-                    "'instructions' must be a string",
-                ));
-            };
-            messages.push(ChatMessage::new(ChatRole::System, instructions.clone()));
-        }
-        match body.find("input") {
-            Some(Value::String(input)) if !input.is_empty() => {
-                messages.push(ChatMessage::new(ChatRole::User, input.clone()));
-            }
-            input => {
-                let mut parse_error = None;
-                if !read_text_messages(
-                    input,
-                    ChatApi::Responses,
-                    semantics,
-                    backend.supports_images(),
-                    &mut messages,
-                    &mut parse_error,
-                ) {
-                    return Ok(invalid_compatibility_request(
-                        parse_error.as_deref().unwrap_or(
-                            "'input' must be nonempty text, or messages with text and images, \
-                         function calls and their outputs",
-                        ),
-                    ));
-                }
-            }
-        }
-        let mut chat = ChatRequest::new(messages);
+        let (mut chat, max_tokens, sampling) =
+            try_response!(read_openai_response_chat(&body, backend, semantics));
         chat.client_id = request.client_id.clone();
-        chat.reasoning = reasoning;
-        if let Err((message, code)) = parse_response_tool_controls(&body, &mut chat) {
-            return Ok(err(
-                400,
-                "Bad Request",
-                &message,
-                "invalid_request_error",
-                code,
-            ));
-        }
-        if let Err(message) = parse_openai_response_format(&body, &mut chat) {
-            return Ok(err(
-                400,
-                "Bad Request",
-                &message,
-                "invalid_request_error",
-                "invalid_response_format",
-            ));
-        }
-        match body.find("cache_prompt") {
-            None | Some(Value::Null) => {}
-            Some(Value::Bool(cache_prompt)) => chat.cache_prompt = *cache_prompt,
-            Some(_) => {
-                return Ok(err(
-                    400,
-                    "Bad Request",
-                    "'cache_prompt' must be a boolean",
-                    "invalid_request_error",
-                    "invalid_cache_prompt",
-                ));
-            }
-        }
-        match body.find("cache_persist") {
-            None | Some(Value::Null) => {}
-            Some(Value::Bool(cache_persist)) => chat.cache_persist = *cache_persist,
-            Some(_) => {
-                return Ok(err(
-                    400,
-                    "Bad Request",
-                    "'cache_persist' must be a boolean",
-                    "invalid_request_error",
-                    "invalid_cache_persist",
-                ));
-            }
-        }
-        match body.find("return_progress") {
-            None | Some(Value::Null) => {}
-            Some(Value::Bool(return_progress)) => chat.return_progress = *return_progress,
-            Some(_) => {
-                return Ok(err(
-                    400,
-                    "Bad Request",
-                    "'return_progress' must be a boolean",
-                    "invalid_request_error",
-                    "invalid_return_progress",
-                ));
-            }
-        }
         let stream = body
             .find("stream")
             .is_some_and(|stream| stream.as_bool(false));
@@ -437,6 +451,21 @@ pub(super) fn openai_responses(
             target,
             &requested_model(&body, backend),
         )
+    })())
+}
+
+/// `POST /v1/responses/input_tokens` (`OpenAiResponsesInputTokens`): the
+/// prompt size of the same Responses request, without scheduling generation.
+pub(super) fn openai_responses_input_tokens(
+    request: &HttpRequest,
+    backend: &Arc<dyn TextGenerationBackend>,
+    semantics: Semantics,
+) -> Result<HttpResponse> {
+    compatibility_errors((|| {
+        let body = try_response!(parse_body(request));
+        let (mut chat, _, _) = try_response!(read_openai_response_chat(&body, backend, semantics));
+        chat.client_id = request.client_id.clone();
+        count_openai_input_tokens(&chat, backend)
     })())
 }
 

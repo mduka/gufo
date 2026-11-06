@@ -299,6 +299,7 @@ class ServeWorkload(Workload):
     concurrency: list[int] = field(default_factory=list)
     warmup: int = 1
     repetitions: int = 3
+    temperature: float = 0.0
 
     def invoke(self, binary: Path, side: str, round_index: int, timeout: float) -> Invocation:
         env = {k: v for k, v in os.environ.items() if k not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
@@ -324,7 +325,7 @@ class ServeWorkload(Workload):
                     model=serving_bench.discover_model(base_url, 30.0),
                     prompt=self.prompt,
                     max_tokens=self.max_tokens,
-                    temperature=0.0,
+                    temperature=self.temperature,
                     concurrency_levels=self.concurrency,
                     warmup_rounds=self.warmup,
                     repetitions=self.repetitions,
@@ -787,6 +788,7 @@ def serve_workload(args: argparse.Namespace) -> Workload:
         concurrency=levels,
         warmup=args.warmup,
         repetitions=args.repeat,
+        temperature=args.temperature,
     )
 
 
@@ -1233,6 +1235,10 @@ def workload_digest(workload: Workload) -> str:
     the command line (prompts, request bodies, repetitions). The port does
     not change what is measured."""
     fields = {name: value for name, value in asdict(workload).items() if name != "port"}
+    # Greedy serving keeps the digest it had before sampled runs existed, so
+    # its stored baselines stay valid.
+    if not fields.get("temperature", 1.0):
+        del fields["temperature"]
     text = json.dumps([type(workload).__name__, fields], sort_keys=True, default=str)
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -1615,6 +1621,8 @@ def add_workloads(parser: argparse.ArgumentParser) -> None:
     serve.add_argument("--concurrency", default="1,2,4", help="levels; the largest sets --sessions")
     serve.add_argument("--context", type=int, default=8192)
     serve.add_argument("--max-tokens", type=int, default=128)
+    serve.add_argument("--temperature", type=float, default=0.0,
+                       help="above 0, sampled; give the server a seed (--server-args \"--seed N\") for equal outputs")
     serve.add_argument("--prompt-repeat", type=int, default=8)
     serve.add_argument("--port", type=int, default=18531)
     tts = workloads.add_parser("tts", help="gufo serve tts: buffered WAV and streamed PCM requests")

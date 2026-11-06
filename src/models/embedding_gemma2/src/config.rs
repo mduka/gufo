@@ -12,6 +12,8 @@ use gufo_core::json::{self, Value};
 /// the CPU reference applies the same constant but keeps the product in f32.
 pub const EMBED_SCALE: f32 = 22.625;
 pub const IMAGE_TOKEN_ID: u32 = 258880;
+pub const VIDEO_TOKEN_ID: u32 = 258884;
+pub const VIDEO_TOKEN: &str = "<|video|>";
 pub const AUDIO_TOKEN_ID: u32 = 258881;
 pub const AUDIO_TOKEN: &str = "<|audio|>";
 pub const BEGIN_AUDIO_TOKEN: &str = "<|audio>";
@@ -110,6 +112,7 @@ pub struct ModelConfig {
     pub hidden_activation: String,
     pub text: TextConfig,
     pub supported_vision: bool,
+    pub supported_video: bool,
     pub supported_audio: bool,
 }
 
@@ -265,6 +268,8 @@ impl ModelConfig {
                 && root.member_size("image_token_id", 0) == 258880
                 && root.member_size("eoi_token_id", 0) == 258882;
         }
+        config.supported_video = config.supported_vision
+            && root.member_size("video_token_id", 0) == VIDEO_TOKEN_ID as usize;
         if let Some(audio) = root.find("audio_config").filter(|a| a.is_object()) {
             let channels = audio.find("subsampling_conv_channels");
             let clipped = audio.find("use_clipped_linears");

@@ -169,6 +169,23 @@ fn the_released_vision_geometry_is_supported() {
         vision.supported_vision,
         "released vision geometry is supported"
     );
+    assert!(
+        vision.supported_video,
+        "released video placeholder is supported"
+    );
+    let wrong_video = ModelConfig::parse(
+        replace(
+            &vision_config,
+            "\"video_token_id\": 258884",
+            "\"video_token_id\": 42",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        wrong_video.supported_vision && !wrong_video.supported_video,
+        "unsupported video token preserves image support"
+    );
     for changed in [
         replace(&vision_config, "\"head_dim\": 64", "\"head_dim\": 128"),
         replace(

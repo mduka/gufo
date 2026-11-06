@@ -28,6 +28,7 @@
 //! matrix) and end in zero bytes that kernels reading whole blocks past the
 //! last row may touch.
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::marker::PhantomData;
@@ -35,8 +36,8 @@ use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::ScopedJoinHandle;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{JoinHandle, ScopedJoinHandle};
 
 use crate::error::{HipError, check};
 use crate::mapped::MappedFile;
@@ -823,6 +824,286 @@ fn upload_worker(
         stream.synchronize()?;
     }
     Ok(())
+}
+
+/// Chunks a [`FileUpload`] queues per reader before [`FileUpload::copy`]
+/// waits (upstream's `2 * kReaders`).
+const QUEUED_PER_READER: usize = 2;
+
+/// One chunk of a [`FileUpload`] copy: `size` bytes at `offset` of `file`
+/// to the device address `address`.
+struct FileTask {
+    file: Arc<MappedFile>,
+    offset: usize,
+    size: usize,
+    address: usize,
+}
+
+#[derive(Default)]
+struct FileQueue {
+    tasks: VecDeque<FileTask>,
+    /// Queued and in-flight chunks.
+    pending: usize,
+    /// Readers that made their staging buffer and stream, or failed to.
+    ready: usize,
+    stopping: bool,
+    failure: Option<HipError>,
+}
+
+impl FileQueue {
+    /// Keeps the first failure and drops the queued chunks (`Fail`).
+    fn fail(&mut self, error: HipError) {
+        self.failure.get_or_insert(error);
+        self.pending -= self.tasks.len();
+        self.tasks.clear();
+    }
+
+    fn status(&self) -> Result<(), HipError> {
+        self.failure.map_or(Ok(()), Err)
+    }
+}
+
+struct FileShared {
+    queue: Mutex<FileQueue>,
+    changed: Condvar,
+}
+
+impl FileShared {
+    fn lock(&self) -> Result<MutexGuard<'_, FileQueue>, HipError> {
+        self.queue
+            .lock()
+            .map_err(|_| HipError::refused("weight upload lock poisoned"))
+    }
+
+    fn wait<'a>(
+        &self,
+        queue: MutexGuard<'a, FileQueue>,
+    ) -> Result<MutexGuard<'a, FileQueue>, HipError> {
+        self.changed
+            .wait(queue)
+            .map_err(|_| HipError::refused("weight upload lock poisoned"))
+    }
+}
+
+/// A bounded disk-to-device pipeline into device memory the caller hands
+/// over (upstream's `WeightUpload`): [`UPLOADERS`] readers, each with a
+/// pinned staging buffer and a stream of its own, read the queued file
+/// ranges with `pread` (`O_DIRECT` where the filesystem allows it, so the
+/// page cache is not filled and the mapping's pages are never touched) and
+/// copy them to their destinations. [`FileUpload::copy`] queues a range
+/// without waiting for its upload; it waits only while
+/// `QUEUED_PER_READER * UPLOADERS` chunks are queued. The upload owns every
+/// destination until [`FileUpload::finish`] returns it, so no destination
+/// can be freed or reused while a reader writes to it; dropping the upload
+/// waits for the queued and in-flight copies first.
+pub struct FileUpload {
+    shared: Arc<FileShared>,
+    readers: Vec<JoinHandle<()>>,
+    destinations: Vec<DeviceBuffer<u8>>,
+}
+
+impl FileUpload {
+    /// Starts the readers (`WeightUpload::Create`); fails when a staging
+    /// buffer, stream or thread cannot be made.
+    pub fn new() -> Result<Self, HipError> {
+        let mut upload = Self {
+            shared: Arc::new(FileShared {
+                queue: Mutex::new(FileQueue::default()),
+                changed: Condvar::new(),
+            }),
+            readers: Vec::with_capacity(UPLOADERS),
+            destinations: Vec::new(),
+        };
+        for _ in 0..UPLOADERS {
+            let shared = Arc::clone(&upload.shared);
+            match std::thread::Builder::new()
+                .name("gufo-upload".into())
+                .spawn(move || file_reader(&shared))
+            {
+                Ok(reader) => upload.readers.push(reader),
+                Err(_) => {
+                    upload
+                        .shared
+                        .lock()?
+                        .fail(HipError::refused("weight upload worker creation failed"));
+                    break;
+                }
+            }
+        }
+        let readers = upload.readers.len();
+        let mut queue = upload.shared.lock()?;
+        while queue.ready < readers && queue.failure.is_none() {
+            queue = upload.shared.wait(queue)?;
+        }
+        let status = queue.status();
+        drop(queue);
+        status.map(|()| upload)
+    }
+
+    /// Queues `size` bytes at byte `offset` of `file` for the start of
+    /// `destination` (`WeightUpload::Copy`). Work the destination's stream
+    /// has queued completes first: the readers write from their own
+    /// streams. An error, also one of an earlier copy, fails the upload.
+    pub fn copy(
+        &mut self,
+        file: &Arc<MappedFile>,
+        offset: usize,
+        size: usize,
+        mut destination: DeviceBuffer<u8>,
+    ) -> Result<(), HipError> {
+        if offset.checked_add(size).is_none_or(|end| end > file.len()) || size > destination.len() {
+            let mut queue = self.shared.lock()?;
+            queue.fail(HipError::refused("weight upload range is outside its file"));
+            return queue.status();
+        }
+        if let Err(error) = destination.wait_for_home() {
+            let mut queue = self.shared.lock()?;
+            queue.fail(error);
+            return queue.status();
+        }
+        let address = destination.as_mut_slice().address();
+        // Owned here until `finish` has seen every chunk complete.
+        self.destinations.push(destination);
+        let mut queue = self.shared.lock()?;
+        let mut done = 0;
+        while done < size {
+            while queue.failure.is_none() && queue.tasks.len() >= QUEUED_PER_READER * UPLOADERS {
+                queue = self.shared.wait(queue)?;
+            }
+            queue.status()?;
+            let count = CHUNK.min(size - done);
+            queue.tasks.push_back(FileTask {
+                file: Arc::clone(file),
+                offset: offset + done,
+                size: count,
+                address: address + done,
+            });
+            queue.pending += 1;
+            done += count;
+            self.shared.changed.notify_all();
+        }
+        queue.status()
+    }
+
+    /// Waits for every queued copy, also after a failure, and returns the
+    /// destinations in the order they were queued (`WeightUpload::Finish`).
+    /// The readers stay for further copies.
+    pub fn finish(&mut self) -> Result<Vec<DeviceBuffer<u8>>, HipError> {
+        let mut queue = self.shared.lock()?;
+        while queue.pending != 0 {
+            queue = self.shared.wait(queue)?;
+        }
+        let status = queue.status();
+        drop(queue);
+        // No reader holds an address of these any more.
+        let destinations = std::mem::take(&mut self.destinations);
+        status.map(|()| destinations)
+    }
+}
+
+impl Drop for FileUpload {
+    fn drop(&mut self) {
+        if let Ok(mut queue) = self.shared.queue.lock() {
+            queue.stopping = true;
+        }
+        self.shared.changed.notify_all();
+        // The readers finish the queued and in-flight copies before the
+        // destinations are freed, even on a failed upload.
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+/// A [`FileUpload`] reader (`WeightUpload::State::Run`).
+fn file_reader(shared: &FileShared) {
+    let made = Stream::new().and_then(|stream| {
+        PinnedBuffer::<u8>::zeroed(CHUNK + DIRECT_ALIGNMENT).map(|staging| (stream, staging))
+    });
+    let Ok(mut queue) = shared.lock() else {
+        return;
+    };
+    queue.ready += 1;
+    let (stream, mut staging) = match made {
+        Ok(made) => made,
+        Err(error) => {
+            queue.fail(error);
+            drop(queue);
+            shared.changed.notify_all();
+            return;
+        }
+    };
+    shared.changed.notify_all();
+    // The unbuffered description of the file this reader read last.
+    let mut direct: Option<(*const MappedFile, Option<File>)> = None;
+    loop {
+        while queue.tasks.is_empty() && !queue.stopping {
+            queue = match shared.wait(queue) {
+                Ok(queue) => queue,
+                Err(_) => return,
+            };
+        }
+        let Some(task) = queue.tasks.pop_front() else {
+            return;
+        };
+        drop(queue);
+        shared.changed.notify_all();
+        let file = Arc::as_ptr(&task.file);
+        if direct.as_ref().is_none_or(|(known, _)| *known != file) {
+            direct = Some((file, open_direct(task.file.file())));
+        }
+        let result = file_transfer(
+            &task,
+            direct.as_ref().and_then(|(_, f)| f.as_ref()),
+            &stream,
+            &mut staging,
+        );
+        queue = match shared.lock() {
+            Ok(queue) => queue,
+            Err(_) => return,
+        };
+        queue.pending -= 1;
+        if let Err(error) = result {
+            queue.fail(error);
+        }
+        shared.changed.notify_all();
+    }
+}
+
+/// Reads one chunk into `staging` and copies it to its destination
+/// (`WeightUpload::State::Transfer`).
+fn file_transfer(
+    task: &FileTask,
+    direct: Option<&File>,
+    stream: &Stream,
+    staging: &mut PinnedBuffer<u8>,
+) -> Result<(), HipError> {
+    let payload = read_chunk(
+        &task.file,
+        direct,
+        task.offset,
+        task.size,
+        staging.host_mut()?,
+    )
+    .map_err(|_| HipError::refused("reading the weight file failed"))?;
+    let source = staging.host()?[payload].as_ptr();
+    // SAFETY: the destination lies inside a buffer the `FileUpload` owns
+    // (`copy` checked the range) and frees or returns only after this chunk
+    // completed (`finish` and `drop` wait for every queued chunk); the work
+    // of its own stream completed before it was queued. The source is this
+    // reader's pinned staging buffer, unchanged until the copy completes
+    // below.
+    let status = unsafe {
+        sys::hipMemcpyAsync(
+            task.address as *mut std::ffi::c_void,
+            source.cast(),
+            task.size,
+            sys::HIP_MEMCPY_HOST_TO_DEVICE,
+            stream.as_raw(),
+        )
+    };
+    stream.observe(check(status, "hipMemcpyAsync weight upload"))?;
+    stream.synchronize()
 }
 
 /// An independent `O_DIRECT` description of an open file, or `None` when the

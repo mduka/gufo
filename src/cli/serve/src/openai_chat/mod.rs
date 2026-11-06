@@ -635,6 +635,73 @@ pub fn handle_openai_chat(
     }
 }
 
+/// Counts the same prompt as Chat Completions without scheduling generation
+/// (`HandleOpenAiChatInputTokens`). Streaming options are accepted, but the
+/// result is always one JSON response.
+pub fn handle_openai_chat_input_tokens(
+    request: &HttpRequest,
+    backend: &Arc<dyn TextGenerationBackend>,
+) -> Result<HttpResponse> {
+    let mut parsed = unparsed_chat(backend);
+    if let Some(response) = parse_request(request, backend, &mut parsed, true) {
+        return Ok(response);
+    }
+    count_openai_input_tokens(&parsed.chat, backend)
+}
+
+/// The Chat and Responses input-token count (`CountOpenAiInputTokens`),
+/// including the unsupported-backend and prompt errors.
+pub fn count_openai_input_tokens(
+    chat: &ChatRequest,
+    backend: &Arc<dyn TextGenerationBackend>,
+) -> Result<HttpResponse> {
+    match backend.count_chat_tokens(chat) {
+        Ok(Some(tokens)) => Ok(HttpResponse::new(
+            200,
+            "OK",
+            dump(
+                &Value::object()
+                    .with("object", "response.input_tokens")
+                    .with("input_tokens", tokens),
+            ),
+        )),
+        Ok(None) => Ok(not_implemented_on_this_model()),
+        Err(failure) => match failure.kind() {
+            ErrorKind::Generation(code) => Ok(generation_error(code, failure.message())),
+            ErrorKind::InvalidArgument => Ok(error(
+                400,
+                "Bad Request",
+                failure.message(),
+                "invalid_prompt",
+            )),
+            ErrorKind::Length => Ok(error(
+                400,
+                "Bad Request",
+                failure.message(),
+                "context_length_exceeded",
+            )),
+            _ => Err(failure),
+        },
+    }
+}
+
+/// The 501 of an endpoint the loaded text model does not implement.
+fn not_implemented_on_this_model() -> HttpResponse {
+    HttpResponse::new(
+        501,
+        "Not Implemented",
+        dump(
+            &Value::object().with(
+                "error",
+                Value::object()
+                    .with("message", "endpoint not implemented on this text model")
+                    .with("type", "server_error")
+                    .with("code", "not_implemented"),
+            ),
+        ),
+    )
+}
+
 /// llama-server's `/apply-template` (`HandleApplyTemplate`): the prompt a
 /// Chat Completions body renders to, with the server's reasoning defaults
 /// applied, without generating. `model` is optional, as outside
@@ -655,19 +722,7 @@ pub fn handle_apply_template(
             "OK",
             dump(&Value::object().with("prompt", prompt)),
         )),
-        Ok(None) => Ok(HttpResponse::new(
-            501,
-            "Not Implemented",
-            dump(
-                &Value::object().with(
-                    "error",
-                    Value::object()
-                        .with("message", "endpoint not implemented on this text model")
-                        .with("type", "server_error")
-                        .with("code", "not_implemented"),
-                ),
-            ),
-        )),
+        Ok(None) => Ok(not_implemented_on_this_model()),
         Err(failure) => match failure.kind() {
             ErrorKind::InvalidArgument => Ok(error(
                 400,

@@ -287,6 +287,7 @@ impl Model {
                     let output = if p.sampled {
                         MtpOutput {
                             token: None,
+                            confidence: None,
                             candidates: Some(&mut p.candidates),
                             kv_only: false,
                             draft_subset: p.draft_subset,
@@ -294,6 +295,7 @@ impl Model {
                     } else {
                         MtpOutput {
                             token: Some(&mut p.draft),
+                            confidence: Some(&mut p.draft_confidence),
                             candidates: None,
                             kv_only: false,
                             draft_subset: p.draft_subset,
@@ -323,6 +325,20 @@ impl Model {
                     continue;
                 }
                 if self.append_lookup(r.session, p, r.stop_at_eos, 1, false) {
+                    continue;
+                }
+                if p.gate_stops() {
+                    if batch_drafts.is_some()
+                        && !p.sampled
+                        && p.draft_confidence < policy::BATCH_DROP_PROBABILITY
+                    {
+                        // Without proposals left the anchor decodes as an
+                        // ordinary step; the catch-up already wrote its
+                        // predictor row.
+                        p.chain.pop();
+                        p.speculative = p.chain.len() > 1;
+                    }
+                    p.width = p.chain.len();
                     continue;
                 }
                 if p.chain.len() < p.width {

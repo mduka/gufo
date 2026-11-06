@@ -6,6 +6,7 @@
 //! token sequences. A JSON grammar (`constraint`) masks the logits before
 //! every filter.
 
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use crate::json_constraint::{State as ConstraintState, TokenConstraint};
@@ -320,6 +321,29 @@ impl SamplingConfig {
 
 /// Token IDs of a logit row (`sampling::TokenId`).
 pub type TokenId = u32;
+
+/// Hashes a token ID with one multiplication. A residual draw looks up every
+/// entry of the target distribution, up to the whole vocabulary, where std's
+/// default SipHash costs milliseconds per rejected draft (C++'s
+/// `std::unordered_map` hashes an integer to itself).
+#[derive(Default)]
+struct TokenHasher(u64);
+
+impl Hasher for TokenHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u32(u32::from(byte) ^ self.0 as u32);
+        }
+    }
+
+    fn write_u32(&mut self, token: u32) {
+        self.0 = u64::from(token).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// The most top candidates a request may ask log probabilities for.
 pub const MAX_LOGPROBS: u32 = 20;
@@ -678,10 +702,23 @@ impl SamplingDistribution {
         if !positive_finite(total) {
             return Err(Error::runtime("logit softmax normalization failed"));
         }
-        for entry in &mut entries {
-            entry.value /= total;
+        // In pairs, which compile to packed divisions: a whole vocabulary per
+        // verified token takes twice as long one entry at a time.
+        let mut zero = false;
+        let (pairs, last) = entries.as_chunks_mut::<2>();
+        for [first, second] in pairs {
+            let (a, b) = (first.value / total, second.value / total);
+            first.value = a;
+            second.value = b;
+            zero |= (a == 0.0) | (b == 0.0);
         }
-        entries.retain(|entry| entry.value != 0.0);
+        for entry in last {
+            entry.value /= total;
+            zero |= entry.value == 0.0;
+        }
+        if zero {
+            entries.retain(|entry| entry.value != 0.0);
+        }
         Ok(Self { entries })
     }
 
@@ -733,8 +770,14 @@ impl SamplingDistribution {
         if candidate_ids.len() != candidate_probabilities.len() {
             return Err(Error::invalid("sparse probability row is malformed"));
         }
-        let mut draft: std::collections::HashMap<TokenId, f64> =
-            std::collections::HashMap::with_capacity(candidate_ids.len());
+        let mut draft: std::collections::HashMap<TokenId, f64, BuildHasherDefault<TokenHasher>> =
+            std::collections::HashMap::with_capacity_and_hasher(
+                candidate_ids.len(),
+                BuildHasherDefault::default(),
+            );
+        // Answers for most entries that they are no candidate, without a lookup.
+        let mut maybe_candidate = [0u64; 16];
+        let filter_bit = |token: TokenId| (token.wrapping_mul(0x9E37_79B1) >> 22) as usize;
         for (&token, &probability) in candidate_ids.iter().zip(candidate_probabilities) {
             if !probability.is_finite() || probability < 0.0 {
                 return Err(Error::invalid(
@@ -742,12 +785,19 @@ impl SamplingDistribution {
                 ));
             }
             *draft.entry(token).or_insert(0.0) += f64::from(probability);
+            let bit = filter_bit(token);
+            maybe_candidate[bit / 64] |= 1 << (bit % 64);
         }
         let mut residual = Vec::with_capacity(self.entries.len());
         let mut sum = 0.0;
         for entry in &self.entries {
-            let q = draft.get(&entry.token).copied().unwrap_or(0.0);
-            let value = (entry.value - q).max(0.0);
+            let bit = filter_bit(entry.token);
+            let q = if maybe_candidate[bit / 64] & (1 << (bit % 64)) != 0 {
+                draft.get(&entry.token).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let value = entry.value - q;
             if value > 0.0 {
                 residual.push(Probability {
                     token: entry.token,
@@ -1679,13 +1729,28 @@ impl SamplerState {
     fn linear_distribution(&self, logits: &[f32]) -> Result<SamplingDistribution> {
         let mut candidates = Vec::with_capacity(logits.len());
         let mut maximum = f64::NEG_INFINITY;
-        self.for_each_adjusted(logits, |index, value| {
-            maximum = maximum.max(value);
-            candidates.push(Probability {
-                token: index as TokenId,
-                value,
-            });
-        })?;
+        if self.penalty_counts.is_empty() {
+            for (index, &logit) in logits.iter().enumerate() {
+                if logit.is_finite() {
+                    let value = f64::from(logit);
+                    if maximum < value {
+                        maximum = value;
+                    }
+                    candidates.push(Probability {
+                        token: index as TokenId,
+                        value,
+                    });
+                }
+            }
+        } else {
+            self.for_each_adjusted(logits, |index, value| {
+                maximum = maximum.max(value);
+                candidates.push(Probability {
+                    token: index as TokenId,
+                    value,
+                });
+            })?;
+        }
         if candidates.is_empty() {
             return Err(Error::runtime(
                 "logit distribution contains no finite values",
@@ -2000,6 +2065,66 @@ pub fn sample_residual(
 
 #[cfg(test)]
 mod tests {
+
+    fn uniform_entries(count: u32) -> Vec<Probability> {
+        (0..count)
+            .map(|token| Probability { token, value: 1.0 })
+            .collect()
+    }
+
+    #[test]
+    fn normalization_drops_zeros_at_every_position() {
+        for count in [1, 2, 3, 4, 5] {
+            for zero in 0..count {
+                let mut entries = uniform_entries(count);
+                entries[zero as usize].value = 0.0;
+                let distribution =
+                    SamplingDistribution::with_total(entries, f64::from(count - 1).max(1.0))
+                        .expect("positive total");
+                let tokens: Vec<_> = distribution.entries().iter().map(|e| e.token).collect();
+                let expected: Vec<_> = (0..count).filter(|&token| token != zero).collect();
+                assert_eq!(tokens, expected);
+                for entry in distribution.entries() {
+                    assert_eq!(entry.value, 1.0 / f64::from(count - 1).max(1.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn residual_sums_repeated_candidates_past_the_filter() {
+        let half = SamplingDistribution::with_total(uniform_entries(2), 2.0).expect("total");
+        let mut rng = 1;
+        // One 0.25 leaves token 0 a share; two take all of it.
+        let drawn: std::collections::HashSet<_> = (0..64)
+            .map(|_| half.sample_residual(&[0], &[0.25], &mut rng).expect("draw"))
+            .collect();
+        assert_eq!(drawn, [0, 1].into());
+        for _ in 0..64 {
+            let token = half
+                .sample_residual(&[0, 0], &[0.25, 0.25], &mut rng)
+                .expect("draw");
+            assert_eq!(token, 1);
+        }
+    }
+
+    #[test]
+    fn residual_stays_exact_when_candidates_saturate_the_filter() {
+        // More candidates than the filter has bits: every entry takes the
+        // lookup, and only the one candidate-free token keeps a mass.
+        let count = 5000;
+        let target = SamplingDistribution::with_total(uniform_entries(count), f64::from(count))
+            .expect("total");
+        let ids: Vec<TokenId> = (0..count - 1).collect();
+        let probabilities = vec![0.001f32; ids.len()];
+        let mut rng = 1;
+        for _ in 0..8 {
+            let token = target
+                .sample_residual(&ids, &probabilities, &mut rng)
+                .expect("draw");
+            assert_eq!(token, count - 1);
+        }
+    }
 
     #[test]
     fn model_presets_follow_the_thinking_mode_and_keep_explicit_fields() {

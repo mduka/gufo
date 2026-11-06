@@ -388,6 +388,7 @@ dependencies = [
  "claxon",
  "gufo-core",
  "gufo-embedding-gemma2-kernels",
+ "gufo-ffmpeg",
  "gufo-hip",
  "gufo-kernel-build",
  "hound",
@@ -412,6 +413,13 @@ version = "0.0.0"
 dependencies = [
  "gufo-core",
  "ureq",
+]
+
+[[package]]
+name = "gufo-ffmpeg"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

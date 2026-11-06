@@ -18,6 +18,31 @@ the retained changes are kept apart, to land as kernel changes of their own.
 | Four-stream HC mix epilogue (F9) | Retained; values, gates and inject weights load before the arithmetic, 7.4 → 3.4 µs per call (traced), equal to the scalar kernel bit for bit. AR tg128 −1.0%, MTP −0.57% (`ab.py`, ABBA); outputs identical. |
 | Load-ahead small GEMM (F9) | Retained; aligned router, alpha/beta and attention F16 projections load up to ten K steps ahead with wide loads and the scalar kernel's folded FMA chain: 27.8/14.7/16 → 14.0/3.95/5.2 µs (traced), equal to the scalar kernel bit for bit. AR tg128 −3.3%, MTP −1.9% (`ab.py`, ABBA); prefill and outputs unchanged. |
 | Stall after the PLE convolution (F7) | Not real: `rocprofv3 --kernel-trace` intercepts packets inside the graph launch and starved the GPU there; untraced GPU clock probes time the PLE convolution block at 14 µs. |
+
+## Prefill route independence (October 23, 2026)
+
+A prompt restored from a checkpoint and finished by a short prefill pass must
+decode like the same prompt prefilled in one pass. Short passes (below 96
+rows, or eight rows and fewer) take different kernels for the HC combines and
+mixers, the SSM convolution, the W8A8 GEMMs and the routed experts than wide
+passes, so every such pair must give a row the same bits.
+
+| Experiment | Outcome |
+| --- | --- |
+| HC mixer epilogue's inject partials in `HcInjectPart`'s pinned order | Retained. On a downstream Q3_K-expert GGUF, a two-session replay decoded differently after a checkpoint restore; the first differing value was layer 0's FFN-mixer inject partial of the last row, one ulp apart: a wide pass gets it from the attention combine (explicit product and FMA order), a short pass from `HcMixEpilogueF16Kernel`, whose `dot +=` chain fast-math contracts and reassociates per instantiation. It is data dependent. On main, `hc_mix_ops` finds 38 of 84 partials different at 7 tokens and `hc_route_ops` carries the difference into the residual, norms and mixed rows of short passes; both pass with the change. |
+| Every F16 k = 2560 projection on `UnquantizedF16Gemm` | Retained. Only m = 96 and 513 (the production router and GDN alpha/beta) took the row-independent kernel; other expert counts took a library plan chosen per token count, and `blaslt_ops` m = 17 changes across a 94/136 split on main. |
+| SSM convolution, HC combine sums and the wave64 W8A8 GEMM in the wide route's order | Retained as guards: `SsmConv4Kernel` uses `SsmConv4Value`, the combines sum their inject partials with `__fadd_rn` from zero, and the wave64 output-projection GEMM (from 1,024 rows) writes `(dx * c)` then one FMA with `dw` through an opt-in template flag (Qwen27B and Qwen3.6 instantiations unchanged). They compile to the same gfx1151 instructions as before (operand swaps at most), so results and speed are unchanged; `gdn_ops`, `hc_route_ops` and `projection_ops` now hold them to it. |
+| Route checks | `routed_wmma_ops`: Q4_K/Q5_K gate/up × Q5_1/Q8_0 down at model shapes (640 × 2560, top-10 of 128 experts, ragged buckets), paired 128-row gate/up against separate 16/48-row tiles, 64-row down against 16/48, wide-pass rows against 7-, 1- and 33-token passes; gated decode GEMVs over 2–8 tokens against per-token launches. `projection_ops`: W8A8 rows of 1/7/9/95/96-row passes at the head, middle and tail of a 1,619- or 1,549-row pass. `gdn_ops`: a 99-row prefill split into a prefix and a 1–40-row tail. `blaslt_ops`: F16/BF16 k = 2560 splits at the short tails a restore leaves (1, 7, 96 rows). All bit for bit. |
+
+## Confidence-gated MTP chains (October 29, 2026)
+
+Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
+
+| Experiment | Outcome |
+| --- | --- |
+| End a chain after its first draft below the head's probability 0.85 (sampled: q below 0.95); unplanned cycles draft to `--draft-tokens`; planned greedy batches keep their width and drop a final proposal below 0.6 | Retained. Replies byte-identical. C1 MTP 50.3 (main, three runs) → 55.8/55.9 tok/s (+11%; every prompt faster, +4% to +16%). On a four-session server: C1 49.7 → 53.3, C4 wall throughput 76.2/76.9 → 85.4 tok/s (+11%). 16-token replies (four runs per arm), decode rate after the first token, main against the branch: prompts 1 and 2 41.5-42.0 → 37.5-37.7 and 52.7-54.0 → 47.5-48.2 tok/s (about −10%, +35 to +65 ms per reply), prompt 3 unchanged, prompt 4 24.3 → 25.3-25.6, prompt 5 within its run-to-run spread (44.9-63.1 against 59.9-62.0). This short-reply cost is not fixed; keeping the controller's first-cycle width until acceptance is observed did not change it. Two 1.5-1.8 s first-token outliers on the branch (and 0.35-0.37 s ones on main) are prefill time, before any drafting. |
+| Downstream sweeps (Q4_K/Q3_K-class recipe) | Greedy gate 0.7-0.95: 0.85 best on prose and four/eight users; sampled 0.9-0.98 within noise. Acceptance of verified C8 drafts by head probability: 0.1-0.2 22%, 0.4-0.5 53%, 0.6-0.7 71%, 0.8-0.9 86%, ≥ 0.9 97%; batch drop thresholds 0.35/0.5/0.65/0.8 gave 347.9/345.9/345.8/349.3 s against 352.6 s on an eight-way 28-question slice. Rejected: continuing while the product of acceptance estimates stays above 0.55/0.45; C1 gates 0.7/0.5 (−3.0%/−7.1%). |
+
 ## Chunked DeltaNet removed (October 27, 2026)
 
 The release-tier functional `tool-reasoning` suite failed in both MTP and AR

@@ -468,7 +468,11 @@ impl Ctx<'_> {
         let (m, kk) = (rows(w), cols(w));
         // Library edge tiles change the accumulation order when a token moves
         // within a batch; the router and recurrent gates keep one K reduction.
-        if !bf16 && kk == 2560 && (m == 96 || m == 513) {
+        // That holds for every F16 projection of the hidden row (router, GDN
+        // alpha/beta at any expert count): library plans are chosen per token
+        // count, so a row's logits would depend on its pass width
+        // (`OwnF16`).
+        if !bf16 && kk == 2560 {
             let half = self.stage.x_half.slice(0..count);
             return launched(
                 k::unquantized_f16_gemm(self.stream, w.view(), half, out, n as usize, m, kk),

@@ -5,7 +5,7 @@ how the workspace is built and checked, where it stands against upstream
 Gufo (the C++ engine, [gufo-org/gufo](https://github.com/gufo-org/gufo)) and
 how it follows upstream releases.
 
-The reference is upstream release **v0.27.0**. Every model of that release
+The reference is upstream release **v0.28.1**. Every model of that release
 except MiniMax H3 runs in Rust, with the same command line, HTTP API and
 numerics (see [Differences from upstream](#differences-from-upstream)).
 
@@ -68,7 +68,8 @@ tiers take the caller's scratch (Flash-Next) and the engine's own stream
 | `gufo-core` | `src/core` | GGUF, tokenizers, sampling, grammars, the text runner interface |
 | `gufo-eval` | `src/eval` | `gufo eval` against an OpenAI-compatible server |
 | `gufo-formats` | `src/formats` | GGML storage formats and block geometry |
-| `gufo-hip` | `src/hip` | Streams, memory, graphs, weights, BLAS: the only hand-written `unsafe` |
+| `gufo-hip` | `src/hip` | Streams, memory, graphs, weights, BLAS: the hand-written `unsafe` of the GPU |
+| `gufo-ffmpeg` | `src/ffmpeg` | Video decoding through FFmpeg, loaded on the first video: the `unsafe` of the FFmpeg calls |
 | `gufo-kernel-build` | `src/kernel_build` | `launch.toml` to C++ shim and Rust wrappers, `hipcc` |
 | `gufo-cli-kernels` | `src/cli/kernels` | The binary's own kernels (the allocation benchmark of `gufo diagnose`) |
 | `gufo-hip-smoke` | `src/hip/smoke` | Starts the HIP runtime as a `gufo` executable does; the template for executables' build scripts |
@@ -90,17 +91,24 @@ contracts stay together, as upstream keeps them.
   `clippy::undocumented_unsafe_blocks = "deny"` and `clippy::unwrap_used =
   "deny"` (tests may opt out).
 - `#![forbid(unsafe_code)]` in every crate except `gufo-hip`,
-  `gufo-kernel-build` and the kernel crates. Kernel crates deny it with one
-  `#[allow(unsafe_code)]` on their generated module; `gufo-kernel-build`
-  denies it except for the build-time jobserver handoff.
-- Changes to `src/hip/` need human review: that is where a mistake becomes
-  memory corruption.
+  `gufo-ffmpeg`, `gufo-kernel-build` and the kernel crates. Kernel crates
+  deny it with one `#[allow(unsafe_code)]` on their generated module;
+  `gufo-kernel-build` denies it except for the build-time jobserver handoff.
+- `gufo-ffmpeg` holds the FFmpeg boundary of video embeddings: `dlopen` of
+  libavformat, libavcodec, libavutil and libswscale on the first video, the
+  calls, and FFmpeg's IO and interrupt callbacks into the decoder. Struct
+  fields go through a C shim compiled against the build's headers
+  (`src/ffmpeg/shim/fields.c`), so no Rust code assumes FFmpeg's layouts, and
+  libraries of another major version than the headers are refused.
+- Changes to `src/hip/` and `src/ffmpeg/` need human review: that is where a
+  mistake becomes memory corruption.
 
 A safe launch wrapper is only as sound as its contract, so the **trusted
 base** is `gufo-hip`, `gufo-kernel-build`, every `launch.toml` (a wrong
 extent compiles and lets a kernel overrun a buffer that passed the check),
-the C++ launchers and kernels behind them, and the BLAS, device-property and
-pointer-attribute shims in `src/hip/shim/`. Changes there get the same
+the C++ launchers and kernels behind them, the BLAS, device-property and
+pointer-attribute shims in `src/hip/shim/`, and `gufo-ffmpeg` with its field
+shim. Changes there get the same
 review as `unsafe` code. Every launcher declares `probes`: the generated
 test runs each with buffers of exactly the declared extent and a 4,096-element
 guard region, and fails when a kernel writes into the guard. Probes catch
@@ -245,7 +253,7 @@ A/B runs against another binary with `tools/bench/ab.py`.
 
 ## Differences from upstream
 
-Against v0.27.0. Everything not listed behaves as upstream does.
+Against v0.28.1. Everything not listed behaves as upstream does.
 
 ### Not in Rust
 
@@ -258,7 +266,7 @@ Against v0.27.0. Everything not listed behaves as upstream does.
 | Dense Qwen with F32 or Q8_K projections, or with other head and state shapes (upstream's hipBLAS/hipBLASLt projection routes, unfused QK-norm/RoPE and plain recurrence) | Not ported: no published checkpoint needs them, and loading refuses such files. Both sides refuse F16 projections. |
 | The DeepSeek V4 Flash profiling and trace hooks (`GUFO_DEEPSEEK_ROCM_*_PROFILE`, `GUFO_DEEPSEEK_DSPARK_TRACE`, `_WIDTH_TRACE`, `_TIMING`) | Not ported: diagnostics only; `tools/prof/prof.py` profiles the Rust binary. |
 | `tune_hipblaslt` and its plan database (`GUFO_HIPBLASLT_PLAN_CACHE`), `gufo-kernel-bench` | Not ported: tools outside `gufo`. Plans are chosen per shape at run time, as upstream does without a database. |
-| Windows support (upstream's `src/core/platform` layer, Windows builds and their workflows, #775, #805) | Not ported: Rust uses the standard library and `gufo-hip`, not upstream's platform layer. |
+| Windows support (upstream's `src/core/platform` layer, Windows builds and their workflows, #775, #805, #872) | Not ported: Rust uses the standard library and `gufo-hip`, not upstream's platform layer. |
 | The Nix package (`nix build`), its ROCr queue-memory patch and the Devlab CI workflows | Not ported: Cargo builds the binary against the installed ROCm; hosted CI runs the ROCm-free checks. A ROCm built with upstream's [queue-memory patch](https://github.com/gufo-org/gufo/blob/v0.27.0/.devops/nix/patches/rocr-fixed-cwsr-rocm10.patch) keeps the same protection against queue evictions during host memory compaction. |
 
 ### Implemented differently
@@ -268,11 +276,13 @@ Against v0.27.0. Everything not listed behaves as upstream does.
 | Conversation cache | Rust keeps its own continuation cache (RAM and disk tiers, same-slot in-place restore) with upstream's policies: the deepest checkpoint across RAM and disk, metadata-only startup, oversized checkpoints on disk only and the wait for checkpoints being published. It does not use upstream's `src/cache` component. Disk checkpoints are written in 1 MiB pieces but serialised and restored as whole payloads, so a disk transfer stages the whole checkpoint in host memory. Two consequences show in the functional suites on Flash-Next: an exactly repeated request restores the state before the assistant's opening and prefills its 7 tokens again, where `src/cache` keeps the whole prompt (`sampling-defaults`); and after earlier suites have filled the cache, `cache-edits` misses an intermediate checkpoint (alone, it passes). Restoring a Flash-Next snapshot into another session copies all of its rows; upstream tracks snapshot lineage and keeps rows both sessions already share. A Flash-Next capture freezes the mutable state on the device and leaves the rows in the session; once a request has generated 10 tokens, the frozen state of the snapshots captured so far moves into pageable host memory on a thread of its own and the device blocks return for the next captures. Upstream copies captures into pinned host memory, 2 GiB of which it commits at load and grows before each prefill; restoring the state from pageable memory takes about 1.5 ms longer. |
 | Flash-Next n-gram rows across cache checkpoints | Read through the page cache; the prefetch across checkpoint boundaries is not ported. |
 | Image sessions and HIP graphs | Graph keys carry whether a session has an image RoPE table, so text graphs survive an image's arrival and image graphs are captured once per shape. |
-| JPEG decoding | `zune-jpeg` instead of libjpeg-turbo: pixels may differ by a few levels (another IDCT and upsampling), so outputs on JPEG images may differ. PNG and WebP decode as upstream's do. |
+| JPEG decoding | `zune-jpeg` instead of libjpeg-turbo: pixels may differ by a few levels (another IDCT and upsampling), so outputs on JPEG images may differ. `tests/functional/embedding_images.py` therefore accepts a cosine of 0.999 between a JPEG's embedding and that of Pillow's decoded copy, where upstream asks for 0.99999 (measured: 0.99983 against C++'s 0.999999). PNG and WebP decode as upstream's do. |
 | Flash-Next quantized-GEMM scratch | Each routed call of the vendored tier allocates from scratch the executor passes (`qfn_mmq_set_scratch`), so a captured graph keeps memory that cannot be freed under it; upstream's tier grows one arena per stream in blocks (#740). |
 | DeepSeek V4 Flash quantized-GEMM scratch | The vendored tier reuses its persistent scratch on the engine's stream; upstream's C++ engine runs on the legacy stream, the only one where the tier reuses it. |
 | `--cache-ram-bytes off` with `--cache-disk` | Keeps no RAM checkpoint and pins no cache memory; the Rust pool still restores the disk checkpoints. Upstream's component cache instead keeps up to 512 MiB of backing for Qwen and Flash-Next captures (#783). |
 | Dense Qwen weights on the device (#708, #794) | A whole-file device image, filled through eight pinned staging buffers that drop the mapping's pages as they go; when the image would leave the device heap less than its dispatch reserve, or its allocation fails, the file falls back to a registered host copy. Upstream falls back to its per-tensor weight upload. |
+| Qwen-Image weight upload (#830) | `gufo_hip::FileUpload` owns each destination buffer from `copy` until `finish` hands it back, so no safe caller can reach memory a reader thread is still filling. The reader count, staging size, queue bound and the overlap of staging and copying are upstream's `WeightUpload`. |
+| Video embedding input (#869) | The same FFmpeg libraries, loaded the same way on the first video; `gufo-ffmpeg` reaches struct fields through a C shim built against the build's headers and refuses libraries of another major version, where a mismatch would be undefined behaviour in C++. |
 | Audio embedding input (#819, #828) | WAV, FLAC, Ogg Vorbis and MP3 decode in Rust (`hound`, `claxon`, `lewton`, `nanomp3`) and other sample rates resample with `rubato`; upstream uses libsndfile and libsoxr. PCM WAV and FLAC decode exactly, MP3 and Ogg within 3e-7; resampled inputs differ (a few percent of the signal energy near the new Nyquist frequency for 24 to 48 kHz stereo). From the 16 kHz PCM on, features, encoder and embeddings equal upstream's bit for bit. |
 | Generated-token logprobs (#814) | Streaming buffer limits count the logprob records at Rust struct sizes, a few bytes apart from C++. Requests that select the unmodified argmax verify in the batched path, which upstream also uses unless batched verification is off. |
 | DFlash2 prompt features | The 27B target captures prompt features into one pinned buffer per model, which grows to the longest prompt and serves every session; upstream pins about 400 MiB of host memory per session at startup. |
@@ -297,7 +307,7 @@ Against v0.27.0. Everything not listed behaves as upstream does.
 
 ## Performance against upstream
 
-A/B runs of `target/release/gufo` against a C++ build of v0.27.0 with the
+A/B runs of `target/release/gufo` against a C++ build of v0.28.1 with the
 same ROCm 10.1 runtime (`tools/bench/ab.py`; `tools/bench/ab-upstream.sh`
 runs every workload below, with the models named in its header). A
 workload runs as whole runs of one binary, the C++ build twice and then
@@ -316,7 +326,7 @@ commits at load, Rust keeps them on the device until a decode is under way.
 
 ### Results
 
-Measured on 2026-10-30 and 31 on a Radeon 8060S (gfx1151) with 128 GiB and
+Measured on 2026-11-04 and 05 on a Radeon 8060S (gfx1151) with 128 GiB and
 ROCm 10.1, 4 to 8 rounds per run, with the build of this tree. Each cell
 gives, per Rust run, the median ratio Rust/C++ as a change in percent (bold
 where that run fails the gate), and in brackets the highest upper bound of
@@ -324,42 +334,53 @@ the runs' 95% intervals.
 
 | Workload | Request | Gated stages | Load | Memory | Device memory | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| q27-q4-ar | +0.04 / +0.04 / +0.08 (≤ +0.21) | pp **+0.78** / **+0.14** / **+1.53** (≤ +2.03) | +0.94 / +0.90 / +1.08 (≤ +2.66) | −0.01 / −0.14 / +0.03 (≤ +0.67) | −0.37 | FAIL (0 of 3) |
-| q27-q4-dflash2 | −0.15 / +0.05 (≤ +0.09) | pp **+0.66** / **+0.99** (≤ +1.16) | −0.73 / −0.31 (≤ +1.21) | −0.21 / −0.15 (≤ +0.08) | −0.34 | FAIL (0 of 2) |
-| q27-q8-ar | ±0.00 / +0.14 / ±0.00 (≤ +0.14) | pp **+0.25** / −0.36 / +0.10 (≤ +0.70) | −0.09 / +1.20 / +0.60 (≤ +2.51) | −0.16 / +0.03 / +0.09 (≤ +0.50) | −0.22 | PASS (2 of 3) |
-| q27-q8-dflash2 | −0.10 / −0.04 / −0.12 (≤ −0.02) | pp −0.34 / **+0.47** / +0.10 (≤ +0.70) | ±0.00 / +0.02 / −0.19 (≤ +1.45) | −0.06 / −0.12 / −0.07 (≤ +0.24) | −0.20 | PASS (2 of 3) |
-| q27-q4-ar-d32k | −0.09 / ±0.00 (≤ ±0.00) | pp +0.03 / +0.09 (≤ +0.25) | −0.67 / −0.85 (≤ +2.01) | −0.32 / −0.34 (≤ −0.19) | −0.30 | PASS (2 of 2) |
-| fn-ar | **+0.32** / **+0.46** / **+0.07** (≤ +5.36) | pp −0.87 / −0.82 / −0.92 (≤ +0.20) | **+0.35** / **+10.77** / **+2.88** (≤ +20.05) | −0.22 / −0.20 / −0.26 (≤ +0.02) | −0.52 | FAIL (0 of 3) |
-| fn-mtp | **+8.33** / **+6.61** / **+11.14** (≤ +17.31) | pp **+0.84** / **+1.12** / **+0.32** (≤ +3.94) | **+13.54** / **+5.35** / **+17.94** (≤ +23.93) | −0.27 / −0.30 / −0.31 (≤ −0.19) | −0.53 | FAIL (0 of 3) |
-| fn-ar-d32k | **−0.17** / **+0.02** (≤ +0.67) | pp +0.15 / +0.23 (≤ +0.30) | **+2.06** / +0.17 (≤ +15.34) | −0.22 / −0.08 (≤ −0.07) | −0.38 | FAIL (0 of 2) |
-| ds-ar | −0.23 / −0.23 / −0.23 (≤ −0.09) | pp **−2.77** / −2.87 / −3.86 (≤ +5.99) | **+1.28** / −0.54 / **−0.84** (≤ +7.02) | −0.03 / −0.10 / −0.11 (≤ +0.09) | −0.09 | FAIL (1 of 3) |
-| ds-dspark | −1.44 / −1.44 / −1.44 (≤ −0.70) | pp **+4.27** / **+2.81** / **+0.30** (≤ +37.10) | **+12.57** / **−1.63** / **−6.31** (≤ +24.70) | −0.06 / −0.04 / −0.06 (≤ +0.06) | −0.08 | FAIL (0 of 3) |
-| serve-q27-dflash2 | +0.04 / **+0.25** (≤ +0.51) | c1 +0.04 / **+0.25** (≤ +0.51); c4 +0.21 / **+0.44** (≤ +0.66); TTFT **+0.24** / **+0.54** (≤ +0.81); decode −0.08 / +0.15 (≤ +0.43) | −27.45 / −26.13 (≤ −25.28) | −27.74 / −27.74 (≤ −27.63) | −9.37 | FAIL (0 of 2) |
-| serve-fn-mtp | **+0.04** / **−0.96** / **−1.48** (≤ +13.01) | c1 **+0.04** / **−0.96** / **−1.48** (≤ +13.01); c4 **+4.44** / **+2.33** / **+0.37** (≤ +15.84); TTFT **+1.29** / **+3.77** / **+1.05** (≤ +16.81); decode **−0.20** / **−2.55** / **−1.94** (≤ +14.35) | **+2.63** / **+7.29** / **+0.99** (≤ +16.34) | −2.00 / −1.99 / −2.00 (≤ −1.86) | +2.47 | FAIL (0 of 3) |
-| serve-ds-dspark | **+0.46** / −1.51 / **+0.86** (≤ +5.66) | c1 **+0.46** / −1.51 / **+0.86** (≤ +5.66); c4 **−16.05** / **−16.17** / **−12.56** (≤ +5.44); TTFT **+4.12** / −2.66 / **+5.91** (≤ +23.51); decode −0.44 / −0.66 / −0.40 (≤ +0.05) | **−0.43** / **−3.01** / **−2.48** (≤ +7.43) | +0.03 / +0.04 / −0.01 (≤ +0.23) | −0.04 | FAIL (0 of 3) |
-| asr | −3.87 / −3.88 (≤ −3.82) | – | −11.67 / −11.33 (≤ −4.25) | −3.87 / −3.50 (≤ −2.17) | +0.04 | PASS (2 of 2) |
-| tts-customvoice | −2.08 / −2.13 / −1.99 (≤ −1.74) | first audio −2.12 / −2.31 / −2.29 (≤ −1.82); streamed −3.39 / −3.54 / −3.41 (≤ −3.31) | **+4.62** / −6.31 / **+3.06** (≤ +23.77) | **+0.80** / **+0.27** / **+0.71** (≤ +2.79) | ±0.00 | FAIL (0 of 3) |
-| tts-voicedesign | −2.19 / −2.16 (≤ −1.95) | first audio −1.97 / −2.04 (≤ −1.62); streamed −3.38 / −3.42 (≤ −2.55) | **+3.34** / **−0.18** (≤ +6.91) | **+0.77** / **+1.23** (≤ +2.55) | ±0.00 | FAIL (0 of 2) |
-| image | +0.03 / **+0.30** (≤ +0.54) | denoise **+0.24** / **+0.51** (≤ +0.77); prompt −7.32 / −7.54 (≤ −6.80); VAE −0.72 / −0.54 (≤ −0.43) | **−8.79** / **−8.34** (≤ +10.99) | ±0.00 / −0.01 (≤ +0.04) | ±0.00 | FAIL (0 of 2) |
-| embedding | −1.11 / −0.54 / −0.95 (≤ +0.20) | single **+1.38** / **+3.48** / **+1.55** (≤ +5.25) | +0.20 / −0.09 / −0.14 (≤ +0.53) | **+0.76** / **+1.11** / **+0.91** (≤ +2.19) | ±0.00 | FAIL (0 of 3) |
+| q27-q4-ar | −0.08 / −0.04 (≤ +0.04) | pp **+0.68** / **+0.56** (≤ +1.19) | +0.58 / +1.30 (≤ +2.23) | +0.19 / +0.11 (≤ +0.81) | −0.37 | FAIL (0 of 2) |
+| q27-q4-dflash2 | +0.01 / +0.05 (≤ +0.11) | pp **+1.09** / **+1.20** (≤ +1.38) | +0.92 / +1.71 (≤ +2.85) | −0.18 / −0.30 (≤ +0.39) | −0.34 | FAIL (0 of 2) |
+| q27-q8-ar | ±0.00 / ±0.00 (≤ +0.14) | pp −0.97 / −0.51 (≤ −0.18) | +0.57 / +0.55 (≤ +1.40) | +0.08 / +0.17 (≤ +0.56) | −0.22 | PASS (2 of 2) |
+| q27-q8-dflash2 | −0.02 / ±0.00 (≤ +0.04) | pp −0.26 / −0.14 (≤ +0.38) | +1.36 / +1.52 (≤ +2.58) | −0.13 / −0.07 (≤ +0.21) | −0.20 | PASS (2 of 2) |
+| q27-q4-ar-d32k | −0.05 / ±0.00 (≤ +0.09) | pp −0.06 / ±0.00 (≤ +0.11) | +2.34 / +1.65 (≤ +3.46) | −0.38 / −0.32 (≤ −0.11) | −0.30 | PASS (2 of 2) |
+| fn-ar | −0.39 / −0.42 / −0.39 (≤ −0.20) | pp +0.04 / −0.04 / −0.04 (≤ +0.15) | **+9.49** / −0.25 / **+3.10** (≤ +20.66) | −0.36 / −0.29 / −0.38 (≤ −0.27) | −0.52 | FAIL (1 of 3) |
+| fn-mtp | −3.62 / −3.62 (≤ −1.06) | pp +0.03 / +0.02 (≤ +0.16) | −3.27 / −3.64 (≤ +4.92) | −0.49 / −0.51 (≤ −0.42) | −0.53 | PASS (2 of 2) |
+| fn-ar-d32k | −0.19 / −0.24 (≤ −0.17) | pp −0.03 / +0.06 (≤ +0.15) | **+2.82** / **+0.79** (≤ +22.65) | −0.19 / −0.16 (≤ −0.12) | −0.38 | FAIL (0 of 2) |
+| ds-ar | −0.09 / −0.06 (≤ −0.03) | pp −1.26 / −1.68 (≤ −0.26) | **−2.23** / **−1.16** (≤ +18.94) | −0.04 / −0.04 (≤ +0.03) | −0.09 | FAIL (0 of 2) |
+| ds-dspark | −1.44 / −1.44 / −1.44 (≤ −1.39) | pp ±0.00 / −0.08 / +0.10 (≤ +0.26) | −3.87 / **−2.45** / −3.99 (≤ +5.18) | −0.04 / −0.05 / −0.04 (≤ −0.02) | −0.08 | PASS (2 of 3) |
+| serve-q27-dflash2 | −0.16 / ±0.00 (≤ +0.19) | c1 −0.16 / ±0.00 (≤ +0.19); c4 +0.04 / +0.24 (≤ +0.37); TTFT +0.12 / +0.27 (≤ +0.44); decode −0.25 / −0.02 (≤ +0.12) | −26.18 / −25.57 (≤ −24.29) | −27.91 / −27.91 (≤ −27.56) | −9.37 | PASS (2 of 2) |
+| serve-fn-mtp | −0.38 / −0.36 / −0.36 (≤ −0.23) | c1 −0.38 / −0.36 / −0.36 (≤ −0.23); c4 **−0.18** / **+0.45** / **−0.03** (≤ +2.53); TTFT −0.03 / +0.03 / −0.03 (≤ +0.20); decode −0.39 / −0.36 / −0.37 (≤ −0.24) | **−0.39** / **−0.21** / **+3.93** (≤ +13.75) | −1.04 / −1.04 / −1.01 (≤ −0.91) | +0.98 | FAIL (0 of 3) |
+| serve-ds-dspark | **−0.91** / −0.75 / −0.80 (≤ +3.15) | c1 **−0.91** / −0.75 / −0.80 (≤ +3.15); c4 **+3.13** / **−0.03** / −1.18 (≤ +7.48); TTFT **−0.77** / −0.45 / −0.45 (≤ +3.34); decode **−0.83** / −0.70 / −0.78 (≤ +3.24) | **+10.79** / **+5.63** / **−0.27** (≤ +17.36) | +0.20 / +0.08 / +0.14 (≤ +0.35) | +0.03 | FAIL (0 of 3) |
+| serve-q27-dflash2-t08 | +0.14 / +0.30 (≤ +0.46) | c1 +0.14 / +0.30 (≤ +0.46); c4 **+0.49** / **+0.84** (≤ +1.17); TTFT **+0.44** / **+0.58** (≤ +0.76); decode +0.07 / +0.26 (≤ +0.38) | −27.40 / −27.88 (≤ −26.98) | −27.43 / −27.44 (≤ −27.21) | −9.33 | FAIL (0 of 2) |
+| serve-fn-mtp-t08 | −0.70 / −0.73 (≤ −0.53) | c1 −0.70 / −0.73 (≤ −0.53); c4 **+0.22** / **−0.16** (≤ +2.34); TTFT +0.11 / +0.20 (≤ +0.32); decode −0.81 / −0.85 (≤ −0.62) | **+2.37** / **+6.94** (≤ +18.97) | −0.98 / −0.98 (≤ −0.91) | +0.98 | FAIL (0 of 2) |
+| serve-ds-dspark-t08 | −1.13 / −1.10 / −1.11 (≤ −0.89) | c1 −1.13 / −1.10 / −1.11 (≤ −0.89); c4 **+1.23** / −1.14 / −1.12 (≤ +3.49); TTFT −0.69 / −0.73 / −0.78 (≤ −0.13); decode −1.31 / −1.26 / −1.29 (≤ −1.16) | **−0.19** / −0.15 / **−0.24** (≤ +14.33) | +0.16 / +0.31 / +0.06 (≤ +0.35) | +0.12 | FAIL (1 of 3) |
+| asr | −4.31 / −4.37 / −4.40 (≤ −4.28) | – | **+1.28** / −9.95 / −6.14 (≤ +6.45) | −4.59 / −4.75 / −4.34 (≤ −1.19) | +0.04 | PASS (2 of 3) |
+| tts-customvoice | −4.78 / −3.53 / −3.34 (≤ −2.17) | first audio −2.82 / −2.48 / −2.50 (≤ −1.81); streamed −3.60 / −3.50 / −3.52 (≤ −3.40) | **+4.82** / +3.20 / **+3.14** (≤ +8.01) | **−0.09** / **−0.51** / **−0.50** (≤ +1.52) | ±0.00 | FAIL (0 of 3) |
+| tts-voicedesign | −3.07 / −2.95 / −4.14 (≤ −2.64) | first audio −2.31 / −2.10 / −2.21 (≤ −1.60); streamed −3.48 / −3.54 / −3.45 (≤ −2.77) | **+15.39** / −1.57 / **+19.97** (≤ +29.14) | **+0.51** / **+0.16** / **+0.34** (≤ +2.54) | ±0.00 | FAIL (0 of 3) |
+| image | −0.56 / −0.20 / −0.53 (≤ +0.06) | denoise −0.35 / +0.03 / −0.32 (≤ +0.27); prompt −4.94 / −5.17 / −5.30 (≤ −4.59); VAE −0.92 / −0.86 / −0.94 (≤ −0.34) | −16.32 / **−8.17** / **−0.33** (≤ +10.01) | −0.08 / −0.02 / +0.08 (≤ +0.53) | ±0.00 | FAIL (1 of 3) |
+| embedding | −1.63 / −1.26 / −1.58 (≤ −0.31) | single **−1.39** / **−0.22** / **+0.93** (≤ +5.23) | −0.13 / −1.47 / −0.13 (≤ +0.15) | **+0.62** / **+0.20** / **+0.72** (≤ +2.20) | ±0.00 | FAIL (0 of 3) |
 
 The text workloads (`gufo bench`) prefill 512 prompt tokens and generate
 128 (64 after 32,768 tokens of context for `d32k`) on Qwen3.8 27B
 (UD-Q4_K_XL, UD-Q8_K_XL; autoregressive or with the DFlash2 draft),
 Flash-Next (UD-Q4_K_XL; autoregressive or with MTP) and DeepSeek V4 Flash
-(IQ2XXS; autoregressive or with DSpark); `pp` is prefill time per token.
-The serving workloads run the HTTP server at concurrency 1 and 4 (`c1`,
-`c4`: time per output token). Speech, image and embedding requests go
-through their servers: an English recording, the CustomVoice and
-VoiceDesign checkpoints, eight steps at 1024×1024, and EmbeddingGemma 2
-with a batch of 32 inputs of about 512 tokens (the request) and one short
-input (`single`).
+(IQ2XXS; autoregressive or with DSpark); `pp` is prefill time per token. The serving workloads run the HTTP server at concurrency 1 and 4
+(`c1`, `c4`: time per output token); those named `t08` sample at temperature
+0.8 with a fixed seed and without top-k. Speech, image and embedding requests
+go through their servers: an English recording, the CustomVoice and
+VoiceDesign checkpoints, eight steps at 1024×1024, and EmbeddingGemma 2 with
+a batch of 32 inputs of about 512 tokens (the request) and one short input
+(`single`).
 
 Every invocation of every workload gave the same outputs on both sides.
-Four workloads pass. Rust needs less memory in every run of 11 of 18
+Image and video embeddings, which these workloads do not cover, take one of
+two values per server process at some budgets on both sides: the BLAS plan of
+a shape is chosen by timing at its first call, so C++ differs from C++ as
+often as from Rust (up to 3e-4 per element, a cosine of at least 0.999997).
+
+Seven workloads pass. Rust needs less memory in every run of 14 of 21
 workloads, 28% less when serving the 27B with DFlash2 (see
 [DFlash2 prompt features](#implemented-differently)). Most failures have
-causes that are not Rust's:
+causes that are not Rust's. Of the alternating rounds cited here, q27-q4-ar,
+the first 27B prefill number and the first sampled 27B numbers ran with this
+build; the others ran with earlier builds of this sync that differ only in the
+host sampler and in the waits after host copies, which measure the same:
 
 - **Upstream's speech loaders.** Since v0.27.0, the TTS and ASR loads drop
   the checkpoint's pages after the upload
@@ -367,58 +388,82 @@ causes that are not Rust's:
   the files again and its peak memory varies with what the kernel has
   reclaimed. The C++ builds of v0.23.0 and v0.27.0 measured in alternating
   rounds load the CustomVoice checkpoint in 615 and 1,644 ms, with a peak of
-  6.47–6.49 and 6.48–6.75 GiB. The load and memory results of the speech
-  workloads lie within this.
+  6.47–6.49 and 6.48–6.75 GiB. In alternating rounds against v0.28.1, the peak
+  spreads over 6.35–6.96 GiB on C++ and 6.49–6.81 GiB on Rust, so the median
+  ratios of +1.0 and +1.9% have intervals that reach below 1; per process,
+  Rust holds about 19 MiB (+0.3%) more. The load takes +3.3% on CustomVoice,
+  one step of the harness's 50 ms poll, and +1.3% (≤ +3.2) on VoiceDesign.
 - **Machine state.** Decoding the large models alternates between fast and
   slow rounds on both sides, and slow rounds follow slow loads: with
-  80 to 100 GiB of weights on a 128 GiB machine, the kernel reclaims and
-  swaps while a round runs. The request, prefill and decode intervals of
-  the Flash-Next and DeepSeek workloads reach +5 to +37%; the C++ and Rust
-  builds of v0.23.0 vary the same way now.
+  80 to 100 GiB of weights on a 128 GiB machine, the kernel reclaims and swaps
+  while a round runs. The Flash-Next and DeepSeek workloads fail only through
+  this spread: load intervals reach +23%, `c4` intervals +7.5%, and in one
+  serve-ds-dspark run the request and decode intervals +3.2%. Their request and
+  decode medians lie below C++'s in every run.
 - **Run order.** The APU runs at its power limit, so a hotter GPU clocks
   lower and a run that follows other runs is slower; the Rust runs of a
   workload follow its C++ runs. Measured in alternating rounds (ABBA, 8
-  rounds per side), q27-q4-ar passes every gate, with prefill at −0.01%
-  (≤ +0.08).
+  rounds per side), q27-q4-ar's prefill is +0.04% (≤ +0.56).
 - **Load time.** Loads of the large models take 20 to 25 s on both sides,
-  from round to round, so the intervals reach +7 to +25%.
+  from round to round. The image workload's load median lies below C++'s in
+  every run, its interval reaches +10%.
 
-Measured in alternating rounds as well, the single embedding request takes
-+3.4% (≤ +5.7) with three single requests per round, each right after a
-batch, where its latency varies by about 15% from request to request; 200
-single requests per server, alternating, take 5.85 to 5.86 ms against
-C++'s 5.82 to 5.84 (+0.4%). Runs that each start from a GPU cooled to
-45 °C, alternating and in swapped order, remove the run order from the
-other gaps: 27B DFlash2 prefill is +0.03% (+0.62% in alternating rounds,
-where the later slot ran hotter), Flash-Next decodes with MTP at 49.16 to
-49.27 tokens per second against C++'s 48.73 to 49.25, and serving the 27B
-with DFlash2 takes +0.15 to +0.25% (about 3 ms) to the first token and
-about +0.1% per token at concurrency 4.
+Rust is slower than C++ here, and the causes are open:
 
-Flash-Next serving with MTP was measured that way after the table's runs,
-with the snapshot handling of the [conversation
-cache](#implemented-differently): time to the first and the tenth streamed
-token at concurrency 1, four servers per side. A new 443-token prompt takes 440.7
-to 440.9 and 571.6 to 572.4 ms against C++'s 441.0 to 442.8 and 572.8 to
-575.0 ms (one server per side, whose first requests ran in the slow
-machine state, left out). The second turn of a conversation (568 tokens
-cached, 29 prefilled) takes 132.6 to 133.1 and 326.3 to 330.9 ms against
-134.7 to 137.0 and 329.8 to 332.2 ms, the third 136.6 to 139.0 and 269.3
-to 271.0 ms against 138.5 to 142.1 and 272.1 to 275.9 ms. An exactly
-repeated prompt restores its snapshot from host memory and takes 6.7 to
-6.9 and 132.7 to 133.5 ms against 5.2 to 5.3 and 131.6 to 132.0 ms, so
-Rust is slower there:
+- **27B DFlash2 prefill:** +0.47% (≤ +0.56) in alternating rounds, +0.38 and
+  +0.63% in two earlier series (+0.62% at v0.27.0). Over 21 repetitions per
+  run the hot gap is +0.19% (419.24 against 420.02 tokens per second), and from
+  a GPU cooled to 45 °C before each run, in swapped order, Rust leads by 0.15%
+  (468.42 against 467.71). Prefill moves far more with temperature than
+  between the binaries: 468 tokens per second at 45 to 57 °C, 420 at 80 °C.
+  Ruled out: bench arguments, the waits after host copies (a build without
+  them measures the same), CPU time per prefill, clocks and power. AB and BA
+  rounds show the same gap, so it is not the later slot running hotter.
+  Generation is 0.16% ahead in the same rounds.
+- **27B DFlash2 serving, the first token:** about 4 ms. +0.32% (≤ +0.59;
+  1,331.6 against 1,327.2 ms) sampled in alternating rounds, +0.40% greedy, and
+  +0.32% from a cooled GPU. Greedy `c1` and `c4` take +0.2% hot and +0.07 to
+  +0.09% cooled. Sampled, decoding is equal (+0.05%) and `c4` takes +0.28%
+  (≤ +0.70), +0.51% (≤ +0.89) in the series before.
+- **Embedding, one request:** +0.60% over 200 requests per server (5.871
+  against 5.836 ms, 35 µs), and +1.63% (≤ +2.78) for three requests right
+  after a batch, over 24 rounds, where latency varies by about 15% from
+  request to request. The batch request is 0.82% faster and memory is +0.29%
+  (≤ +1.45) in the same rounds.
+- **Flash-Next serving, a repeated prompt** (against v0.27.0, below): +1.4
+  to +1.7 ms to the first token, +0.5 to +1.4% to the tenth. Here the cause
+  is known. The restore copies the snapshot's frozen state (about 118 MB) from
+  pageable host memory ([conversation cache](#implemented-differently)), which
+  takes 3.5 to 4.6 ms; C++ copies it from the pinned host memory it commits at
+  load, in 2.2 to 2.8 ms. Matching that needs pinned memory held for the
+  cache, and Rust reserves no host memory up front. Pinning a buffer for each
+  capture instead costs 35 to 55 ms to the first token, and batching the
+  restore's copies gains nothing, as the transfer from pageable memory
+  dominates.
 
-- **Flash-Next serving, a repeated prompt:** +1.4 to +1.7 ms to the first
-  token, +0.5 to +1.4% to the tenth. The restore copies the snapshot's
-  frozen state (about 118 MB) from pageable host memory
-  ([conversation cache](#implemented-differently)), which takes 3.5 to
-  4.6 ms; C++ copies it from the pinned host memory it commits at load, in
-  2.2 to 2.8 ms. Matching that needs pinned memory held for the cache, and
-  Rust reserves no host memory up front. Pinning a buffer for each capture
-  instead costs 35 to 55 ms to the first token, and batching the restore's
-  copies gains nothing, as the transfer from pageable memory dominates.
-- **Embedding:** one request +0.4%; the cause is open.
+Sampling without top-k is new in this comparison: per verified token the host
+normalises a target distribution over the whole vocabulary, and per rejected
+draft it draws from the residual. Flash-Next with MTP took 20.34 ms per token
+against C++'s 19.56 (+4%), with identical outputs, while top-k 40 was equal
+(20.79 ms on both). `src/core/src/sampling.rs` now divides in pairs, hashes a
+token ID with one multiplication and filters non-candidates before the lookup.
+Against the same C++ source in a microbenchmark, the distribution takes 1.37
+against 1.47 ms and the residual draw 0.77 against 0.75 ms, and
+`serve-fn-mtp-t08` decodes 0.8% and `serve-ds-dspark-t08` 1.3% faster than
+C++.
+
+Against v0.27.0 on 2026-11-01, Flash-Next serving with MTP was measured from a
+GPU cooled to 45 °C, alternating and in swapped order, with the snapshot
+handling of the [conversation cache](#implemented-differently): time to the
+first and the tenth streamed token at concurrency 1, four servers per side. A
+new 443-token prompt takes 440.7 to 440.9 and 571.6 to 572.4 ms against C++'s
+441.0 to 442.8 and 572.8 to 575.0 ms (one server per side, whose first requests
+ran in the slow machine state, left out). The second turn of a conversation
+(568 tokens cached, 29 prefilled) takes 132.6 to 133.1 and 326.3 to 330.9 ms
+against 134.7 to 137.0 and 329.8 to 332.2 ms, the third 136.6 to 139.0 and
+269.3 to 271.0 ms against 138.5 to 142.1 and 272.1 to 275.9 ms. An exactly
+repeated prompt restores its snapshot from host memory and takes 6.7 to 6.9 and
+132.7 to 133.5 ms against 5.2 to 5.3 and 131.6 to 132.0 ms.
 
 ### The C++ reference
 
@@ -432,9 +477,9 @@ set to the prefix:
 
 ```sh
 R=/opt/rocm/core-10.1 G=/usr/lib/gcc/x86_64-linux-gnu/15
-mkdir -p target/upstream-v0.27.0/src
-git archive v0.27.0 | tar -x -C target/upstream-v0.27.0/src
-cd target/upstream-v0.27.0/src
+mkdir -p target/upstream-v0.28.1/src
+git archive v0.28.1 | tar -x -C target/upstream-v0.28.1/src
+cd target/upstream-v0.28.1/src
 cmake --preset release -DCMAKE_PREFIX_PATH=$R \
   -DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ \
   "-DCMAKE_HIP_FLAGS=--rocm-path=$R -isystem $R/include --gcc-install-dir=$G"
@@ -462,15 +507,29 @@ not the runtime it loads; check that with `ldd`.
   snapshot when a deeper disk restore fails while RAM holds only a live
   frontier (today the request prefills its whole prompt); and the functional
   runners that still read upstream's component-cache logs
-  ([functional tests](../tests/functional/README.md)).
+  ([functional tests](../tests/functional/README.md)). The log check of
+  `disk-spacing` reports two stored Flash-Next checkpoints 381 tokens apart
+  (C++ passes it); Rust's events carry no checkpoint ids, and the cause is
+  open.
+- **27B DFlash2, short replies:** two requests that arrive together and end
+  within a speculative cycle or two run one after the other
+  (`serial-fallback`), where C++ verifies them in one batch, with the same
+  texts and about the same total time. The width check of the `batch` suite
+  therefore fails on the 27B with DFlash2; the Rust build of v0.27.0 does the
+  same.
+- **Performance gaps:** the open causes under [results](#results); also the
+  17 MiB of additional anonymous memory in the speech servers.
 - **Small dense Qwen:** decode stays 0.2 to 0.4% behind C++ below the 9B
   ([optimizations](OPTIMIZATIONS.md), Q8); Flash-Next's bit-exact
   follow-ups F10 and F11 are listed there as well.
 - **References:** the 27B BF16 comparison as a Rust test (upstream's
   `qwen27b_target_test`), Flash-Next's independent MTP audit and deep
   execution check (`--mtp-audit`, `--execution-only`), Flash-Next's F32
-  reference fixtures with their GPU probe and scorer (#758), the two disabled
-  DeepSeek baseline checks and the `reference` suite of `tools/ds4/check.py`.
+  reference fixtures with their GPU probe and scorer (#758), Flash-Next's
+  operator chains `hc_route_ops_test` and `routed_wmma_ops_test` and the
+  m=17 split of `blaslt_ops_test` (the C++ session fixtures cover these routes
+  end to end), the two disabled DeepSeek baseline checks and the `reference`
+  suite of `tools/ds4/check.py`.
 - **Freeing shared tensors:** the last drop of an immutable tensor waits for
   the whole device (not during a graph capture). Swapping models at run time
   would need it to wait for the tensor's actual users instead.
@@ -494,7 +553,7 @@ not the runtime it loads; check that with `ldd`.
    `qwen` (chat template, vision) or `qwen35` (everything else). Comments
    that cite a C++ file (`src/cli/serve/openai_chat.cpp`,
    `tests/cli/http_server_test.cpp`) mean upstream's tree at the reference
-   release, where `git show v0.27.0:<path>` finds them.
+   release, where `git show v0.28.1:<path>` finds them.
 3. Keep numerics: kernels merge as source onto the Rust tree, host
    arithmetic follows the C++ order, and fixtures that upstream's changes
    alter are recorded again from a C++ build of the reference.

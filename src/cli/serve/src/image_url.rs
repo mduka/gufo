@@ -250,27 +250,55 @@ pub fn decode_base64(input: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// The media a URL must hold (`MediaKind`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Audio,
+    Video,
+}
+
 /// Base64 data URLs or public HTTPS destinations.
 pub fn read_image_url(url: &str, budget: &mut ImageReadBudget) -> Result<Vec<u8>> {
-    read_media_url(url, budget, false)
+    read_media_url(url, budget, MediaKind::Image)
 }
 
 /// Embedding audio (`ReadAudioUrl`): like an image URL with audio media
 /// types, or raw base64, which has no scheme and reads as a WAV data URL.
 /// The strict decoder rejects paths and bad padding.
 pub fn read_audio_url(url: &str, budget: &mut ImageReadBudget) -> Result<Vec<u8>> {
-    if ["data:", "https://", "http://", "file:"]
-        .iter()
-        .any(|scheme| url.starts_with(scheme))
-    {
-        return read_media_url(url, budget, true);
+    if has_scheme(url) {
+        return read_media_url(url, budget, MediaKind::Audio);
     }
-    read_media_url(&format!("data:audio/wav;base64,{url}"), budget, true)
+    read_media_url(
+        &format!("data:audio/wav;base64,{url}"),
+        budget,
+        MediaKind::Audio,
+    )
 }
 
-/// `ReadMediaUrl`: the bytes of an image or audio data URL or HTTPS
+/// Embedding video (`ReadVideoUrl`): the same shared byte/deadline budget and
+/// public HTTPS protections as images; raw base64 reads as an MP4 data URL.
+pub fn read_video_url(url: &str, budget: &mut ImageReadBudget) -> Result<Vec<u8>> {
+    if has_scheme(url) {
+        return read_media_url(url, budget, MediaKind::Video);
+    }
+    read_media_url(
+        &format!("data:video/mp4;base64,{url}"),
+        budget,
+        MediaKind::Video,
+    )
+}
+
+fn has_scheme(url: &str) -> bool {
+    ["data:", "https://", "http://", "file:"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
+}
+
+/// `ReadMediaUrl`: the bytes of an image, audio or video data URL or HTTPS
 /// destination within the request's budget.
-fn read_media_url(url: &str, budget: &mut ImageReadBudget, audio: bool) -> Result<Vec<u8>> {
+fn read_media_url(url: &str, budget: &mut ImageReadBudget, kind: MediaKind) -> Result<Vec<u8>> {
     if !budget.accepts_images {
         return Err(Error::invalid("model does not support image input"));
     }
@@ -300,8 +328,12 @@ fn read_media_url(url: &str, budget: &mut ImageReadBudget, audio: bool) -> Resul
             return Err(Error::invalid("image data URL must be base64-encoded"));
         }
         let media = header.split(';').next().unwrap_or_default();
-        if audio {
-            if !matches!(
+        let supported = match kind {
+            MediaKind::Video => matches!(
+                media,
+                "video/mp4" | "video/webm" | "video/x-matroska" | "video/quicktime"
+            ),
+            MediaKind::Audio => matches!(
                 media,
                 "audio/wav"
                     | "audio/x-wav"
@@ -309,16 +341,18 @@ fn read_media_url(url: &str, budget: &mut ImageReadBudget, audio: bool) -> Resul
                     | "audio/mp3"
                     | "audio/flac"
                     | "audio/ogg"
-            ) {
-                return Err(Error::invalid("unsupported audio data URL type"));
-            }
-        } else if !matches!(
-            media,
-            "image/png" | "image/jpeg" | "image/jpg" | "image/webp"
-        ) {
-            return Err(Error::invalid(format!(
-                "image data URL type \"{media}\" is not supported; use PNG, JPEG or WebP"
-            )));
+            ),
+            MediaKind::Image => matches!(
+                media,
+                "image/png" | "image/jpeg" | "image/jpg" | "image/webp"
+            ),
+        };
+        if !supported {
+            return Err(Error::invalid(if kind == MediaKind::Image {
+                format!("image data URL type \"{media}\" is not supported; use PNG, JPEG or WebP")
+            } else {
+                "unsupported media data URL type".to_owned()
+            }));
         }
         let encoded = &url[comma + 1..];
         // Check the decoded size before allocating, including padding.

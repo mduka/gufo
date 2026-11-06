@@ -3,7 +3,8 @@
 //! tiles of wide shapes included, and nothing is written past the output
 //! (`CheckDecodeGrouping` of the C++
 //! `tests/models/qwen38_flash_next/projection_ops_test.cpp`); Q8_0 weights
-//! expanded to F32 equal their codes (`CheckExpandQ8_0`):
+//! expanded to F32 equal their codes (`CheckExpandQ8_0`); prefill W8A8 rows
+//! do not depend on the pass width (`CheckW8A8PassWidths`):
 //! cargo test -p gufo-qwen38-flash-next-kernels --features gpu --test projection
 
 #![cfg(feature = "gpu")]
@@ -191,4 +192,106 @@ fn q8_0_weights_expand_to_their_codes() {
     // shapes.
     check_expand_q8_0(4, 10240, 0xE8A4D1);
     check_expand_q8_0(96, 2560, 0xE8A4D2);
+}
+
+/// A prefill row's W8A8 projection does not depend on the pass width: a
+/// prompt finished by a short pass after a checkpoint restore projects its
+/// last rows with the 64-token tile (below 96 rows), a wide pass with the
+/// 128-token tiles, their tail kernel or, from 1,024 rows of the 2560 x 6144
+/// output projection, the wave64 kernel. Each short pass quantizes its own
+/// rows, as its combine would (`CheckW8A8PassWidths`).
+fn check_w8a8_pass_widths(m: usize, k: usize, wide: usize, seed: u32) {
+    let stream = Stream::new().unwrap();
+    let host = weights(m, k, seed);
+    let mut state = seed ^ 0x9A55;
+    let x: Vec<f32> = (0..wide * k).map(|_| uniform(&mut state, 2.0)).collect();
+    let mut w = stream.alloc::<u8>(host.len()).unwrap();
+    stream.upload(&host, w.as_mut_slice()).unwrap();
+    let w = || QuantSlice::new(w.as_slice(), GgmlType::Q8_0);
+    let mut input = stream.alloc::<f32>(x.len()).unwrap();
+    stream.upload(&x, input.as_mut_slice()).unwrap();
+    let tiled_bytes = |rows: usize| rows.div_ceil(128) * 8 * (k / 32) * 576;
+    let mut tiled = stream.alloc::<u8>(tiled_bytes(wide)).unwrap();
+    let mut out = stream.alloc::<f32>(wide * m).unwrap();
+    k::quantize_q8_tiled(
+        &stream,
+        input.as_slice(),
+        tiled.slice_mut(0..tiled_bytes(wide)),
+        wide,
+        k,
+    )
+    .unwrap();
+    let launched = k::w8a8_gemm(
+        &stream,
+        w(),
+        tiled.slice(0..tiled_bytes(wide)),
+        out.as_mut_slice(),
+        wide,
+        m,
+        k,
+    )
+    .unwrap();
+    assert_eq!(
+        launched,
+        gufo_hip::Launch::Launched,
+        "W8A8 wide pass rejected"
+    );
+    let mut reference = vec![0f32; wide * m];
+    stream.download(out.as_slice(), &mut reference).unwrap();
+    let mut failures = Vec::new();
+    for rows in [1usize, 7, 9, 95, 96] {
+        for first in [0, (wide - rows) / 2, wide - rows] {
+            k::quantize_q8_tiled(
+                &stream,
+                input.slice(first * k..(first + rows) * k),
+                tiled.slice_mut(0..tiled_bytes(rows)),
+                rows,
+                k,
+            )
+            .unwrap();
+            let launched = k::w8a8_gemm(
+                &stream,
+                w(),
+                tiled.slice(0..tiled_bytes(rows)),
+                out.slice_mut(0..rows * m),
+                rows,
+                m,
+                k,
+            )
+            .unwrap();
+            assert_eq!(
+                launched,
+                gufo_hip::Launch::Launched,
+                "W8A8 short pass rejected"
+            );
+            let mut actual = vec![0f32; rows * m];
+            stream
+                .download(out.slice(0..rows * m), &mut actual)
+                .unwrap();
+            let differ = (0..rows)
+                .filter(|&r| {
+                    actual[r * m..(r + 1) * m]
+                        .iter()
+                        .zip(&reference[(first + r) * m..(first + r + 1) * m])
+                        .any(|(a, b)| a.to_bits() != b.to_bits())
+                })
+                .count();
+            if differ != 0 {
+                failures.push(format!(
+                    "{differ} of {rows} rows from {first} differ from the {wide}-row pass"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "W8A8 m={m} k={k}: {failures:#?}");
+}
+
+#[test]
+fn w8a8_rows_do_not_depend_on_the_pass_width() {
+    // The output projection takes the wave64 kernel from 1,024 rows; the
+    // others keep the blocked kernel, past a W8A8 tail at 1549 rows.
+    check_w8a8_pass_widths(2560, 6144, 1619, 0x5A_6144);
+    check_w8a8_pass_widths(2560, 6144, 1549, 0x5B_6144);
+    check_w8a8_pass_widths(320, 10240, 1549, 0x5A_0320);
+    check_w8a8_pass_widths(640, 2560, 1619, 0x5A_0640);
 }

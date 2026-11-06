@@ -963,7 +963,7 @@ mod weights {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use gufo_hip::{Bf16, MappedFile, Placement, Stream, WeightLoader};
+    use gufo_hip::{Bf16, FileUpload, MappedFile, Placement, Stream, WeightLoader};
 
     const FILE_BYTES: usize = 40 << 20;
 
@@ -1025,6 +1025,52 @@ mod weights {
                 assert_eq!(b.offset(), 4098)
             }
         }
+    }
+
+    /// A `FileUpload` writes each range into the start of the buffer it was
+    /// handed and returns the buffers in queue order; the readers stay for a
+    /// second batch, and a range outside its file fails the upload
+    /// (upstream's `hip_weight_upload_test`).
+    #[test]
+    fn file_uploads_fill_the_buffers_they_are_handed() {
+        let test_file = TestFile::create(Path::new(env!("CARGO_TARGET_TMPDIR")), "upload");
+        let file = MappedFile::open(&test_file.0).unwrap();
+        let stream = Stream::new().unwrap();
+        let mut upload = FileUpload::new().unwrap();
+        // (offset, bytes, buffer): odd offset, several chunks, file end, a
+        // larger buffer whose tail stays untouched.
+        let ranges = [
+            (37, 4096, 4096),
+            (12_345, 40 << 20 >> 1, 20 << 20),
+            (FILE_BYTES - 1000, 1000, 1000),
+            (4098, 6000, 8192),
+        ];
+        let expected = |offset: usize, bytes: usize| &file.bytes()[offset..offset + bytes];
+        for (batch, chunk) in ranges.chunks(2).enumerate() {
+            for &(offset, bytes, len) in chunk {
+                let mut buffer = stream.alloc::<u8>(len).unwrap();
+                stream.fill_bytes(buffer.as_mut_slice(), 0xA5).unwrap();
+                upload.copy(&file, offset, bytes, buffer).unwrap();
+            }
+            let buffers = upload.finish().unwrap();
+            assert_eq!(buffers.len(), chunk.len(), "batch {batch}");
+            for (buffer, &(offset, bytes, len)) in buffers.iter().zip(chunk) {
+                let mut got = vec![0u8; len];
+                stream.download(buffer.as_slice(), &mut got).unwrap();
+                assert!(
+                    got[..bytes] == *expected(offset, bytes),
+                    "range at {offset}"
+                );
+                assert!(got[bytes..].iter().all(|&b| b == 0xA5), "tail of {offset}");
+            }
+        }
+        let buffer = stream.alloc::<u8>(16).unwrap();
+        assert!(upload.copy(&file, FILE_BYTES - 8, 16, buffer).is_err());
+        assert!(upload.finish().is_err());
+        let small = stream.alloc::<u8>(8).unwrap();
+        let mut fresh = FileUpload::new().unwrap();
+        assert!(fresh.copy(&file, 0, 16, small).is_err());
+        drop(Arc::clone(&file));
     }
 
     #[test]

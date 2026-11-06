@@ -27,6 +27,7 @@ notices of the versions they actually ship.
 | unicode-normalization / unicode-properties | Compiled in; tokenizer normalization | `MIT OR Apache-2.0` | 0.1.25 / 0.1.4; Cargo.lock | [unicode-rs](https://github.com/unicode-rs) |
 | sha2 / sha1_smol | Compiled in; artifact identities and the WebSocket handshake | `MIT OR Apache-2.0` (sha2); `BSD-3-Clause` (sha1_smol) | 0.10.9 / 1.0.1; Cargo.lock | [RustCrypto](https://github.com/RustCrypto/hashes), [sha1-smol](https://github.com/mitsuhiko/sha1-smol) |
 | Other Rust crates | Compiled in: serde, serde_json, chrono, libc, rustix, signal-hook, toml, jobserver | `MIT OR Apache-2.0` (rustix also `Apache-2.0 WITH LLVM-exception`) | Cargo.lock | [crates.io](https://crates.io) |
+| FFmpeg | Loaded on the first video embedding (libavformat, libavcodec, libavutil, libswscale); headers compiled into `gufo-ffmpeg`'s field shim; not linked | `LGPL-2.1-or-later` (a build with GPL components: `GPL-2.0-or-later` or `GPL-3.0-or-later`) | installed FFmpeg, the major version of the build's headers (8.x qualified) | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
 | GNU C/C++/OpenMP runtimes | System runtime libraries; no Gufo source import | `LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)` | glibc/GCC packages in flake.lock | [GNU](https://www.gnu.org/software/) |
 | llama.cpp / ggml | Adapted quantization, attention and model-private HIP kernels | `MIT` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`; attention `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | mikealanni/gufo | Adapted Flash-Next GDN row reuse and SSM stride optimization | `MIT` | `f450218743bcaf77e3e1f8fab78f4cd4e4aafae3` | [gufo fork](https://github.com/mikealanni/gufo/tree/f450218743bcaf77e3e1f8fab78f4cd4e4aafae3) |
@@ -44,6 +45,11 @@ and [Flash-Next HIP import](src/models/qwen38_flash_next/kernels/rocm/mmq/VENDOR
 
 The mikealanni/gufo fork retains the same Copyright (c) 2026 gufo contributors
 notice and MIT text as Gufo's root `LICENSE`.
+
+Gufo loads the installed FFmpeg libraries on demand for video embeddings; a
+system FFmpeg build can carry GPL terms through its enabled components.
+Redistributors bundling FFmpeg must also provide its applicable license texts
+and corresponding source/build materials, not just this MIT license.
 
 The official 0731 DeepSeek continuations in
 `tests/models/deepseek_v4_flash/fixtures/official-0731.json` come from DS4 revision

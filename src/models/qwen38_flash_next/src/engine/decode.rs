@@ -17,6 +17,21 @@ impl PendingDecode {
         self.chain.push(self.draft);
         Ok(())
     }
+
+    /// Whether the chain ends after its latest neural proposal
+    /// (`GateStops`).
+    pub(super) fn gate_stops(&self) -> bool {
+        if !self.gated {
+            return false;
+        }
+        if self.sampled {
+            self.proposals
+                .last()
+                .is_some_and(|p| p.probability < policy::SAMPLED_GATE_PROBABILITY)
+        } else {
+            self.draft_confidence < policy::GATE_PROBABILITY
+        }
+    }
 }
 
 impl Model {
@@ -49,8 +64,14 @@ impl Model {
             batch_drafts.is_some(),
             occupancy,
         );
-        let width = if s.mtp_enabled() && cap > 1 {
-            1 + match batch_drafts {
+        // Every chain ends after its first proposal below the gate (greedy:
+        // the head's confidence, read back with each draft token in every
+        // path; sampled: host-side q). An unplanned cycle drafts to its
+        // budget; a jointly planned greedy batch keeps the planned width as
+        // its cap. The controller still backs off to AR.
+        let mut drafts = 0;
+        if s.mtp_enabled() && cap > 1 {
+            drafts = match batch_drafts {
                 Some(drafts) => (drafts as usize).min(cap - 1),
                 None => s.draft_length.choose(
                     (cap - 1) as u32,
@@ -58,7 +79,13 @@ impl Model {
                     pending.policy_concurrency,
                     false,
                 ) as usize,
+            };
+            if batch_drafts.is_none() && drafts != 0 {
+                drafts = (cap - 1).min(self.options.max_draft_tokens as usize);
             }
+        }
+        let width = if s.mtp_enabled() && cap > 1 {
+            1 + drafts
         } else {
             cap
         };
@@ -132,6 +159,7 @@ impl Model {
         pending.draft_sampler = Some(draft_sampler);
         pending.chain = vec![anchor];
         pending.width = width;
+        pending.gated = true;
         pending.base = base;
         pending.speculative = true;
         pending.sampled = sampled;
@@ -170,25 +198,19 @@ impl Model {
         // Wider verification slowed short resumed replies, so cycles within
         // two blocks of the remaining budget keep the established costs, as
         // do full target rows (an active tool constraint): the small-head
-        // curve does not price their transfers.
+        // curve does not price their transfers. The confidence gate already
+        // sets the chain length, so the curve only prices the controller's
+        // AR backoff (`FinishDecode`).
         pending.sampled_subset_cost = sampled
             && pending.gpu_verification
             && pending.draft_subset
             && max_tokens.min(room) > 2 * max_speculative;
-        if pending.sampled_subset_cost && batch_drafts.is_none() {
-            // Price the head actually used, after vocabulary fallback and the
-            // copy bypass; the policy reads only committed history.
-            pending.width =
-                1 + s
-                    .draft_length
-                    .choose((cap - 1) as u32, base, pending.policy_concurrency, true)
-                    as usize;
-        }
         if !defer_head {
             let candidates = sampled.then_some(&mut pending.candidates);
             self.draft_catch_up(s, anchor, true, candidates, pending.draft_subset)?;
         }
         pending.draft = s.draft_token;
+        pending.draft_confidence = s.draft_confidence;
         if !defer_head {
             while pending.chain.len() < pending.width {
                 pending.append_draft()?;
@@ -200,12 +222,18 @@ impl Model {
                 if self.append_lookup(s, pending, stop_at_eos, 1, false) {
                     break;
                 }
+                if pending.gate_stops() {
+                    pending.width = pending.chain.len();
+                    break;
+                }
                 if pending.chain.len() < pending.width {
                     let draft = pending.draft;
                     let mut token = pending.draft;
+                    let mut confidence = pending.draft_confidence;
                     let output = if sampled {
                         MtpOutput {
                             token: None,
+                            confidence: Some(&mut confidence),
                             candidates: Some(&mut pending.candidates),
                             kv_only: false,
                             draft_subset: pending.draft_subset,
@@ -213,6 +241,7 @@ impl Model {
                     } else {
                         MtpOutput {
                             token: Some(&mut token),
+                            confidence: Some(&mut confidence),
                             candidates: None,
                             kv_only: false,
                             draft_subset: pending.draft_subset,
@@ -223,6 +252,7 @@ impl Model {
                     if !sampled {
                         pending.draft = token;
                     }
+                    pending.draft_confidence = confidence;
                 }
             }
         }

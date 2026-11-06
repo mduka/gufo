@@ -1,6 +1,6 @@
 //! OpenAI-compatible `POST /v1/embeddings` and llama.cpp's `POST /embeddings`
 //! over EmbeddingGemma 2 (`src/cli/serve/embeddings_api.cpp`): request
-//! validation of text, image and audio inputs, named prompts, Matryoshka
+//! validation of text, image, video and audio inputs, named prompts, Matryoshka
 //! truncation, float and base64 encodings.
 
 use std::sync::Arc;
@@ -10,7 +10,8 @@ use gufo_core::text::Result;
 
 use crate::embedding_service::{
     EmbeddingBatch, EmbeddingInput, EmbeddingPart, EmbeddingPartType, EmbeddingRequestOptions,
-    EmbeddingService, EmbeddingStatus, MAX_AUDIO, MAX_IMAGES, MAX_INPUT_TOKENS,
+    EmbeddingService, EmbeddingStatus, MAX_AUDIO, MAX_IMAGE_SOFT_TOKENS, MAX_IMAGES,
+    MAX_INPUT_TOKENS, MAX_VIDEOS, supported_image_soft_tokens,
 };
 use crate::http::{HttpRequest, HttpResponse};
 
@@ -209,7 +210,15 @@ fn looks_like_audio(base64: &str) -> bool {
 fn is_known_field(name: &str, native: bool) -> bool {
     matches!(
         name,
-        "input" | "model" | "encoding_format" | "dimensions" | "user" | "truncate" | "prompt_name"
+        "input"
+            | "model"
+            | "encoding_format"
+            | "dimensions"
+            | "user"
+            | "truncate"
+            | "prompt_name"
+            | "video_options"
+            | "mm_processor_kwargs"
     ) || (native && matches!(name, "content" | "embd_normalize"))
 }
 
@@ -218,6 +227,7 @@ fn is_known_field(name: &str, native: bool) -> bool {
 struct MediaCounts {
     images: usize,
     audio: usize,
+    videos: usize,
 }
 
 /// A boxed refusal: the error of a parser that returns early.
@@ -360,6 +370,32 @@ fn parse_item(
                     parsed.content.push(EmbeddingPart {
                         kind: EmbeddingPartType::Image,
                         value: url.expect("checked url").str().to_owned(),
+                    });
+                }
+                "input_video" => {
+                    let video = part.find("input_video");
+                    let Some(video) = video.filter(|v| part.len() == 2 && v.is_object()) else {
+                        return Err(invalid("video parts require an 'input_video' object"));
+                    };
+                    if video.members().iter().any(|(key, value)| {
+                        !matches!(key.as_str(), "data" | "url") || !value.is_string()
+                    }) {
+                        return Err(invalid("input_video accepts string data and url fields"));
+                    }
+                    let source = video.find("data").or_else(|| video.find("url"));
+                    let Some(source) = source.filter(|s| !s.str().is_empty()) else {
+                        return Err(invalid("input_video requires nonempty data or url"));
+                    };
+                    counts.videos += 1;
+                    if counts.videos > MAX_VIDEOS {
+                        return Err(refuse(
+                            "embedding requests accept at most 32 videos",
+                            "too_many_videos",
+                        ));
+                    }
+                    parsed.content.push(EmbeddingPart {
+                        kind: EmbeddingPartType::Video,
+                        value: source.str().to_owned(),
                     });
                 }
                 "input_audio" => {
@@ -568,11 +604,83 @@ fn embed(request: &HttpRequest, service: &EmbeddingService, native: bool) -> Htt
     }
 
     let mut options = EmbeddingRequestOptions::default();
+    if let Some(video) = optional(&root, "video_options") {
+        if !video.is_object() {
+            return bad_request("video_options must be an object", "invalid_parameter_type");
+        }
+        let refused = |message: &str| bad_request(message, "invalid_video_options");
+        for (key, value) in video.members() {
+            match key.as_str() {
+                "fps" => {
+                    let fps = value.as_double(0.0);
+                    if !value.is_number() || !fps.is_finite() || fps <= 0.0 || fps > 120.0 {
+                        return refused("video fps must be in (0, 120]");
+                    }
+                    options.video.fps = fps;
+                }
+                "max_frames" => {
+                    let n = value.as_size(0);
+                    if !value.is_number()
+                        || !(1..=32).contains(&n)
+                        || value.as_double(0.0) != n as f64
+                    {
+                        return refused("video max_frames must be an integer in [1, 32]");
+                    }
+                    options.video.max_frames = n;
+                }
+                "add_timestamps" => {
+                    if !value.is_bool() {
+                        return refused("add_timestamps must be boolean");
+                    }
+                    options.video.timestamps = value.as_bool(false);
+                }
+                "overflow_strategy" => {
+                    if !value.is_string() || !matches!(value.str(), "uniform" | "truncate") {
+                        return refused("video overflow_strategy must be uniform or truncate");
+                    }
+                    options.video.truncate_overflow = value.str() == "truncate";
+                }
+                _ => return refused(&format!("unsupported video option: {key}")),
+            }
+        }
+    }
+
     if let Some(truncate) = optional(&root, "truncate") {
         if !truncate.is_bool() {
             return bad_request("'truncate' must be a boolean", "invalid_parameter_type");
         }
         options.truncate = truncate.as_bool(false);
+    }
+
+    // vLLM's per-request processor options. Only the image budget is
+    // supported.
+    if let Some(kwargs) = optional(&root, "mm_processor_kwargs") {
+        if !kwargs.is_object() {
+            return bad_request(
+                "'mm_processor_kwargs' must be an object",
+                "invalid_parameter_type",
+            );
+        }
+        for (key, value) in kwargs.members() {
+            if key != "max_soft_tokens" {
+                return bad_request(
+                    &format!(
+                        "unsupported mm_processor_kwargs key '{key}'; only 'max_soft_tokens' is supported"
+                    ),
+                    "invalid_mm_processor_kwargs",
+                );
+            }
+            let budget = value.as_size(0);
+            if budget > MAX_IMAGE_SOFT_TOKENS as usize
+                || !supported_image_soft_tokens(budget as u32)
+            {
+                return bad_request(
+                    "'max_soft_tokens' must be one of 70, 140, 280, 560, or 1120",
+                    "invalid_mm_processor_kwargs",
+                );
+            }
+            options.image_soft_tokens = budget as u32;
+        }
     }
 
     let cancelled = || request.is_cancelled.as_ref().is_some_and(|check| check());
@@ -597,6 +705,9 @@ fn embed(request: &HttpRequest, service: &EmbeddingService, native: bool) -> Htt
                 ),
                 "context_length_exceeded",
             );
+        }
+        EmbeddingStatus::InvalidVideoInput => {
+            return bad_request(&message, "invalid_video_input");
         }
         EmbeddingStatus::InvalidAudioInput => {
             return bad_request(&message, "invalid_audio_input");

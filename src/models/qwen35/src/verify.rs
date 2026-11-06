@@ -20,9 +20,9 @@ use crate::config::NORM_EPS;
 use crate::routes::{bf16_weights, supports_exact_shared_projection};
 use crate::weights::{LayerWeights, Mixer};
 
-/// `y[rows][m] = x[rows][k] w^T` (`LaunchProjection`): the exact
-/// shared-weight kernel of the quantized formats, the exact BF16 kernel, and
-/// otherwise one decode GEMV per row.
+/// `y[rows][m] = x[rows][k] w^T` (`LaunchProjection`): the 27B shapes'
+/// tuned block geometries, the exact shared-weight kernel of the quantized
+/// formats, the exact BF16 kernel, and otherwise one decode GEMV per row.
 pub(crate) fn project(
     s: &Stream,
     w: &QuantTensor,
@@ -33,6 +33,10 @@ pub(crate) fn project(
     k: usize,
 ) -> Result<(), LaunchError> {
     if supports_exact_shared_projection(w.format()) {
+        // `TryLaunchVerifyGemm27` declines every format outside this set.
+        if k::verify_gemm_27b(s, w.view(), x, y.reborrow(), rows, m, k)? == Launch::Launched {
+            return Ok(());
+        }
         return k::batched_quant_gemm_f32(s, w.view(), x, y, rows, m, k);
     }
     if w.format() == GgmlType::Bf16 {

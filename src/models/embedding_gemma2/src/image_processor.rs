@@ -1,6 +1,6 @@
 //! `Gemma4ImageProcessor` for image embeddings (`image_processor.cpp`): an
-//! aspect-preserving 280-soft-token budget, torchvision's uint8 antialiased
-//! bicubic resize, rescale to [0, 1] and 16x16 patches.
+//! aspect-preserving soft-token budget (280 by default), torchvision's uint8
+//! antialiased bicubic resize, rescale to [0, 1] and 16x16 patches.
 
 use std::path::Path;
 
@@ -8,9 +8,15 @@ use gufo_core::image::{Image, MAX_IMAGE_PIXELS};
 use gufo_core::json;
 
 pub const MAX_IMAGE_SIDE: u32 = 32768;
+/// `Gemma4ImageProcessor`'s supported `max_soft_tokens` values; the
+/// checkpoint defaults to 280.
+pub const IMAGE_SOFT_TOKEN_BUDGETS: [u32; 5] = [70, 140, 280, 560, 1120];
+pub const DEFAULT_IMAGE_SOFT_TOKENS: u32 = 280;
+pub const MAX_IMAGE_SOFT_TOKENS: u32 = 1120;
 
-/// Unpadded, row-major 16x16 RGB patches. The reference pads to 2,520
-/// patches and masks the padding; omitting those keys gives the same result.
+/// Unpadded, row-major 16x16 RGB patches. The reference pads to nine patches
+/// per soft token of the budget and masks the padding; omitting those keys
+/// gives the same result.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImagePatches {
     pub rows: u32,
@@ -157,7 +163,7 @@ pub fn validate_image_processor(model_dir: &Path) -> Result<(), String> {
                 && enabled("do_normalize", false)
                 && config.member_size("patch_size", 0) == 16
                 && config.member_size("pooling_kernel_size", 0) == 3
-                && config.member_size("max_soft_tokens", 0) == 280
+                && config.member_size("max_soft_tokens", 0) == DEFAULT_IMAGE_SOFT_TOKENS as usize
                 && config.member_size("resample", 0) == 3
                 && (config.member_double("rescale_factor", 0.0) - 1.0 / 255.0).abs() < 1e-15
         })
@@ -169,9 +175,19 @@ pub fn validate_image_processor(model_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// `ProcessImage`: aspect-preserving 280-soft-token budget, uint8
-/// antialiased bicubic resize, rescale, then patchify. Does not crop.
-pub fn process_image(image: &Image) -> Result<ImagePatches, String> {
+/// `SupportedImageSoftTokens`: a `max_soft_tokens` value of
+/// [`IMAGE_SOFT_TOKEN_BUDGETS`].
+pub fn supported_image_soft_tokens(max_soft_tokens: u32) -> bool {
+    IMAGE_SOFT_TOKEN_BUDGETS.contains(&max_soft_tokens)
+}
+
+/// `ProcessImage`: aspect-preserving resize to at most `max_soft_tokens` soft
+/// tokens (a value of [`IMAGE_SOFT_TOKEN_BUDGETS`]), uint8 antialiased bicubic
+/// resize, rescale, then patchify. Does not crop.
+pub fn process_image(image: &Image, max_soft_tokens: u32) -> Result<ImagePatches, String> {
+    if !supported_image_soft_tokens(max_soft_tokens) {
+        return Err("image max_soft_tokens must be one of 70, 140, 280, 560, or 1120".into());
+    }
     if image.width == 0
         || image.height == 0
         || image.width > MAX_IMAGE_SIDE
@@ -181,19 +197,19 @@ pub fn process_image(image: &Image) -> Result<ImagePatches, String> {
     {
         return Err("invalid embedding image dimensions or RGB data".into());
     }
-    const BUDGET: u32 = 280;
+    let budget = max_soft_tokens as i32;
     const STRIDE: i32 = 48;
-    let factor = ((f64::from(BUDGET) * 9.0 * 256.0)
+    let factor = ((f64::from(budget) * 9.0 * 256.0)
         / (f64::from(image.width) * f64::from(image.height)))
     .sqrt();
     let mut height = (factor * f64::from(image.height) / f64::from(STRIDE)).floor() as i32 * STRIDE;
     let mut width = (factor * f64::from(image.width) / f64::from(STRIDE)).floor() as i32 * STRIDE;
     if height == 0 {
         height = STRIDE;
-        width = (image.width / image.height).min(BUDGET) as i32 * STRIDE;
+        width = (image.width / image.height).min(max_soft_tokens) as i32 * STRIDE;
     } else if width == 0 {
         width = STRIDE;
-        height = (image.height / image.width).min(BUDGET) as i32 * STRIDE;
+        height = (image.height / image.width).min(max_soft_tokens) as i32 * STRIDE;
     }
     let resized = resize(image, width, height);
     let (width, height) = (width as usize, height as usize);

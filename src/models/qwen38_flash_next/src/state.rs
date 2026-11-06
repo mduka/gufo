@@ -230,7 +230,8 @@ pub(crate) struct Scratch {
     pub shexp_half: DeviceBuffer<F16>,
     pub logits: DeviceBuffer<f32>,
     /// The draft head's selections: argmax candidates (8 bytes each), the
-    /// greedy token, and the top-64 IDs with their scores behind them.
+    /// greedy token followed by its confidence's float bits (one host
+    /// transfer), and the top-64 IDs with their scores behind them.
     pub mtp_argmax: DeviceBuffer<u8>,
     pub mtp_token: DeviceBuffer<i32>,
     pub mtp_ids: DeviceBuffer<u32>,
@@ -246,8 +247,8 @@ pub(crate) struct Host {
     pub tiles: PinnedBuffer<u32>,
     /// Logit rows on their way to the caller (`max_logit_rows` of them).
     pub logits: PinnedBuffer<f32>,
-    /// Per batch session: the draft head's greedy token and its candidates
-    /// (IDs, then the scores' bits).
+    /// Per batch session: the draft head's greedy token with its
+    /// confidence's bits, and its candidates (IDs, then the scores' bits).
     pub draft_tokens: Vec<PinnedBuffer<i32>>,
     pub draft_candidates: Vec<PinnedBuffer<u32>>,
 }
@@ -390,7 +391,7 @@ impl Scratch {
             shexp_half: alloc::<F16>(stream, t * c.shared_expert_ff as usize)?,
             logits: f32s(max_logit_rows as usize * c.vocab_size as usize)?,
             mtp_argmax: alloc::<u8>(stream, 64 * 8)?,
-            mtp_token: alloc::<i32>(stream, 1)?,
+            mtp_token: alloc::<i32>(stream, 2)?,
             mtp_ids: alloc::<u32>(stream, workspace)?,
             mtp_scratch_ids: alloc::<u32>(stream, workspace)?,
         };
@@ -435,7 +436,7 @@ impl Scratch {
         if model.mtp.is_some() {
             let count = (c.vocab_size as usize).min(crate::mtp::MTP_CANDIDATES);
             for _ in 0..crate::batch::BATCH_SESSIONS {
-                host.draft_tokens.push(PinnedBuffer::zeroed(1)?);
+                host.draft_tokens.push(PinnedBuffer::zeroed(2)?);
                 host.draft_candidates
                     .push(PinnedBuffer::zeroed(crate::mtp::MTP_CANDIDATES + count)?);
             }

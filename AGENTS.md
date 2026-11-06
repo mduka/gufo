@@ -91,8 +91,9 @@ extent probes for every launcher.
   `tools/gufo/control_tokens.py`. Keep them identical, inspect their uses
   when reviewing or changing behavior, and keep reference fixtures independent.
 - Use one canonical long option and backend name per behavior; avoid aliases.
-- `unsafe` lives in `gufo-hip`, the generated launcher modules and the
-  kernel build's one call into Cargo's jobserver (`tools/ci/check-unsafe.py`).
+- `unsafe` lives in `gufo-hip`, `gufo-ffmpeg` (the FFmpeg calls of video
+  decoding), the generated launcher modules and the kernel build's one call
+  into Cargo's jobserver (`tools/ci/check-unsafe.py`).
 - Port upstream changes as [Gufo in Rust](docs/RUST.md#following-upstream)
   describes: kernels keep upstream's paths and arithmetic, host code follows
   the C++ order. Comments that cite a C++ file mean upstream's tree at the

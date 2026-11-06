@@ -416,6 +416,14 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         }
     }
 
+    /// Waits until the home stream has run everything queued so far, so
+    /// another stream may write the memory.
+    pub(crate) fn wait_for_home(&self) -> Result<(), HipError> {
+        // SAFETY: the home stream outlives every allocation of it.
+        let status = unsafe { sys::hipStreamSynchronize(self.owner.allocation.home.raw) };
+        check(status, "hipStreamSynchronize")
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

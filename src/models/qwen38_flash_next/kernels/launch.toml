@@ -822,7 +822,7 @@ probes = [
 name = "unquantized_f16_gemm"
 cpp = "UnquantizedF16Gemm"
 returns = "supported"
-doc = "out[t][m] = sum_k W[m][k] x[t][k] over F16 weights and rows, one K reduction per row at every batch width (the router and alpha/beta stacks)."
+doc = "out[t][m] = sum_k W[m][k] x[t][k] over F16 weights and rows, one K reduction per row at every batch width (every F16 projection of the hidden row: router and alpha/beta stacks at any expert count)."
 params = [
   { name = "w", kind = "quant", rows = "m", cols = "k", formats = ["F16"] },
   { name = "x", kind = "in", elem = "f16", len = "batch * k" },
@@ -834,6 +834,7 @@ params = [
 probes = [
   { w = "F16", batch = 130, m = 513, k = 2560 },
   { w = "F16", batch = 9, m = 96, k = 2560 },
+  { w = "F16", batch = 17, m = 17, k = 2560 },
 ]
 
 [[launcher]]
@@ -1874,6 +1875,19 @@ params = [
 ]
 requires = ["vocab >= 1"]
 probes = [{ n_tokens = 2, vocab = 248320 }, { n_tokens = 1, vocab = 3 }]
+
+[[launcher]]
+name = "argmax_confidence"
+cpp = "ArgmaxConfidenceFlat"
+returns = "void"
+doc = "The draft head's confidence in its greedy token: row[1] becomes the float bits of softmax(logits)[row[0]] over `vocab` entries (0 when that logit is not finite). Trusted: row[0] is below `vocab`, as `argmax` leaves it."
+params = [
+  { name = "logits", kind = "in", elem = "f32", len = "vocab" },
+  { name = "row", kind = "inout", elem = "u32", len = "2" },
+  { name = "vocab", kind = "scalar", type = "u32" },
+]
+requires = ["vocab >= 1"]
+probes = [{ vocab = 248320, row = 248319 }, { vocab = 99328, row = 0 }, { vocab = 3, row = 2 }]
 
 [[launcher]]
 name = "penalized_argmax"

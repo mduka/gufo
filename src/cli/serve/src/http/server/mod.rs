@@ -52,11 +52,12 @@ use crate::logprobs::{
 };
 use crate::metrics::{prometheus_text, record_server_metrics};
 use crate::openai_chat::{
-    ApiCompat, ResponsesReasoningTarget, handle_apply_template, handle_openai_chat,
-    parse_anthropic_image, parse_anthropic_tool_controls, parse_anthropic_tool_message,
-    parse_openai_response_format, parse_openai_response_message, parse_reasoning_budget,
-    parse_reasoning_effort_name, parse_reasoning_options, parse_response_function_call,
-    parse_response_function_output, parse_response_tool_controls, sse,
+    ApiCompat, ResponsesReasoningTarget, count_openai_input_tokens, handle_apply_template,
+    handle_openai_chat, handle_openai_chat_input_tokens, parse_anthropic_image,
+    parse_anthropic_tool_controls, parse_anthropic_tool_message, parse_openai_response_format,
+    parse_openai_response_message, parse_reasoning_budget, parse_reasoning_effort_name,
+    parse_reasoning_options, parse_response_function_call, parse_response_function_output,
+    parse_response_tool_controls, sse,
 };
 use crate::sampling_request::{parse_sampling_config, read_integer};
 use crate::stop_sequences::{StopSequenceFormat, parse_stop_sequences};
@@ -461,6 +462,11 @@ impl HttpServer {
         // OpenAI
         self.add_fn("POST", "/v1/completions", openai_completions);
         self.add_fn("POST", "/v1/chat/completions", handle_openai_chat);
+        self.add_fn(
+            "POST",
+            "/v1/chat/completions/input_tokens",
+            handle_openai_chat_input_tokens,
+        );
         let semantics = Semantics {
             compat: self.shared.options.api_compat,
             target: self.shared.options.responses_reasoning_target,
@@ -469,6 +475,13 @@ impl HttpServer {
             "POST",
             "/v1/responses",
             Arc::new(move |request, backend| openai_responses(request, backend, semantics)),
+        );
+        self.add(
+            "POST",
+            "/v1/responses/input_tokens",
+            Arc::new(move |request, backend| {
+                openai_responses_input_tokens(request, backend, semantics)
+            }),
         );
         self.add_fn("POST", "/v1/embeddings", not_implemented);
         // Anthropic

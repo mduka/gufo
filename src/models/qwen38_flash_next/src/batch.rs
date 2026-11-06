@@ -1039,15 +1039,25 @@ impl Executor {
                     )?;
                 }
                 if item.output.token.is_some() {
+                    // The token and its confidence (float bits) land in
+                    // mtp_token[0..2].
                     k::argmax(
                         stream,
                         logits,
                         core.s.mtp_argmax.slice_mut(0..64 * 8),
-                        core.s.mtp_token.as_mut_slice(),
+                        core.s.mtp_token.slice_mut(0..1),
                         1,
                         rows as u32,
                     )
                     .map_err(launch_error("draft argmax"))?;
+                    let row = core
+                        .s
+                        .mtp_token
+                        .slice_mut(0..2)
+                        .cast::<u32>()
+                        .ok_or("misaligned draft token")?;
+                    k::argmax_confidence(stream, logits, row, rows as u32)
+                        .map_err(launch_error("draft confidence"))?;
                     let token = core
                         .s
                         .mtp_token
@@ -1056,7 +1066,7 @@ impl Executor {
                         .ok_or("misaligned draft token")?;
                     remap(token, 1)?;
                     stream.download_async(
-                        core.s.mtp_token.slice(0..1),
+                        core.s.mtp_token.slice(0..2),
                         &mut core.host.draft_tokens[i],
                     )?;
                 }
@@ -1072,9 +1082,13 @@ impl Executor {
                 continue;
             }
             if let Some(token) = item.output.token.as_deref_mut() {
-                *token = self.core.host.draft_tokens[i]
+                let words = self.core.host.draft_tokens[i]
                     .host()
-                    .map_err(|e| e.to_string())?[0];
+                    .map_err(|e| e.to_string())?;
+                *token = words[0];
+                if let Some(confidence) = item.output.confidence.as_deref_mut() {
+                    *confidence = f32::from_bits(words[1] as u32);
+                }
             }
             if let Some(candidates) = item.output.candidates.as_deref_mut() {
                 let words = self.core.host.draft_candidates[i]

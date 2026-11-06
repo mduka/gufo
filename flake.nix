@@ -52,6 +52,7 @@
             ps.openai # official SDK for local API compatibility checks
             ps.jsonschema # independent structured-output schema oracle
             ps.numpy
+            ps.av # official video decoder oracle
             ps.scipy
             ps.matplotlib # benchmark charts (tools/bench/model-bench.py render)
           ]

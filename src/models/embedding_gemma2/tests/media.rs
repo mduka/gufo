@@ -1,7 +1,9 @@
-//! Image and audio embeddings on the GPU against the reference model's
-//! vectors (`image_golden_test.cpp`, `audio_golden_hip_test.cpp`). The
-//! inputs are synthetic images and 16-kHz waveforms, so preprocessing is the
-//! C++ engine's bit for bit; the reference vectors come from transformers:
+//! Image, audio and video embeddings on the GPU against the reference
+//! model's vectors (`image_golden_test.cpp`, `audio_golden_hip_test.cpp`,
+//! the video cases of `tests/functional/embedding_video.py`). The inputs are
+//! synthetic images, 16-kHz waveforms and the encoded video fixtures, whose
+//! frames the host tests check bit for bit; the reference vectors come from
+//! transformers:
 //! cargo test --profile gpu-test -p gufo-embedding-gemma2 --features gpu,models --test media
 
 #![cfg(all(feature = "gpu", feature = "models"))]
@@ -12,8 +14,9 @@ mod common;
 use gufo_core::json::{self, Value};
 use gufo_embedding_gemma2::audio_decoder::decode_audio;
 use gufo_embedding_gemma2::audio_processor::{SequenceAudio, process_audio};
-use gufo_embedding_gemma2::config::{AUDIO_TOKEN_ID, IMAGE_TOKEN_ID};
-use gufo_embedding_gemma2::image_processor::process_image;
+use gufo_embedding_gemma2::config::{AUDIO_TOKEN_ID, IMAGE_TOKEN_ID, VIDEO_TOKEN_ID};
+use gufo_embedding_gemma2::image_processor::{DEFAULT_IMAGE_SOFT_TOKENS, process_image};
+use gufo_embedding_gemma2::video_processor::{VideoOptions, process_video};
 use gufo_embedding_gemma2::{EncoderRuntime, EncoderSequence, SequenceImage};
 
 fn fixture(name: &str) -> Value {
@@ -82,8 +85,9 @@ fn sequence(case: &Value) -> EncoderSequence {
         cursor += count;
     }
     cursor = 0;
+    let budget = case.member_size("max_soft_tokens", DEFAULT_IMAGE_SOFT_TOKENS as usize) as u32;
     for picture in case.find("images").map_or(&[][..], Value::items) {
-        let patches = process_image(&common::make_image(picture)).unwrap();
+        let patches = process_image(&common::make_image(picture), budget).unwrap();
         while cursor < sequence.tokens.len() && sequence.tokens[cursor] != IMAGE_TOKEN_ID {
             cursor += 1;
         }
@@ -91,6 +95,7 @@ fn sequence(case: &Value) -> EncoderSequence {
         sequence.images.push(SequenceImage {
             offset: cursor,
             patches,
+            token_id: IMAGE_TOKEN_ID,
         });
         cursor += count;
     }
@@ -127,6 +132,62 @@ fn image_and_audio_embeddings_match_the_reference_model() {
             println!("{name} embedding cosine={cosine}");
             assert!(cosine > threshold, "{name}: cosine {cosine}");
         }
+    }
+    assert!(!runtime.device_lost());
+}
+
+#[test]
+fn video_embeddings_match_the_reference_model() {
+    let root = common::checkpoint("model.safetensors");
+    let runtime = EncoderRuntime::create(&root).unwrap_or_else(|e| panic!("{e}"));
+    for case in fixture("video_golden.json").find("cases").unwrap().items() {
+        let name = case.member_str("name", "");
+        // Its image and audio parts are the functional suite's inputs.
+        if name == "mixed" {
+            continue;
+        }
+        let settings = case.find("options").unwrap();
+        let options = VideoOptions {
+            fps: settings.member_double("fps", 1.0),
+            timestamps: settings
+                .find("add_timestamps")
+                .is_some_and(|v| v.as_bool(false)),
+            max_frames: settings.member_size("max_frames", 32),
+            truncate_overflow: settings.member_str("overflow_strategy", "") == "truncate",
+        };
+        let tokens: Vec<u32> = case
+            .find("token_ids")
+            .unwrap()
+            .items()
+            .iter()
+            .map(|id| id.as_size(0) as u32)
+            .collect();
+        let mut sequence = EncoderSequence::text(tokens);
+        let (mut cursor, mut sampled) = (0, 0);
+        for video in case.find("videos").unwrap().items() {
+            let path = common::fixture(&video.member_str("path", ""));
+            let bytes = std::fs::read(&path).unwrap();
+            for frame in process_video(&bytes, &options, None, 64 - sampled).unwrap() {
+                while sequence.tokens[cursor] != VIDEO_TOKEN_ID {
+                    cursor += 1;
+                }
+                let count = frame.patches.soft_tokens();
+                sequence.images.push(SequenceImage {
+                    offset: cursor,
+                    patches: frame.patches,
+                    token_id: VIDEO_TOKEN_ID,
+                });
+                cursor += count;
+                sampled += 1;
+            }
+        }
+        let vectors = runtime
+            .embed_multimodal(vec![sequence], None)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(vectors[0].iter().all(|v| v.is_finite()), "{name} finite");
+        let cosine = cosine_with(&vectors[0], case.find("embedding").unwrap());
+        println!("{name} video embedding cosine={cosine}");
+        assert!(cosine >= 0.9999, "{name}: cosine {cosine}");
     }
     assert!(!runtime.device_lost());
 }

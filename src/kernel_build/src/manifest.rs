@@ -67,15 +67,16 @@ pub struct Launcher {
     #[serde(default)]
     pub requires: Vec<String>,
     /// Concrete scalar values (and optional buffers under `with`, and values
-    /// for `u32` input buffers) for the generated extent probes; at least one
+    /// for `u32` input and in/out buffers) for the generated extent probes; at least one
     /// per launcher.
     #[serde(default)]
     pub probes: Vec<toml::Table>,
 }
 
 /// A validated probe: a Rust literal per scalar parameter, the optional
-/// buffers to pass, and the value that fills a `u32` input buffer (others hold
-/// zeros) so that data-dependent writes such as a ring slot are reached.
+/// buffers to pass, and the value that fills a `u32` input or in/out buffer
+/// (others hold zeros, written buffers the guard pattern) so that
+/// data-dependent accesses such as a ring slot stay in range.
 pub struct Probe {
     pub literals: BTreeMap<String, String>,
     pub with: BTreeSet<String>,
@@ -406,7 +407,7 @@ impl Launcher {
         for (key, value) in table {
             if let Some(p) = self.params.iter().find(|p| {
                 p.name == *key
-                    && ((p.kind == Kind::In && p.elem == Some(Elem::U32))
+                    && ((matches!(p.kind, Kind::In | Kind::Inout) && p.elem == Some(Elem::U32))
                         || matches!(p.kind, Kind::Indices | Kind::IndicesOut))
             }) {
                 let fill = value
@@ -983,6 +984,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.launchers[0].probes().unwrap()[0].fills["slot"], 15);
+        // An in/out word the kernel reads as an index takes a fill too.
+        let m = manifest_with_probes(
+            r#"{ name = "row", kind = "inout", elem = "u32", len = "2" },
+               { name = "n", kind = "scalar", type = "u32" }"#,
+            "{ n = 3, row = 2 }",
+        )
+        .unwrap();
+        assert_eq!(m.launchers[0].probes().unwrap()[0].fills["row"], 2);
     }
 
     #[test]

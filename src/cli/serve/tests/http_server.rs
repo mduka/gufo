@@ -1579,6 +1579,197 @@ fn apply_template() {
     assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
 }
 
+/// `POST /v1/chat/completions/input_tokens` and `/v1/responses/input_tokens`
+/// (`TestOpenAiInputTokens`).
+#[test]
+fn openai_input_tokens() {
+    let server = RunningServer::new(HttpServerOptions::default());
+    let parse = |response: &str| json::parse_str(body_of(response)).expect("json");
+    let error_code = |response: &str| {
+        parse(response)
+            .find("error")
+            .expect("error")
+            .member_str("code", "")
+            .to_string()
+    };
+    let slots = || body_of(&server.send("GET /slots HTTP/1.1\r\n\r\n", false)).to_string();
+    let endpoints = [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"test","messages":[{"role":"system","content":"sys"},
+                {"role":"user","content":"café 東京"}]}"#,
+            "messages",
+        ),
+        (
+            "/v1/responses",
+            r#"{"model":"test","instructions":"sys","input":"café 東京"}"#,
+            "input",
+        ),
+    ];
+    *server.backend.reasoning.lock().expect("reasoning") = ReasoningOptions {
+        enabled: Some(true),
+        effort: Some(ReasoningEffort::Medium),
+        ..ReasoningOptions::default()
+    };
+    for (endpoint, text, input) in endpoints {
+        let path = format!("{endpoint}/input_tokens");
+        let mut body = json::parse_str(text).expect("body");
+        let calls = server.backend.calls.load(Ordering::SeqCst);
+        // A registered endpoint reports an unsupported backend, not a fake
+        // count.
+        let unsupported = server.post(&path, &body.dump().expect("dump"));
+        expect_status(&unsupported, 501);
+        assert_eq!(error_code(&unsupported), "not_implemented");
+
+        // Sizing must not reject a prompt merely because it exceeds the
+        // context.
+        *server.backend.chat_token_count.lock().expect("count") = Some(65537);
+        let slots_before = slots();
+        for stream in [
+            json::Value::Null,
+            json::Value::Bool(false),
+            json::Value::Bool(true),
+        ] {
+            body.set("stream", stream);
+            let response = server.post(&path, &body.dump().expect("dump"));
+            expect_status(&response, 200);
+            assert!(!response.contains("text/event-stream"), "{response}");
+            let counted = parse(&response);
+            assert_eq!(counted.len(), 2);
+            assert_eq!(counted.member_str("object", ""), "response.input_tokens");
+            assert_eq!(counted.member_size("input_tokens", 0), 65537);
+            let chat = server.backend.counted_chat.lock().expect("chat").clone();
+            assert_eq!(chat.messages.len(), 2);
+            assert_eq!(chat.messages[0].role, ChatRole::System);
+            assert_eq!(chat.messages[0].content, "sys");
+            assert_eq!(chat.messages[1].content, "café 東京");
+            assert_eq!(chat.reasoning.enabled, Some(true));
+            assert_eq!(chat.reasoning.effort, Some(ReasoningEffort::Medium));
+            assert!(!chat.client_id.is_empty());
+        }
+        assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(slots(), slots_before);
+        // Generation still receives the same conversation and defaults.
+        body.set("stream", json::Value::Bool(false));
+        expect_status(&server.post(endpoint, &body.dump().expect("dump")), 200);
+        let generated = server.backend.last_call().chat;
+        let counted = server.backend.counted_chat.lock().expect("chat").clone();
+        assert_eq!(generated.messages.len(), counted.messages.len());
+        assert_eq!(generated.messages[0].content, "sys");
+        assert_eq!(generated.messages[1].content, "café 東京");
+        assert_eq!(generated.reasoning.effort, Some(ReasoningEffort::Medium));
+        assert_eq!(generated.client_id, counted.client_id);
+
+        for invalid in ["{", "[]", "null"] {
+            expect_status(&server.post(&path, invalid), 400);
+        }
+        for field in ["model", "stream"] {
+            let mut invalid = body.clone();
+            invalid.set(field, json::Value::from(42));
+            expect_status(&server.post(&path, &invalid.dump().expect("dump")), 400);
+        }
+        let mut invalid = body.clone();
+        invalid.set(input, json::Value::array());
+        expect_status(&server.post(&path, &invalid.dump().expect("dump")), 400);
+        let mut invalid = body.clone();
+        invalid.set("model", json::Value::from("not-loaded"));
+        expect_status(&server.post(&path, &invalid.dump().expect("dump")), 404);
+        for failure in [1, 2] {
+            server
+                .backend
+                .count_failure
+                .store(failure, Ordering::SeqCst);
+            let rejected = server.post(&path, &body.dump().expect("dump"));
+            expect_status(&rejected, 400);
+            assert_eq!(
+                error_code(&rejected),
+                if failure == 1 {
+                    "invalid_prompt"
+                } else {
+                    "context_length_exceeded"
+                }
+            );
+        }
+        server.backend.count_failure.store(0, Ordering::SeqCst);
+        *server.backend.chat_token_count.lock().expect("count") = Some(0);
+        let zero = server.post(&path, &body.dump().expect("dump"));
+        expect_status(&zero, 200);
+        assert_eq!(parse(&zero).member_size("input_tokens", 99), 0);
+        *server.backend.chat_token_count.lock().expect("count") = None;
+        assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls + 1);
+    }
+
+    *server.backend.chat_token_count.lock().expect("count") = Some(1234);
+    let calls = server.backend.calls.load(Ordering::SeqCst);
+    for (path, body) in [
+        (
+            "/v1/chat/completions/input_tokens",
+            r#"{"model":"test","messages":[
+                {"role":"user","content":"look"},
+                {"role":"assistant","content":null,"tool_calls":[
+                  {"id":"call_1","type":"function","function":
+                    {"name":"look","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"found"}],
+                "tools":[{"type":"function","function":{"name":"look",
+                  "parameters":{"type":"object"}}}],
+                "tool_choice":{"type":"function","function":{"name":"look"}},
+                "parallel_tool_calls":false,"reasoning_effort":"high"}"#,
+        ),
+        (
+            "/v1/responses/input_tokens",
+            r#"{"model":"test","input":[
+                {"role":"user","content":"look"},
+                {"type":"function_call","call_id":"call_1","name":"look","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"found"}],
+                "tools":[{"type":"function","name":"look","parameters":{"type":"object"}}],
+                "tool_choice":{"type":"function","name":"look"},
+                "parallel_tool_calls":false,"reasoning":{"effort":"high"}}"#,
+        ),
+    ] {
+        expect_status(&server.post(path, body), 200);
+        let chat = server.backend.counted_chat.lock().expect("chat").clone();
+        assert!(chat.messages.len() == 3 && chat.tools.len() == 1);
+        assert_eq!(chat.tools[0].name, "look");
+        assert_eq!(chat.messages[1].tool_calls.len(), 1);
+        assert_eq!(chat.messages[2].tool_call_id, "call_1");
+        assert_eq!(chat.messages[2].content, "found");
+        assert!(chat.forced_tool_name == "look" && !chat.parallel_tool_calls);
+        assert_eq!(chat.reasoning.effort, Some(ReasoningEffort::High));
+    }
+    for (path, body) in [
+        (
+            "/v1/chat/completions/input_tokens",
+            r#"{"model":"test","messages":[{"role":"user","content":[
+                {"type":"text","text":"pixels:"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}]}],
+                "response_format":{"type":"json_schema","json_schema":{
+                  "name":"color","description":"Return a color.","schema":{"type":"object"}}}}"#,
+        ),
+        (
+            "/v1/responses/input_tokens",
+            r#"{"model":"test","input":[{"role":"user","content":[
+                {"type":"input_text","text":"pixels:"},
+                {"type":"input_image","image_url":"data:image/png;base64,AQID","detail":"low"}]}],
+                "text":{"format":{"type":"json_schema","name":"color",
+                  "description":"Return a color.","schema":{"type":"object"}}}}"#,
+        ),
+    ] {
+        server.backend.image_support.store(false, Ordering::SeqCst);
+        expect_status(&server.post(path, body), 400);
+        server.backend.image_support.store(true, Ordering::SeqCst);
+        expect_status(&server.post(path, body), 200);
+        let chat = server.backend.counted_chat.lock().expect("chat").clone();
+        assert!(chat.messages.len() == 1 && chat.messages[0].images.len() == 1);
+        let image = &chat.messages[0].images[0];
+        assert_eq!(image.offset, 7);
+        assert_eq!(*image.bytes, vec![1u8, 2, 3]);
+        assert_eq!(image.detail, ImageDetail::Low);
+        assert!(chat.response_format.is_some());
+        assert_eq!(chat.response_format_description, "Return a color.");
+    }
+    assert_eq!(server.backend.calls.load(Ordering::SeqCst), calls);
+}
+
 #[test]
 fn raw_completion_streaming() {
     let server = RunningServer::new(HttpServerOptions::default());

@@ -5,16 +5,29 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::audio_processor::SequenceAudio;
+use crate::config::IMAGE_TOKEN_ID;
 use crate::image_processor::ImagePatches;
 
 /// A cancellation poll that another caller's thread may run.
 pub type CancelCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// An image and the offset of its placeholder tokens.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SequenceImage {
     pub offset: usize,
     pub patches: ImagePatches,
+    /// Video frames share the vision tower but use their own placeholders.
+    pub token_id: u32,
+}
+
+impl Default for SequenceImage {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            patches: ImagePatches::default(),
+            token_id: IMAGE_TOKEN_ID,
+        }
+    }
 }
 
 /// One sequence to embed: its tokens, and the images and audio clips whose

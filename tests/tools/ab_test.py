@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -263,6 +264,17 @@ class AbTest(unittest.TestCase):
                 "--server-args", "--speculative dflash2"]
         code = ab.main(argv)
         return code, json.loads(output.read_text()) if output.exists() else None
+
+    def test_greedy_serving_keeps_its_stored_baselines_and_sampling_does_not_share_them(self) -> None:
+        def workload(**fields) -> ab.ServeWorkload:
+            return ab.ServeWorkload(name="serve", command=["serve"], samples="", stage_fields=[],
+                                    gated_stages=[], **fields)
+        before_sampling = {name: value for name, value in dataclasses.asdict(workload()).items()
+                           if name not in {"port", "temperature"}}
+        digest = hashlib.sha256(
+            json.dumps(["ServeWorkload", before_sampling], sort_keys=True, default=str).encode()).hexdigest()
+        self.assertEqual(ab.workload_digest(workload()), digest)
+        self.assertNotEqual(ab.workload_digest(workload(temperature=0.8)), digest)
 
     def test_serve_judges_latency_and_throughput_per_level(self) -> None:
         code, report = self.run_serve(self.fake_server("A"), self.fake_server("B"), EQUAL_SIDES)

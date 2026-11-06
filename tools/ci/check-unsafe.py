@@ -3,8 +3,9 @@
 check-unsafe.py — Rust `unsafe` policy for gufo (docs/RUST.md)
 
 Validates that:
-1. Hand-written `unsafe` appears only in src/hip (gufo-hip) and in the
-   jobserver handoff of src/kernel_build/src/compile.rs.
+1. Hand-written `unsafe` appears only in src/hip (gufo-hip), in src/ffmpeg
+   (gufo-ffmpeg, the FFmpeg boundary) and in the jobserver handoff of
+   src/kernel_build/src/compile.rs.
 2. Kernel crates (src/models/*/kernels, src/cli/kernels) allow `unsafe_code`
    only on their generated module and deny it everywhere else.
 3. Every other crate root forbids `unsafe_code`.
@@ -17,8 +18,9 @@ from pathlib import Path
 from typing import List
 
 # The gufo-hip crate itself; other crates below src/hip (e.g. smoke) are checked.
-UNSAFE_ANYWHERE = ("src/hip/src/", "src/hip/build.rs")
-UNSAFE_CRATE_ROOTS = {"src/hip/src/lib.rs"}
+# gufo-ffmpeg holds the FFmpeg calls of video decoding.
+UNSAFE_ANYWHERE = ("src/hip/src/", "src/hip/build.rs", "src/ffmpeg/src/")
+UNSAFE_CRATE_ROOTS = {"src/hip/src/lib.rs", "src/ffmpeg/src/lib.rs"}
 UNSAFE_FILES = {"src/kernel_build/src/compile.rs"}
 DENY_ROOTS = {"src/kernel_build/src/lib.rs"}
 KERNEL_ROOT = re.compile(r"^src/(models/[^/]+|cli)/kernels/src/lib\.rs$")
@@ -64,7 +66,7 @@ def check(root: Path) -> List[str]:
         for number, line in enumerate(code.splitlines(), start=1):
             if UNSAFE_TOKEN.search(line):
                 errors.append(
-                    f"{rel}:{number}: unsafe outside gufo-hip (src/hip/src): {line.strip()}"
+                    f"{rel}:{number}: unsafe outside gufo-hip and gufo-ffmpeg: {line.strip()}"
                 )
 
     for path in crate_roots(root):
@@ -90,7 +92,7 @@ def main() -> int:
     if errors:
         return 1
     print(
-        "[check-unsafe] PASSED: unsafe code is confined to gufo-hip and generated launchers."
+        "[check-unsafe] PASSED: unsafe code is confined to gufo-hip, gufo-ffmpeg and generated launchers."
     )
     return 0
 

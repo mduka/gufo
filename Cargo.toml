@@ -6,6 +6,7 @@ members = [
   "src/cli/serve",
   "src/core",
   "src/eval",
+  "src/ffmpeg",
   "src/formats",
   "src/hip",
   "src/hip/smoke",
@@ -38,6 +39,7 @@ gufo-cli-kernels = { path = "src/cli/kernels" }
 gufo-core = { path = "src/core" }
 gufo-deepseek-v4-flash-kernels = { path = "src/models/deepseek_v4_flash/kernels" }
 gufo-eval = { path = "src/eval" }
+gufo-ffmpeg = { path = "src/ffmpeg" }
 gufo-formats = { path = "src/formats" }
 gufo-hip = { path = "src/hip" }
 gufo-kernel-build = { path = "src/kernel_build" }

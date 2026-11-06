@@ -12,6 +12,7 @@ headers = [
   "src/models/qwen/hip/ops.hpp",
   "src/models/qwen/hip/ops/prefill_fp16.hpp",
   "src/models/qwen/hip/kernels/dflash_kernels.hpp",
+  "src/models/qwen/hip/kernels/verify_gemm_27b.hpp",
   "src/models/qwen/kernels/adapters.hpp",
   "src/models/qwen/vision/kernels.hpp",
 ]
@@ -105,6 +106,9 @@ path = "src/models/qwen/hip/kernels/rope.hip"
 
 [[source]]
 path = "src/models/qwen/hip/kernels/sample.hip"
+
+[[source]]
+path = "src/models/qwen/hip/kernels/verify_gemm_27b.hip"
 
 [[source]]
 path = "src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip"
@@ -366,6 +370,37 @@ params = [
 probes = [
   { vocab_size = 248320, temperature = 0.8, top_k = 40, top_p = 0.95, min_p = 0.05, min_keep = 1, repeat_penalty = 1.1, frequency_penalty = 0.0, presence_penalty = 0.0, uniform = 0.5, penalty_count = 3, sort_storage_bytes = 16777216 },
   { vocab_size = 7, temperature = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, min_keep = 0, repeat_penalty = 1.0, frequency_penalty = 0.0, presence_penalty = 0.0, uniform = 0.0, penalty_count = 0, sort_storage_bytes = 4096 },
+]
+
+[[launcher]]
+name = "verify_gemm_27b"
+cpp = "TryLaunchVerifyGemm27"
+returns = "supported"
+doc = "`y[batch][m] = x[batch][k] w[m][k]^T` at 2 to 8 rows with block shapes measured faster for the Qwen3.8-27B UD-Q4_K_XL target and Q4_K_M DFlash2 draft projections; the exact small-batch kernel, bit for bit equal to `batched_quant_gemm_f32`. Declines other formats, row counts and shapes."
+params = [
+  { name = "w_type", kind = "format", of = "w" },
+  { name = "w", kind = "quant", rows = "m", cols = "k", formats = ["Q8_0", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ4_NL", "IQ4_XS", "IQ3_S"] },
+  { name = "x", kind = "in", elem = "f32", len = "batch * k" },
+  { name = "y", kind = "out", elem = "f32", len = "batch * m" },
+  { name = "batch", kind = "scalar", type = "usize" },
+  { name = "m", kind = "scalar", type = "usize" },
+  { name = "k", kind = "scalar", type = "usize" },
+]
+# Probes take tuned geometries (one per block shape family, both lane
+# widths); tests/small_batch.rs checks that the others decline.
+probes = [
+  { w = "Q4_K", batch = 2, m = 1024, k = 5120 },
+  { w = "Q4_K", batch = 8, m = 1024, k = 5120 },
+  { w = "Q4_K", batch = 6, m = 1280, k = 5120 },
+  { w = "Q4_K", batch = 4, m = 5120, k = 17408 },
+  { w = "Q4_K", batch = 8, m = 10240, k = 5120 },
+  { w = "Q5_K", batch = 7, m = 1024, k = 5120 },
+  { w = "Q6_K", batch = 8, m = 5120, k = 17408 },
+  { w = "Q6_K", batch = 6, m = 5120, k = 6144 },
+  { w = "IQ4_XS", batch = 2, m = 6144, k = 5120 },
+  { w = "IQ4_XS", batch = 8, m = 6144, k = 5120 },
+  { w = "IQ4_XS", batch = 3, m = 10240, k = 5120 },
+  { w = "IQ4_XS", batch = 3, m = 34816, k = 5120 },
 ]
 
 [[launcher]]

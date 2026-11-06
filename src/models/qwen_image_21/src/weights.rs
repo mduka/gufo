@@ -452,6 +452,23 @@ impl Weights {
         Ok(())
     }
 
+    /// `Weights::Group`: every tensor whose name starts with `prefix`, in
+    /// name order.
+    pub fn group(&self, prefix: &str) -> Vec<(&str, &Weight)> {
+        self.weights
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|(name, _)| name.starts_with(prefix))
+            .map(|(name, weight)| (name.as_str(), weight))
+            .collect()
+    }
+
+    /// `Weights::Files`: the mapped shards, which keep the descriptors
+    /// they were mapped from. Reopening a pathname could read a replacement
+    /// file with other tensor contents or offsets.
+    pub fn files(&self) -> &[Arc<MappedFile>] {
+        &self.files
+    }
+
     /// `Weights::Get`.
     pub fn get(&self, name: &str) -> Result<&Weight> {
         self.weights

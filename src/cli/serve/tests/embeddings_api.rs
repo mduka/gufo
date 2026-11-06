@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,8 +12,9 @@ use gufo_core::json::{self, Value};
 use gufo_core::text::CancellationCheck;
 use gufo_serve::embedding_service::{
     EmbeddingBatch, EmbeddingEngine, EmbeddingInput, EmbeddingPartType, EmbeddingRequestOptions,
-    EmbeddingRunner, EmbeddingService, EmbeddingServiceOptions, EmbeddingStatus, EngineMedia,
-    EngineSequence, MAX_INPUT_TOKENS, load_sentence_transformer_prompts, truncate_keeping_images,
+    EmbeddingRunner, EmbeddingService, EmbeddingServiceOptions, EmbeddingStatus,
+    EmbeddingVideoOptions, EngineMedia, EngineSequence, EngineVideo, EngineVideoError,
+    MAX_INPUT_TOKENS, load_sentence_transformer_prompts, truncate_keeping_images,
 };
 use gufo_serve::embeddings_api::{handle_embeddings_api_request, is_embeddings_api_path};
 use gufo_serve::http::{HttpRequest, HttpResponse};
@@ -52,6 +53,7 @@ struct FakeRunner {
     calls: AtomicI32,
     last_texts: Mutex<Vec<String>>,
     last_truncate: AtomicBool,
+    last_image_soft_tokens: AtomicU32,
 }
 
 /// The text of an input: its parts joined, as the service tokenizes them.
@@ -75,6 +77,8 @@ impl FakeRunner {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_texts.lock().unwrap() = texts.clone();
         self.last_truncate.store(request.truncate, Ordering::SeqCst);
+        self.last_image_soft_tokens
+            .store(request.image_soft_tokens, Ordering::SeqCst);
         for (i, text) in texts.iter().enumerate() {
             if text.starts_with("TOOLONG") {
                 if request.truncate {
@@ -820,6 +824,8 @@ struct FakeEngine {
     lost: AtomicBool,
     fail: bool,
     sequences: Mutex<Vec<Vec<u32>>>,
+    /// What `process_video` reports; `None` without video support.
+    video: Option<EngineVideoError>,
 }
 
 impl EmbeddingEngine for FakeEngine {
@@ -848,6 +854,10 @@ impl EmbeddingEngine for FakeEngine {
         false
     }
 
+    fn supports_video(&self) -> bool {
+        self.video.is_some()
+    }
+
     fn supports_audio(&self) -> bool {
         false
     }
@@ -860,8 +870,25 @@ impl EmbeddingEngine for FakeEngine {
         String::new()
     }
 
-    fn process_image(&self, _: &[u8]) -> Result<EngineMedia, String> {
+    fn video_processor_error(&self) -> String {
+        String::new()
+    }
+
+    fn process_image(&self, _: &[u8], _: u32) -> Result<EngineMedia, String> {
         Err("no images".into())
+    }
+
+    fn process_video(
+        &self,
+        _: &[u8],
+        _: &EmbeddingVideoOptions,
+        _: Option<&CancellationCheck>,
+        _: usize,
+    ) -> Result<EngineVideo, EngineVideoError> {
+        Err(self
+            .video
+            .clone()
+            .unwrap_or_else(|| EngineVideoError::Invalid("no video".into())))
     }
 
     fn process_audio(
@@ -894,10 +921,18 @@ impl EmbeddingEngine for FakeEngine {
 }
 
 fn native_service(fail: bool) -> (Arc<EmbeddingService>, Arc<FakeEngine>) {
+    native_service_with(fail, None)
+}
+
+fn native_service_with(
+    fail: bool,
+    video: Option<EngineVideoError>,
+) -> (Arc<EmbeddingService>, Arc<FakeEngine>) {
     let engine = Arc::new(FakeEngine {
         lost: AtomicBool::new(false),
         fail,
         sequences: Mutex::new(Vec::new()),
+        video,
     });
     struct Shared(Arc<FakeEngine>);
     impl EmbeddingEngine for Shared {
@@ -913,6 +948,9 @@ fn native_service(fail: bool) -> (Arc<EmbeddingService>, Arc<FakeEngine>) {
         fn supports_vision(&self) -> bool {
             self.0.supports_vision()
         }
+        fn supports_video(&self) -> bool {
+            self.0.supports_video()
+        }
         fn supports_audio(&self) -> bool {
             self.0.supports_audio()
         }
@@ -922,8 +960,21 @@ fn native_service(fail: bool) -> (Arc<EmbeddingService>, Arc<FakeEngine>) {
         fn audio_processor_error(&self) -> String {
             self.0.audio_processor_error()
         }
-        fn process_image(&self, bytes: &[u8]) -> Result<EngineMedia, String> {
-            self.0.process_image(bytes)
+        fn video_processor_error(&self) -> String {
+            self.0.video_processor_error()
+        }
+        fn process_image(&self, bytes: &[u8], max_soft_tokens: u32) -> Result<EngineMedia, String> {
+            self.0.process_image(bytes, max_soft_tokens)
+        }
+        fn process_video(
+            &self,
+            bytes: &[u8],
+            options: &EmbeddingVideoOptions,
+            is_cancelled: Option<&CancellationCheck>,
+            frame_budget: usize,
+        ) -> Result<EngineVideo, EngineVideoError> {
+            self.0
+                .process_video(bytes, options, is_cancelled, frame_budget)
         }
         fn process_audio(
             &self,
@@ -1735,5 +1786,234 @@ fn prompt_names() {
         load_sentence_transformer_prompts(dir.path())
             .unwrap_err()
             .contains("config_sentence_transformers.json")
+    );
+}
+
+/// Video parts and `video_options` reach the service in request order
+/// (`TestTypedInput`, #869).
+#[test]
+fn typed_video_input() {
+    let captured = Arc::new(Mutex::new((Vec::new(), EmbeddingRequestOptions::default())));
+    let c = captured.clone();
+    let service = service_with(Box::new(move |inputs, options, batch, _| {
+        *c.lock().unwrap() = (inputs.to_vec(), *options);
+        for input in inputs {
+            let text = joined(input);
+            batch.embeddings.push(fake_embedding(&text));
+            batch.token_counts.push(fake_tokens(&text));
+        }
+        EmbeddingStatus::Ok
+    }));
+    let response = send(
+        &service,
+        r#"{"input":[{"content":[{"type":"text","text":"before"},{"type":"input_video","input_video":{"data":"AAAA","url":"ignored"}},{"type":"text","text":"after"}]}],"video_options":{"fps":0.5,"max_frames":3,"add_timestamps":true,"overflow_strategy":"truncate"}}"#,
+    );
+    assert_eq!(response.status, 200, "video content and controls accepted");
+    {
+        let (inputs, options) = &*captured.lock().unwrap();
+        let parts = &inputs[0].content;
+        assert!(
+            parts.len() == 3
+                && parts[1].kind == EmbeddingPartType::Video
+                && parts[1].value == "AAAA"
+                && parts[0].value == "before"
+                && parts[2].value == "after",
+            "video data precedence and interleaving"
+        );
+        assert_eq!(
+            options.video,
+            EmbeddingVideoOptions {
+                fps: 0.5,
+                max_frames: 3,
+                timestamps: true,
+                truncate_overflow: true,
+            },
+            "video controls reach runtime"
+        );
+    }
+    for body in [
+        r#"{"input":[{"content":[{"type":"input_video","input_video":{}}]}]}"#,
+        r#"{"input":[{"content":[{"type":"input_video","input_video":{"data":3}}]}]}"#,
+        r#"{"input":[{"content":[{"type":"input_video","input_video":{"url":"x","extra":"x"}}]}]}"#,
+    ] {
+        expect_error(
+            &send(&service, body),
+            400,
+            "invalid_parameter_type",
+            "invalid video schema",
+        );
+    }
+    for settings in [
+        r#"{"fps":0}"#,
+        r#"{"fps":121}"#,
+        r#"{"max_frames":0}"#,
+        r#"{"max_frames":33}"#,
+        r#"{"max_frames":1.5}"#,
+        r#"{"add_timestamps":1}"#,
+        r#"{"overflow_strategy":"other"}"#,
+        r#"{"unknown":true}"#,
+    ] {
+        expect_error(
+            &send(
+                &service,
+                &format!(r#"{{"input":"hello","video_options":{settings}}}"#),
+            ),
+            400,
+            "invalid_video_options",
+            "invalid video control",
+        );
+    }
+    let many = format!(
+        r#"{{"input":[{{"content":[{}]}}]}}"#,
+        vec![r#"{"type":"input_video","input_video":{"data":"AAAA"}}"#; 33].join(",")
+    );
+    expect_error(
+        &send(&service, &many),
+        400,
+        "too_many_videos",
+        "video request count bound",
+    );
+}
+
+/// `mm_processor_kwargs.max_soft_tokens` selects the image budget, as in
+/// vLLM's embedding requests; the default is the checkpoint's 280
+/// (`TestImageSoftTokens`, #870).
+#[test]
+fn image_soft_tokens() {
+    let runner = Arc::new(FakeRunner::default());
+    let service = make_service(&runner);
+    let last = || runner.last_image_soft_tokens.load(Ordering::SeqCst);
+    assert_eq!(
+        send(&service, r#"{"input":"a"}"#).status,
+        200,
+        "default request"
+    );
+    assert_eq!(last(), 280, "the default budget is 280");
+    for budget in [70u32, 140, 280, 560, 1120] {
+        let response = send(
+            &service,
+            &format!(r#"{{"input":"a","mm_processor_kwargs":{{"max_soft_tokens":{budget}}}}}"#),
+        );
+        assert_eq!(response.status, 200, "a supported budget is accepted");
+        assert_eq!(last(), budget, "the budget reaches the service");
+    }
+    assert_eq!(
+        send_to(
+            &service,
+            "/embeddings",
+            r#"{"content":"a","mm_processor_kwargs":{"max_soft_tokens":70}}"#
+        )
+        .status,
+        200,
+        "the native form accepts the budget"
+    );
+    assert_eq!(last(), 70, "the native budget is applied");
+    assert_eq!(
+        send(&service, r#"{"input":"a","mm_processor_kwargs":null}"#).status,
+        200,
+        "null mm_processor_kwargs is absent"
+    );
+    assert_eq!(last(), 280, "null keeps the default");
+    assert_eq!(
+        send(&service, r#"{"input":"a","mm_processor_kwargs":{}}"#).status,
+        200,
+        "empty mm_processor_kwargs keeps the default"
+    );
+    let calls = runner.calls.load(Ordering::SeqCst);
+    expect_error(
+        &send(&service, r#"{"input":"a","mm_processor_kwargs":[]}"#),
+        400,
+        "invalid_parameter_type",
+        "mm_processor_kwargs is an object",
+    );
+    for body in [
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":281}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":0}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":-70}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":null}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":true}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":[]}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":{}}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":1121}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":280.5}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":"280"}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":4294967576}}"#,
+        r#"{"input":"a","mm_processor_kwargs":{"fps":2}}"#,
+    ] {
+        expect_error(
+            &send(&service, body),
+            400,
+            "invalid_mm_processor_kwargs",
+            &format!("refused: {body}"),
+        );
+    }
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        calls,
+        "invalid kwargs never reach the service"
+    );
+    assert_eq!(
+        send(
+            &service,
+            r#"{"input":"a","mm_processor_kwargs":{"max_soft_tokens":70},"video_options":{"fps":0.5,"max_frames":3}}"#
+        )
+        .status,
+        200,
+        "image and video processor options coexist"
+    );
+    assert_eq!(last(), 70, "video options do not override the image budget");
+}
+
+/// The native service refuses video without the model's support, reports a
+/// video it cannot decode as the client's error and missing video libraries
+/// as its own.
+#[test]
+fn native_video_failures() {
+    let video = r#"{"input":[{"content":[{"type":"input_video","input_video":{"data":"AAAA"}}]}]}"#;
+    let (unsupported, _) = native_service(false);
+    let response = send(&unsupported, video);
+    expect_error(&response, 400, "invalid_video_input", "video unsupported");
+    assert_eq!(
+        parse(&response)
+            .find("error")
+            .unwrap()
+            .member_str("message", ""),
+        "unsupported embedding vision configuration"
+    );
+    let (invalid, _) = native_service_with(
+        false,
+        Some(EngineVideoError::Invalid(
+            "embedding video has no video stream".into(),
+        )),
+    );
+    let response = send(&invalid, video);
+    expect_error(&response, 400, "invalid_video_input", "undecodable video");
+    assert_eq!(
+        parse(&response)
+            .find("error")
+            .unwrap()
+            .member_str("message", ""),
+        "embedding video has no video stream"
+    );
+    expect_error(
+        &send(
+            &invalid,
+            r#"{"input":[{"content":[{"type":"input_video","input_video":{"data":"data:video/avi;base64,AAAA"}}]}]}"#,
+        ),
+        400,
+        "invalid_video_input",
+        "unsupported video media type",
+    );
+    let (missing, _) = native_service_with(
+        false,
+        Some(EngineVideoError::Library(
+            "cannot load runtime library libavformat.so.62: not found".into(),
+        )),
+    );
+    expect_error(
+        &send(&missing, video),
+        500,
+        "embedding_failed",
+        "missing video libraries",
     );
 }

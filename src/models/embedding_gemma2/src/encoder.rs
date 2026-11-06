@@ -19,8 +19,11 @@ use gufo_hip::{
 
 use crate::audio::AudioRuntime;
 use crate::batch_scheduler::{BatchScheduler, CancelCheck, EncoderSequence, Outcome};
-use crate::config::{AUDIO_TOKEN_ID, EMBED_SCALE, IMAGE_TOKEN_ID, LayerType, ModelConfig};
+use crate::config::{
+    AUDIO_TOKEN_ID, EMBED_SCALE, IMAGE_TOKEN_ID, LayerType, ModelConfig, VIDEO_TOKEN_ID,
+};
 use crate::gemm::{self, Gemm};
+use crate::image_processor::MAX_IMAGE_SOFT_TOKENS;
 use crate::loader::{LoadedModel, TEXT_TENSOR_PREFIX, TensorStore, Towers, load_model_directory};
 use crate::vision::Vision;
 
@@ -438,6 +441,13 @@ impl Device {
                 .map_err(launch)?;
             }
             for image in &sequence.images {
+                if sequence
+                    .is_cancelled
+                    .as_ref()
+                    .is_some_and(|cancelled| cancelled())
+                {
+                    return Err(CANCELLED_MESSAGE.into());
+                }
                 if self.vision.is_none() {
                     self.vision = Some(Vision::load(&self.model_dir, stream)?);
                 }
@@ -449,6 +459,12 @@ impl Device {
                     self.state.slice_mut(at..n * hidden),
                     self.embeddings_bf16.slice_mut(at..n * hidden),
                 )?;
+                // Bound outstanding video work to one frame, so a
+                // disconnected long clip releases the device before encoding
+                // the remaining frames.
+                if image.token_id == VIDEO_TOKEN_ID {
+                    stream.synchronize().map_err(hip)?;
+                }
             }
             offset += sequence.tokens.len();
         }
@@ -845,7 +861,7 @@ impl EncoderRuntime {
                     || patches.columns == 0
                     || patches.rows % 3 != 0
                     || patches.columns % 3 != 0
-                    || n > 280
+                    || n > MAX_IMAGE_SOFT_TOKENS as usize
                     || patches.pixels.len() != n * 9 * 768
                     || image.offset < previous_end
                     || image.offset > tokens.len()
@@ -853,9 +869,10 @@ impl EncoderRuntime {
                 {
                     return Err("embedding_gemma2: invalid image patches or token offset".into());
                 }
-                if tokens[image.offset..image.offset + n]
-                    .iter()
-                    .any(|&id| id != IMAGE_TOKEN_ID)
+                if (image.token_id != IMAGE_TOKEN_ID && image.token_id != VIDEO_TOKEN_ID)
+                    || tokens[image.offset..image.offset + n]
+                        .iter()
+                        .any(|&id| id != image.token_id)
                 {
                     return Err("embedding_gemma2: image placeholder mismatch".into());
                 }

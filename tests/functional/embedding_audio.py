@@ -80,7 +80,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--server-log", type=Path, required=True)
     args = parser.parse_args()
-    fixture = json.loads((Path(__file__).resolve().parents[1] / "fixtures/embedding_gemma2/audio_embedding_golden.json").read_text())
+    fixture = json.loads((Path(__file__).resolve().parents[2] / "src/models/embedding_gemma2/tests/fixtures/audio_embedding_golden.json").read_text())
     cases = fixture["cases"]
     results = []
     report = {"status": "running", "requests": results,
@@ -117,7 +117,7 @@ def main():
         for i, case in enumerate(selected):
             assert batch["data"][i]["index"] == i
             check_vector(batch["data"][i]["embedding"], case["embedding"])
-        text_fixture = json.loads((Path(__file__).resolve().parents[1] / "fixtures/embedding_gemma2/embedding_golden.json").read_text())
+        text_fixture = json.loads((Path(__file__).resolve().parents[2] / "src/models/embedding_gemma2/tests/fixtures/embedding_golden.json").read_text())
         text_case = next(case for case in text_fixture["cases"] if case["name"] == "plain")
         status, mixed = post([text_case["text"], content(cases[2]), content(cases[0])])
         assert status == 200 and len(mixed["data"]) == 3, mixed

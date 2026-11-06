@@ -72,6 +72,8 @@ impl Default for MtpCandidates {
 #[derive(Default)]
 pub struct MtpOutput<'a> {
     pub token: Option<&'a mut i32>,
+    /// With `token`: the draft head's softmax probability of it.
+    pub confidence: Option<&'a mut f32>,
     pub candidates: Option<&'a mut MtpCandidates>,
     /// Prefill needs only the persistent draft K/V: a full forward from
     /// known trunk rows must follow before a head or recursive proposal.
@@ -1074,11 +1076,19 @@ impl Core {
                 stream,
                 logits,
                 self.s.mtp_argmax.slice_mut(0..64 * 8),
-                self.s.mtp_token.as_mut_slice(),
+                self.s.mtp_token.slice_mut(0..1),
                 1,
                 vocab,
             )
             .map_err(launch_error("draft argmax"))?;
+            let row = self
+                .s
+                .mtp_token
+                .slice_mut(0..2)
+                .cast::<u32>()
+                .ok_or("misaligned draft token")?;
+            k::argmax_confidence(stream, logits, row, vocab)
+                .map_err(launch_error("draft confidence"))?;
         }
         Ok(())
     }
@@ -1088,7 +1098,7 @@ impl Core {
     fn read_mtp_outputs(&mut self, stream: &Stream, output: MtpOutput<'_>) -> Result<(), Error> {
         let count = (self.model.config.vocab_size as usize).min(MTP_CANDIDATES);
         if output.token.is_some() {
-            stream.download_async(self.s.mtp_token.slice(0..1), &mut self.host.draft_tokens[0])?;
+            stream.download_async(self.s.mtp_token.slice(0..2), &mut self.host.draft_tokens[0])?;
         }
         if output.candidates.is_some() {
             stream.download_async(
@@ -1098,7 +1108,11 @@ impl Core {
         }
         stream.synchronize()?;
         if let Some(token) = output.token {
-            *token = self.host.draft_tokens[0].host()?[0];
+            let words = self.host.draft_tokens[0].host()?;
+            *token = words[0];
+            if let Some(confidence) = output.confidence {
+                *confidence = f32::from_bits(words[1] as u32);
+            }
         }
         if let Some(candidates) = output.candidates {
             let words = self.host.draft_candidates[0].host()?;
